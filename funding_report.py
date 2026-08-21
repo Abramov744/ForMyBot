@@ -171,6 +171,11 @@ def fetch_bybit(api_key: str, api_secret: str,
     api_key    = api_key.strip()
     api_secret = api_secret.strip()
 
+    # Диагностика ключей (без полного раскрытия)
+    print(f"[Bybit DEBUG] api_key_len={len(api_key)}, api_secret_len={len(api_secret)}")
+    print(f"[Bybit DEBUG] api_key_preview={api_key[:4]!r}...{api_key[-4:]!r}")
+    print(f"[Bybit DEBUG] api_secret_preview={api_secret[:3]!r}...{api_secret[-3:]!r}")
+
     while True:
         timestamp = str(int(time.time() * 1000))
 
@@ -186,14 +191,20 @@ def fetch_bybit(api_key: str, api_secret: str,
         if cursor:
             params_list.append(("cursor", cursor))
 
-        # query_string, по которому строится подпись, = тот же, что уйдёт в URL
         query_string = urllib.parse.urlencode(params_list)
 
-        # Диагностический вывод origin_string (apiKey виден, api_secret — НЕТ)
-        origin_string = f"{timestamp}{api_key}{recv_window}{query_string}"
-        print(f"[Bybit DEBUG] origin_string: {origin_string}")
+        # payload для HMAC — ровно то, что подписываем
+        payload = f"{timestamp}{api_key}{recv_window}{query_string}"
+        print(f"[Bybit DEBUG] payload_for_hmac: {payload}")
 
-        sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
+        sig = hmac.new(
+            api_secret.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        print(f"[Bybit DEBUG] signature: {sig}")
+        print(f"[Bybit DEBUG] origin_string (as Bybit shows): "
+              f"{payload[:14]}***{payload[-60:]}")
 
         headers = {
             "X-BAPI-API-KEY":     api_key,
@@ -202,10 +213,7 @@ def fetch_bybit(api_key: str, api_secret: str,
             "X-BAPI-RECV-WINDOW": recv_window,
         }
 
-        # Используем ОДИН И ТОТ ЖЕ query_string и в подписи, и в URL.
-        # намеренно НЕ передаём params=... — иначе requests переформатирует
-        # строку и подпись с Bybit не сойдётся (это и есть основная причина
-        # Error sign 10004).
+        # Подпись и URL используют ОДИН И ТОТ ЖЕ query_string.
         url = f"{base_url}/v5/account/transaction-log?{query_string}"
         resp = requests.get(
             url,
