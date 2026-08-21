@@ -26,6 +26,7 @@ jobs:
           ASTER_SIGNER_PRIVATE_KEY: ${{ secrets.ASTER_SIGNER_PRIVATE_KEY }}
           BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+          BYBIT_PROXY: ${{ secrets.BYBIT_PROXY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python funding_report.py
