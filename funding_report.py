@@ -163,7 +163,7 @@ def fetch_bybit(api_key: str, api_secret: str,
             headers=headers,
             timeout=30,
         )
-if not resp.ok:
+        if not resp.ok:
             print(f"[Bybit DEBUG] HTTP {resp.status_code}, тело ответа: {resp.text}")
         resp.raise_for_status()
         data = resp.json()
