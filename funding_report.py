@@ -193,7 +193,7 @@ def fetch_bybit(api_key: str, api_secret: str,
         b_payload = payload.encode("utf-8")
 
         # Считаем подпись
-        sig = hmac.new(b_secret, b_payload, hashlib.sha256).hexdigest()
+        sig = hmac.new(api_secret.encode("utf-8"), b_payload, hashlib.sha256).hexdigest()
 
         headers = {
             "X-BAPI-API-KEY":     api_key,
