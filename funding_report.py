@@ -167,31 +167,48 @@ def fetch_bybit(api_key: str, api_secret: str,
     if proxies:
         print(f"[Bybit DEBUG] запрос через прокси: {proxies['https'].split('@')[-1]}")
 
+    # На случай, если в GitHub-секрете затесался пробел/перевод строки
+    api_key    = api_key.strip()
+    api_secret = api_secret.strip()
+
     while True:
         timestamp = str(int(time.time() * 1000))
-        params: dict = {
-            "accountType": "UNIFIED",
-            "category":    "linear",
-            "type":        "SETTLEMENT",
-            "startTime":   str(start_ms),
-            "endTime":     str(end_ms),
-            "limit":       "50",
-        }
-        if cursor:
-            params["cursor"] = cursor
 
-        query_string = urllib.parse.urlencode(params)
+        # Параметры в фиксированном порядке — list of tuples
+        params_list = [
+            ("accountType", "UNIFIED"),
+            ("category",    "linear"),
+            ("type",        "SETTLEMENT"),
+            ("startTime",   str(start_ms)),
+            ("endTime",     str(end_ms)),
+            ("limit",       "50"),
+        ]
+        if cursor:
+            params_list.append(("cursor", cursor))
+
+        # query_string, по которому строится подпись, = тот же, что уйдёт в URL
+        query_string = urllib.parse.urlencode(params_list)
+
+        # Диагностический вывод origin_string (apiKey виден, api_secret — НЕТ)
+        origin_string = f"{timestamp}{api_key}{recv_window}{query_string}"
+        print(f"[Bybit DEBUG] origin_string: {origin_string}")
+
         sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
 
         headers = {
-            "X-BAPI-API-KEY":      api_key,
-            "X-BAPI-SIGN":         sig,
-            "X-BAPI-TIMESTAMP":    timestamp,
-            "X-BAPI-RECV-WINDOW":  recv_window,
+            "X-BAPI-API-KEY":     api_key,
+            "X-BAPI-SIGN":        sig,
+            "X-BAPI-TIMESTAMP":   timestamp,
+            "X-BAPI-RECV-WINDOW": recv_window,
         }
+
+        # Используем ОДИН И ТОТ ЖЕ query_string и в подписи, и в URL.
+        # намеренно НЕ передаём params=... — иначе requests переформатирует
+        # строку и подпись с Bybit не сойдётся (это и есть основная причина
+        # Error sign 10004).
+        url = f"{base_url}/v5/account/transaction-log?{query_string}"
         resp = requests.get(
-            f"{base_url}/v5/account/transaction-log",
-            params=params,
+            url,
             headers=headers,
             timeout=30,
             proxies=proxies,
