@@ -121,6 +121,35 @@ def fetch_aster(user: str, signer: str, private_key: str,
 
 # ── Получение данных с Bybit ──────────────────────────────────────────────────
 
+def _get_proxies() -> dict | None:
+    """
+    Читает прокси из окружения для запросов к Bybit.
+    Приоритет: BYBIT_PROXY → HTTPS_PROXY → HTTP_PROXY.
+    Поддерживаемые форматы значения:
+      - http://user:pass@host:port
+      - http://host:port
+      - host:port:user:pass   → конвертируется в http://user:pass@host:port
+      - host:port             → добавляется схема http://
+    """
+    proxy = (
+        os.environ.get("BYBIT_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
 def _bybit_sign(api_key: str, api_secret: str,
                 timestamp: str, recv_window: str, query_string: str) -> str:
     payload = f"{timestamp}{api_key}{recv_window}{query_string}"
@@ -134,6 +163,9 @@ def fetch_bybit(api_key: str, api_secret: str,
     recv_window = "5000"
     all_records = []
     cursor      = None
+    proxies     = _get_proxies()
+    if proxies:
+        print(f"[Bybit DEBUG] запрос через прокси: {proxies['https'].split('@')[-1]}")
 
     while True:
         timestamp = str(int(time.time() * 1000))
@@ -162,6 +194,7 @@ def fetch_bybit(api_key: str, api_secret: str,
             params=params,
             headers=headers,
             timeout=30,
+            proxies=proxies,
         )
         if not resp.ok:
             print(f"[Bybit DEBUG] HTTP {resp.status_code}, тело ответа: {resp.text}")
