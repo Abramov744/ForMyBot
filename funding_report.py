@@ -171,19 +171,6 @@ def fetch_bybit(api_key: str, api_secret: str,
     api_key    = api_key.strip()
     api_secret = api_secret.strip()
 
-    # ── Диагностика ключей (без полного раскрытия) ─────────────────────────
-    import binascii
-    b_key    = api_key.encode("utf-8")
-    b_secret = api_secret.encode("utf-8")
-    print(f"[Bybit DEBUG] api_key_len={len(api_key)}, api_secret_len={len(api_secret)}")
-    print(f"[Bybit DEBUG] api_key_preview={api_key[:4]!r}...{api_key[-4:]!r}")
-    print(f"[Bybit DEBUG] api_secret_preview={api_secret[:3]!r}...{api_secret[-3:]!r}")
-    print(f"[Bybit DEBUG] api_key_head_hex={binascii.hexlify(b_key[:6])}, "
-          f"api_key_tail_hex={binascii.hexlify(b_key[-6:])}")
-    print(f"[Bybit DEBUG] api_secret_head_hex={binascii.hexlify(b_secret[:6])}, "
-          f"api_secret_tail_hex={binascii.hexlify(b_secret[-6:])}")
-    # ───────────────────────────────────────────────────────────────────────
-
     while True:
         timestamp = str(int(time.time() * 1000))
 
@@ -205,26 +192,8 @@ def fetch_bybit(api_key: str, api_secret: str,
         payload = f"{timestamp}{api_key}{recv_window}{query_string}"
         b_payload = payload.encode("utf-8")
 
-        print(f"[Bybit DEBUG] payload_for_hmac: {payload}")
-        print(f"[Bybit DEBUG] payload_len={len(b_payload)}, "
-              f"payload_head_hex={binascii.hexlify(b_payload[:8])}, "
-              f"payload_tail_hex={binascii.hexlify(b_payload[-8:])}")
-
         # Считаем подпись
         sig = hmac.new(b_secret, b_payload, hashlib.sha256).hexdigest()
-        print(f"[Bybit DEBUG] signature: {sig}")
-
-        # Sanity check: перерасчёт через чистый hashlib (для контроля шифтинга/entropy)
-        sig_check = hmac.new(
-            api_secret.encode("utf-8"),
-            payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        if sig != sig_check:
-            print(f"[Bybit DEBUG] !!! ВНУТРЕННЯЯ ОШИБКА: подписи не совпадают! "
-                  f"sig={sig} sig_check={sig_check}")
-        else:
-            print(f"[Bybit DEBUG] подписи совпадают (sig == sig_check) — OK")
 
         headers = {
             "X-BAPI-API-KEY":     api_key,
