@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC → Telegram
+Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC + Gate → Telegram
 Период: предыдущие календарные сутки по МСК (00:00–00:00 МСК).
 Запуск: ежедневно в 04:00 UTC (07:00 МСК).
 """
@@ -64,6 +64,13 @@ def load_secrets() -> dict:
     if mexc_api_key and mexc_api_secret:
         result["mexc_api_key"]    = mexc_api_key
         result["mexc_api_secret"] = mexc_api_secret
+
+    # Gate — опционально
+    gate_api_key    = os.environ.get("GATE_API_KEY")
+    gate_api_secret = os.environ.get("GATE_API_SECRET")
+    if gate_api_key and gate_api_secret:
+        result["gate_api_key"]    = gate_api_key
+        result["gate_api_secret"] = gate_api_secret
 
     return result
 
@@ -425,6 +432,108 @@ def fetch_mexc(api_key: str, api_secret: str,
     return all_records
 
 
+# ── Получение данных с Gate ───────────────────────────────────────────────────
+#
+# Авторизация Gate API v4 (своя, отличная от остальных):
+#   payload_hash    = HexEncode(SHA512(тело_запроса))  — для GET тело пустое
+#   signature_string = "Method\nURL\nQueryString\npayload_hash\nTimestamp"
+#   SIGN             = HexEncode(HMAC-SHA512(api_secret, signature_string))
+# Заголовки: KEY (api_key), Timestamp (unix-секунды), SIGN.
+#
+# Эндпоинт: GET /api/v4/futures/{settle}/account_book, type=fund — история
+# начислений funding по фьючерсам. settle — валюта расчётов контракта;
+# по умолчанию берём usdt (покрывает все USDT-M бессрочные контракты).
+
+def _get_gate_proxies() -> dict | None:
+    """Прокси для запросов к Gate — тот же паттерн, что и для Bybit/MEXC."""
+    proxy = (
+        os.environ.get("GATE_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
+def _gate_sign(api_secret: str, method: str, url_path: str,
+               query_string: str, payload: str = "") -> tuple[str, str]:
+    timestamp = str(time.time())
+    payload_hash = hashlib.sha512(payload.encode("utf-8")).hexdigest()
+    signature_string = f"{method}\n{url_path}\n{query_string}\n{payload_hash}\n{timestamp}"
+    sign = hmac.new(api_secret.encode("utf-8"), signature_string.encode("utf-8"), hashlib.sha512).hexdigest()
+    return sign, timestamp
+
+
+def fetch_gate(api_key: str, api_secret: str,
+               start_ms: int, end_ms: int, settle: str = "usdt") -> list:
+    """GET /api/v4/futures/{settle}/account_book, type=fund, с пагинацией offset/limit."""
+    base_url = "https://api.gateio.ws"
+    url_path = f"/api/v4/futures/{settle}/account_book"
+    limit    = 1000
+    offset   = 0
+    all_records = []
+    proxies  = _get_gate_proxies()
+    if proxies:
+        print(f"[Gate DEBUG] запрос через прокси: {proxies['https'].split('@')[-1]}")
+
+    api_key    = api_key.strip()
+    api_secret = api_secret.strip()
+
+    start_s = start_ms // 1000
+    end_s   = end_ms // 1000
+
+    while True:
+        params_list = [
+            ("type",   "fund"),
+            ("from",   str(start_s)),
+            ("to",     str(end_s)),
+            ("limit",  str(limit)),
+            ("offset", str(offset)),
+        ]
+        query_string = urllib.parse.urlencode(params_list)
+
+        sig, timestamp = _gate_sign(api_secret, "GET", url_path, query_string)
+        headers = {
+            "KEY":       api_key,
+            "Timestamp": timestamp,
+            "SIGN":      sig,
+            "Accept":    "application/json",
+        }
+
+        url = f"{base_url}{url_path}?{query_string}"
+        resp = requests.get(url, headers=headers, timeout=30, proxies=proxies)
+        if not resp.ok:
+            print(f"[Gate DEBUG] HTTP {resp.status_code}, тело ответа: {resp.text}")
+        resp.raise_for_status()
+        data = resp.json()
+
+        if isinstance(data, dict) and data.get("label"):
+            raise RuntimeError(f"Gate API error {data.get('label')}: {data.get('message')}")
+
+        items = data if isinstance(data, list) else []
+        for item in items:
+            text = item.get("text", "")
+            item["symbol"] = text.split(":")[0] if text else "UNKNOWN"
+            item["asset"]  = settle.upper()
+        all_records.extend(items)
+
+        if len(items) < limit:
+            break
+        offset += limit
+
+    return all_records
+
+
 # ── Формирование отчёта ───────────────────────────────────────────────────────
 
 def _fmt_ms(ms: int) -> str:
@@ -475,7 +584,8 @@ def build_report(start_ms: int, end_ms: int,
                  aster_records: list | None, aster_error: str | None,
                  bybit_records: list | None, bybit_error: str | None,
                  lighter_records: list | None = None, lighter_error: str | None = None,
-                 mexc_records: list | None = None, mexc_error: str | None = None) -> str:
+                 mexc_records: list | None = None, mexc_error: str | None = None,
+                 gate_records: list | None = None, gate_error: str | None = None) -> str:
 
     header = [
         "📊 Отчёт по funding fee",
@@ -520,17 +630,31 @@ def build_report(start_ms: int, end_ms: int,
         )
         combined.extend(mexc_lines)
 
+    # Gate — только если запрашивался
+    gate_totals: dict = {}
+    if gate_records is not None or gate_error is not None:
+        combined.append("")
+        gate_lines, gate_totals = _section_lines(
+            "Gate", gate_records, gate_error,
+            income_field="change", symbol_field="symbol", asset_field="asset",
+        )
+        combined.extend(gate_lines)
+
     # Итог по всем биржам
-    if bybit_totals or aster_totals or lighter_totals or mexc_totals:
+    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals:
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
-        all_assets: set = set(aster_totals) | set(bybit_totals) | set(lighter_totals) | set(mexc_totals)
+        all_assets: set = (
+            set(aster_totals) | set(bybit_totals) | set(lighter_totals)
+            | set(mexc_totals) | set(gate_totals)
+        )
         for asset in sorted(all_assets):
             total = (
                 aster_totals.get(asset, 0.0)
                 + bybit_totals.get(asset, 0.0)
                 + lighter_totals.get(asset, 0.0)
                 + mexc_totals.get(asset, 0.0)
+                + gate_totals.get(asset, 0.0)
             )
             emoji = "🟢" if total >= 0 else "🔴"
             combined.append(f"  {emoji} {asset}: {total:+.4f}")
@@ -608,12 +732,27 @@ def main():
             mexc_error = str(e)
             print(f"[MEXC] Ошибка: {e}")
 
+    # Gate (опционально)
+    gate_records, gate_error = None, None
+    if "gate_api_key" in secrets:
+        try:
+            gate_records = fetch_gate(
+                api_key    = secrets["gate_api_key"],
+                api_secret = secrets["gate_api_secret"],
+                start_ms   = start_ms,
+                end_ms     = end_ms,
+            )
+        except Exception as e:
+            gate_error = str(e)
+            print(f"[Gate] Ошибка: {e}")
+
     message = build_report(
         start_ms, end_ms,
         aster_records, aster_error,
         bybit_records, bybit_error,
         lighter_records, lighter_error,
         mexc_records, mexc_error,
+        gate_records, gate_error,
     )
 
     send_telegram(secrets["telegram_token"], secrets["telegram_chat_id"], message)
