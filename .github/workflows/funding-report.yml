@@ -33,4 +33,6 @@ jobs:
           LIGHTER_AUTH_TOKEN: ${{ secrets.LIGHTER_AUTH_TOKEN }}
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_API_SECRET: ${{ secrets.MEXC_API_SECRET }}
+          GATE_API_KEY: ${{ secrets.GATE_API_KEY }}
+          GATE_API_SECRET: ${{ secrets.GATE_API_SECRET }}
         run: python funding_report.py
