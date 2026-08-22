@@ -29,4 +29,6 @@ jobs:
           BYBIT_PROXY: ${{ secrets.BYBIT_PROXY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LIGHTER_ACCOUNT_INDEX: ${{ secrets.LIGHTER_ACCOUNT_INDEX }}
+          LIGHTER_AUTH_TOKEN: ${{ secrets.LIGHTER_AUTH_TOKEN }}
         run: python funding_report.py
