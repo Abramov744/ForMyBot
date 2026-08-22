@@ -534,6 +534,85 @@ def fetch_gate(api_key: str, api_secret: str,
     return all_records
 
 
+# ── Опрос всех подключённых бирж за произвольный период ──────────────────────
+
+def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
+    """
+    Опрашивает все биржи за период [start_ms, end_ms).
+    Aster опрашивается всегда, остальные — только если для них есть секреты.
+    Возвращает dict: {"aster": (records, error), "bybit": (...), ...}
+    Ошибки отдельных бирж не прерывают опрос остальных.
+    """
+    results: dict = {}
+
+    try:
+        aster_records = fetch_aster(
+            user        = secrets["user"],
+            signer      = secrets["signer"],
+            private_key = secrets["signer_private_key"],
+            start_ms    = start_ms,
+            end_ms      = end_ms,
+        )
+        results["aster"] = (aster_records, None)
+    except Exception as e:
+        print(f"[Aster] Ошибка: {e}")
+        results["aster"] = (None, str(e))
+
+    if "bybit_api_key" in secrets:
+        try:
+            records = fetch_bybit(
+                api_key    = secrets["bybit_api_key"],
+                api_secret = secrets["bybit_api_secret"],
+                start_ms   = start_ms,
+                end_ms     = end_ms,
+            )
+            results["bybit"] = (records, None)
+        except Exception as e:
+            print(f"[Bybit] Ошибка: {e}")
+            results["bybit"] = (None, str(e))
+
+    if "lighter_account_index" in secrets:
+        try:
+            records = fetch_lighter(
+                account_index = secrets["lighter_account_index"],
+                auth_token    = secrets["lighter_auth_token"],
+                start_ms      = start_ms,
+                end_ms        = end_ms,
+            )
+            results["lighter"] = (records, None)
+        except Exception as e:
+            print(f"[Lighter] Ошибка: {e}")
+            results["lighter"] = (None, str(e))
+
+    if "mexc_api_key" in secrets:
+        try:
+            records = fetch_mexc(
+                api_key    = secrets["mexc_api_key"],
+                api_secret = secrets["mexc_api_secret"],
+                start_ms   = start_ms,
+                end_ms     = end_ms,
+            )
+            results["mexc"] = (records, None)
+        except Exception as e:
+            print(f"[MEXC] Ошибка: {e}")
+            results["mexc"] = (None, str(e))
+
+    if "gate_api_key" in secrets:
+        try:
+            records = fetch_gate(
+                api_key    = secrets["gate_api_key"],
+                api_secret = secrets["gate_api_secret"],
+                start_ms   = start_ms,
+                end_ms     = end_ms,
+            )
+            results["gate"] = (records, None)
+        except Exception as e:
+            print(f"[Gate] Ошибка: {e}")
+            results["gate"] = (None, str(e))
+
+    return results
+
+
 # ── Формирование отчёта ───────────────────────────────────────────────────────
 
 def _fmt_ms(ms: int) -> str:
@@ -676,83 +755,15 @@ def main():
     secrets  = load_secrets()
     start_ms, end_ms = previous_day_msk_ms()
 
-    # Aster
-    aster_records, aster_error = None, None
-    try:
-        aster_records = fetch_aster(
-            user        = secrets["user"],
-            signer      = secrets["signer"],
-            private_key = secrets["signer_private_key"],
-            start_ms    = start_ms,
-            end_ms      = end_ms,
-        )
-    except Exception as e:
-        aster_error = str(e)
-        print(f"[Aster] Ошибка: {e}")
-
-    # Bybit (опционально)
-    bybit_records, bybit_error = None, None
-    if "bybit_api_key" in secrets:
-        try:
-            bybit_records = fetch_bybit(
-                api_key    = secrets["bybit_api_key"],
-                api_secret = secrets["bybit_api_secret"],
-                start_ms   = start_ms,
-                end_ms     = end_ms,
-            )
-        except Exception as e:
-            bybit_error = str(e)
-            print(f"[Bybit] Ошибка: {e}")
-
-    # Lighter (опционально)
-    lighter_records, lighter_error = None, None
-    if "lighter_account_index" in secrets:
-        try:
-            lighter_records = fetch_lighter(
-                account_index = secrets["lighter_account_index"],
-                auth_token    = secrets["lighter_auth_token"],
-                start_ms      = start_ms,
-                end_ms        = end_ms,
-            )
-        except Exception as e:
-            lighter_error = str(e)
-            print(f"[Lighter] Ошибка: {e}")
-
-    # MEXC (опционально)
-    mexc_records, mexc_error = None, None
-    if "mexc_api_key" in secrets:
-        try:
-            mexc_records = fetch_mexc(
-                api_key    = secrets["mexc_api_key"],
-                api_secret = secrets["mexc_api_secret"],
-                start_ms   = start_ms,
-                end_ms     = end_ms,
-            )
-        except Exception as e:
-            mexc_error = str(e)
-            print(f"[MEXC] Ошибка: {e}")
-
-    # Gate (опционально)
-    gate_records, gate_error = None, None
-    if "gate_api_key" in secrets:
-        try:
-            gate_records = fetch_gate(
-                api_key    = secrets["gate_api_key"],
-                api_secret = secrets["gate_api_secret"],
-                start_ms   = start_ms,
-                end_ms     = end_ms,
-            )
-        except Exception as e:
-            gate_error = str(e)
-            print(f"[Gate] Ошибка: {e}")
+    results = fetch_all(secrets, start_ms, end_ms)
 
     message = build_report(
         start_ms, end_ms,
-        aster_records, aster_error,
-        bybit_records, bybit_error,
-        lighter_records, lighter_error,
-        mexc_records, mexc_error,
-        gate_records, gate_error,
+        *results.get("aster",   (None, None)),
+        *results.get("bybit",   (None, None)),
+        *results.get("lighter", (None, None)),
+        *results.get("mexc",    (None, None)),
+        *results.get("gate",    (None, None)),
     )
 
     send_telegram(secrets["telegram_token"], secrets["telegram_chat_id"], message)
