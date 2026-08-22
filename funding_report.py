@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Funding Fee Daily Report — Aster + Bybit + Lighter → Telegram
+Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC → Telegram
 Период: предыдущие календарные сутки по МСК (00:00–00:00 МСК).
 Запуск: ежедневно в 04:00 UTC (07:00 МСК).
 """
@@ -57,6 +57,13 @@ def load_secrets() -> dict:
     if lighter_account_index and lighter_auth_token:
         result["lighter_account_index"] = lighter_account_index
         result["lighter_auth_token"]    = lighter_auth_token
+
+    # MEXC — опционально
+    mexc_api_key    = os.environ.get("MEXC_API_KEY")
+    mexc_api_secret = os.environ.get("MEXC_API_SECRET")
+    if mexc_api_key and mexc_api_secret:
+        result["mexc_api_key"]    = mexc_api_key
+        result["mexc_api_secret"] = mexc_api_secret
 
     return result
 
@@ -315,6 +322,109 @@ def fetch_lighter(account_index: str, auth_token: str,
     return all_records
 
 
+# ── Получение данных с MEXC ───────────────────────────────────────────────────
+#
+# Авторизация MEXC Futures отличается и от Bybit, и от Aster:
+#   строка_параметров = отсортированные по алфавиту "key=value", склеенные через &
+#   (пустая строка, если параметров нет)
+#   target_string      = ApiKey + Request-Time(мс) + строка_параметров
+#   Signature           = HMAC-SHA256(ApiSecret, target_string), hex
+# Подпись передаётся не в query, а в заголовках: ApiKey, Request-Time, Signature.
+#
+# Эндпоинт: GET /api/v1/private/position/funding_records (база: https://api.mexc.com)
+
+def _get_mexc_proxies() -> dict | None:
+    """
+    Прокси для запросов к MEXC — на случай, если GitHub Actions IP тоже
+    попадёт под блокировку (как ранее было с Bybit). Читает MEXC_PROXY,
+    затем общие HTTPS_PROXY/HTTP_PROXY. Форматы значения — как у Bybit-версии.
+    """
+    proxy = (
+        os.environ.get("MEXC_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
+def _mexc_sign(api_key: str, api_secret: str,
+               timestamp: str, params_list: list) -> str:
+    # Бизнес-параметры сортируются по алфавиту (dictionary order) по ключу
+    sorted_params = sorted(params_list, key=lambda kv: kv[0])
+    param_string = "&".join(f"{k}={v}" for k, v in sorted_params)
+    target = f"{api_key}{timestamp}{param_string}"
+    return hmac.new(api_secret.encode("utf-8"), target.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def fetch_mexc(api_key: str, api_secret: str,
+               start_ms: int, end_ms: int) -> list:
+    """GET /api/v1/private/position/funding_records, с постраничной пагинацией."""
+    base_url    = "https://api.mexc.com"
+    page_size   = 100
+    all_records = []
+    page_num    = 1
+    proxies     = _get_mexc_proxies()
+    if proxies:
+        print(f"[MEXC DEBUG] запрос через прокси: {proxies['https'].split('@')[-1]}")
+
+    api_key    = api_key.strip()
+    api_secret = api_secret.strip()
+
+    while True:
+        timestamp = str(int(time.time() * 1000))
+
+        params_list = [
+            ("start_time", str(start_ms)),
+            ("end_time",   str(end_ms)),
+            ("page_num",   str(page_num)),
+            ("page_size",  str(page_size)),
+        ]
+
+        sig = _mexc_sign(api_key, api_secret, timestamp, params_list)
+        headers = {
+            "ApiKey":       api_key,
+            "Request-Time": timestamp,
+            "Signature":    sig,
+        }
+
+        query_string = urllib.parse.urlencode(sorted(params_list, key=lambda kv: kv[0]))
+        url = f"{base_url}/api/v1/private/position/funding_records?{query_string}"
+
+        resp = requests.get(url, headers=headers, timeout=30, proxies=proxies)
+        if not resp.ok:
+            print(f"[MEXC DEBUG] HTTP {resp.status_code}, тело ответа: {resp.text}")
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get("success", False):
+            raise RuntimeError(f"MEXC API error {data.get('code')}: {data.get('message') or data}")
+
+        payload = data.get("data") or {}
+        items = payload.get("resultList", [])
+        for item in items:
+            symbol = item.get("symbol", "")
+            item["asset"] = symbol.split("_")[-1] if "_" in symbol else "USDT"
+        all_records.extend(items)
+
+        total_page = payload.get("totalPage", 1)
+        if not items or page_num >= total_page:
+            break
+        page_num += 1
+
+    return all_records
+
+
 # ── Формирование отчёта ───────────────────────────────────────────────────────
 
 def _fmt_ms(ms: int) -> str:
@@ -364,7 +474,8 @@ def _section_lines(exchange: str,
 def build_report(start_ms: int, end_ms: int,
                  aster_records: list | None, aster_error: str | None,
                  bybit_records: list | None, bybit_error: str | None,
-                 lighter_records: list | None = None, lighter_error: str | None = None) -> str:
+                 lighter_records: list | None = None, lighter_error: str | None = None,
+                 mexc_records: list | None = None, mexc_error: str | None = None) -> str:
 
     header = [
         "📊 Отчёт по funding fee",
@@ -399,16 +510,27 @@ def build_report(start_ms: int, end_ms: int,
         )
         combined.extend(lighter_lines)
 
+    # MEXC — только если запрашивался
+    mexc_totals: dict = {}
+    if mexc_records is not None or mexc_error is not None:
+        combined.append("")
+        mexc_lines, mexc_totals = _section_lines(
+            "MEXC", mexc_records, mexc_error,
+            income_field="funding", symbol_field="symbol", asset_field="asset",
+        )
+        combined.extend(mexc_lines)
+
     # Итог по всем биржам
-    if bybit_totals or aster_totals or lighter_totals:
+    if bybit_totals or aster_totals or lighter_totals or mexc_totals:
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
-        all_assets: set = set(aster_totals) | set(bybit_totals) | set(lighter_totals)
+        all_assets: set = set(aster_totals) | set(bybit_totals) | set(lighter_totals) | set(mexc_totals)
         for asset in sorted(all_assets):
             total = (
                 aster_totals.get(asset, 0.0)
                 + bybit_totals.get(asset, 0.0)
                 + lighter_totals.get(asset, 0.0)
+                + mexc_totals.get(asset, 0.0)
             )
             emoji = "🟢" if total >= 0 else "🔴"
             combined.append(f"  {emoji} {asset}: {total:+.4f}")
@@ -472,11 +594,26 @@ def main():
             lighter_error = str(e)
             print(f"[Lighter] Ошибка: {e}")
 
+    # MEXC (опционально)
+    mexc_records, mexc_error = None, None
+    if "mexc_api_key" in secrets:
+        try:
+            mexc_records = fetch_mexc(
+                api_key    = secrets["mexc_api_key"],
+                api_secret = secrets["mexc_api_secret"],
+                start_ms   = start_ms,
+                end_ms     = end_ms,
+            )
+        except Exception as e:
+            mexc_error = str(e)
+            print(f"[MEXC] Ошибка: {e}")
+
     message = build_report(
         start_ms, end_ms,
         aster_records, aster_error,
         bybit_records, bybit_error,
         lighter_records, lighter_error,
+        mexc_records, mexc_error,
     )
 
     send_telegram(secrets["telegram_token"], secrets["telegram_chat_id"], message)
