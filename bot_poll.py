@@ -40,6 +40,12 @@ from funding_report import (
 COMMAND_RE = re.compile(r"^/report(?:@\w+)?\s*(.*)$", re.IGNORECASE)
 CALENDAR_RE = re.compile(r"^/calendar(?:@\w+)?\s*$", re.IGNORECASE)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
+
+# Подписи постоянных кнопок внизу чата (Reply Keyboard) — при нажатии
+# Telegram отправляет боту этот же текст, как будто пользователь напечатал его сам
+BUTTON_REPORT = "📊 Отчёт за вчера"
+BUTTON_CALENDAR = "📅 Календарь"
 
 MONTH_NAMES_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
@@ -47,6 +53,24 @@ MONTH_NAMES_RU = {
     9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
 }
 WEEKDAY_HEADERS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def build_main_menu_keyboard() -> dict:
+    """
+    Постоянная клавиатура с кнопками внизу чата (не путать с inline-кнопками
+    календаря — это два независимых механизма Telegram, могут работать
+    одновременно). resize_keyboard делает кнопки компактными, is_persistent
+    держит клавиатуру видимой, пока её явно не уберут.
+    """
+    return {
+        "keyboard": [
+            [{"text": BUTTON_REPORT}],
+            [{"text": BUTTON_CALENDAR}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
 
 
 # ── Разбор даты/периода ───────────────────────────────────────────────────────
@@ -215,6 +239,22 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
     if chat_id != allowed_chat_id:
         print(f"Игнорирую сообщение из чужого чата {chat_id}")
         return
+
+    if START_RE.match(text):
+        send_message(
+            token, chat_id,
+            "Готов присылать отчёты по funding fee.\n"
+            "Кнопки внизу — под рукой, либо команды /report и /calendar текстом.",
+            reply_markup=build_main_menu_keyboard(),
+        )
+        return
+
+    # Нажатие на постоянную кнопку — по сути то же самое, что и команда,
+    # просто текст сообщения не начинается с "/"
+    if text == BUTTON_CALENDAR:
+        text = "/calendar"
+    elif text == BUTTON_REPORT:
+        text = "/report"
 
     if CALENDAR_RE.match(text):
         now_msk = datetime.now(MSK)
