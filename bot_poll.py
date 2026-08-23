@@ -154,13 +154,22 @@ def edit_message_reply_markup(token: str, chat_id: str, message_id: int, reply_m
 
 
 def answer_callback_query(token: str, callback_query_id: str, text: str | None = None) -> None:
-    """Обязательно вызывать на каждый callback_query — иначе кнопка «крутится» у пользователя."""
+    """
+    Снимает «часики» с нажатой кнопки в Telegram. Из-за задержки опроса
+    (cron раз в несколько минут) к моменту вызова callback_query иногда
+    уже "протухает" — Telegram отвечает 400 Bad Request. Это не критично
+    (чисто косметический эффект — кнопка чуть дольше выглядит "нажатой"),
+    поэтому ошибку здесь глотаем и не даём ей прервать формирование отчёта.
+    """
     url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
-    resp = requests.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[answerCallbackQuery] не критично, пропускаю: {e}")
 
 
 # ── Формирование и отправка отчёта ────────────────────────────────────────────
