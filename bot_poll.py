@@ -123,13 +123,21 @@ def build_calendar_markup(year: int, month: int) -> dict:
 
 # ── Низкоуровневые вызовы Telegram Bot API ────────────────────────────────────
 
-def get_updates(token: str, offset: int | None = None) -> list:
-    """Короткий (не long-poll) запрос getUpdates — сама функция вызывается по cron."""
+def get_updates(token: str, offset: int | None = None, timeout: int = 0) -> list:
+    """
+    Запрос к Telegram getUpdates.
+    timeout=0   — короткий запрос, как используется в этом файле (cron-версия
+                  bot_poll.py, одноразовый запуск по расписанию).
+    timeout>0   — long polling: Telegram держит соединение открытым до
+                  timeout секунд и отвечает сразу же, как только придёт
+                  новое сообщение. Используется в bot_worker.py — постоянно
+                  работающем боте на отдельном хостинге.
+    """
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-    params = {"timeout": 0}
+    params = {"timeout": timeout}
     if offset is not None:
         params["offset"] = offset
-    resp = requests.get(url, params=params, timeout=15)
+    resp = requests.get(url, params=params, timeout=timeout + 15)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
