@@ -135,8 +135,9 @@ def api_entry_price():
     """
     Авто-подбор цен открытия для конкретной ОТКРЫТОЙ СЕЙЧАС позиции:
     цена фьючерса — из данных позиции на бирже, цена спота — из истории
-    сделок на подключённых спот-биржах вокруг момента открытия. Может
-    занять до ~10-20 секунд (несколько запросов к биржам подряд).
+    сделок на подключённых спот-биржах и (если настроен UNISWAP_WALLET_ADDRESS)
+    из истории переводов кошелька на всех EVM-сетях вокруг момента открытия.
+    Может занять до ~30 секунд — Uniswap-поиск опрашивает десятки сетей.
     """
     exchange = request.args.get("exchange", "")
     symbol = request.args.get("symbol", "")
@@ -385,7 +386,7 @@ async function onSymbolChange() {
   const symbol = symbolSelect.value;
   if (!exchange || !symbol) { clearEntryPriceStatus(); return; }
 
-  entryPriceStatus.textContent = 'Ищу цены открытия по истории (может занять до ~20 сек)…';
+  entryPriceStatus.textContent = 'Ищу цены открытия по истории (может занять до ~30 сек)…';
   try {
     const resp = await fetch(`/api/entry-price?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`);
     const data = await resp.json();
