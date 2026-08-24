@@ -787,6 +787,73 @@ def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) ->
     return all_records
 
 
+# Funding у перпетуалов на всех крупных биржах идёт не реже раза в 8 часов
+# (стандартный интервал); чаще — бывает (1ч/4ч при повышенной волатильности),
+# реже — нет. Поэтому разрыв заметно больше 8 часов между двумя соседними
+# начислениями по одному символу — надёжный признак закрытия позиции в этот
+# промежуток (funding не начисляется, когда позиции нет), а не просто смены
+# частоты начислений (та бывает чаще, не реже, так что 8ч-порог её не ловит).
+CONTINUOUS_FUNDING_GAP_HOURS = 16
+
+
+def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
+                             gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS) -> list:
+    """
+    Для записей funding ОДНОГО символа: сортирует по времени (от новых
+    к старым) и оставляет только непрерывную цепочку начислений от самой
+    последней записи назад. Как только разрыв между двумя соседними по
+    времени начислениями превышает gap_threshold_hours — считаем, что до
+    этого момента позиция была закрыта, и дальше в прошлое не берём.
+
+    Порог фиксированный (не подстраивается под данные) — см. комментарий
+    к CONTINUOUS_FUNDING_GAP_HOURS про то, почему это безопаснее адаптивного
+    порога (не путает смену частоты начислений с закрытием позиции).
+
+    time_unit: "ms" или "s" — единицы измерения значения в time_field.
+    """
+    def _time_ms(r):
+        raw = r.get(time_field)
+        if raw is None:
+            return None
+        val = int(float(raw))
+        return val * 1000 if time_unit == "s" else val
+
+    timed = [(_time_ms(r), r) for r in records]
+    timed = [(t, r) for t, r in timed if t is not None]
+    if not timed:
+        return []
+    timed.sort(key=lambda x: x[0], reverse=True)  # от самых новых к старым
+    if len(timed) == 1:
+        return [timed[0][1]]
+
+    threshold_ms = gap_threshold_hours * 60 * 60 * 1000
+    result = [timed[0][1]]
+    for i in range(len(timed) - 1):
+        gap = timed[i][0] - timed[i + 1][0]
+        if gap > threshold_ms:
+            break
+        result.append(timed[i + 1][1])
+    return result
+
+
+def _trim_open_position_records(records: list, symbol_field: str,
+                                 time_field: str, time_unit: str) -> list:
+    """
+    Группирует записи funding по символу и для каждого символа отдельно
+    оставляет только непрерывную цепочку начислений (см. _trim_to_continuous_run).
+    Используется для бирж без точного времени открытия позиции в API
+    (Aster, Lighter, Gate) — в отличие от Bybit/MEXC, где есть createdTime.
+    """
+    by_symbol: dict = defaultdict(list)
+    for r in records:
+        by_symbol[r.get(symbol_field)].append(r)
+
+    trimmed: list = []
+    for _, sym_records in by_symbol.items():
+        trimmed.extend(_trim_to_continuous_run(sym_records, time_field, time_unit))
+    return trimmed
+
+
 def fetch_all_time_open_positions(secrets: dict) -> dict:
     """
     Для каждой подключённой биржи:
@@ -794,13 +861,17 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
       2) забирает funding fee и оставляет только записи по этим символам.
 
     Точность различается по биржам:
-      - Bybit, MEXC — ТОЧНО: биржа отдаёт время открытия позиции
-        (createdTime/createTime), funding считается именно с этого момента.
-      - Aster, Lighter, Gate — ПРИБЛИЖЁННО: биржа не отдаёт время открытия
-        позиции в API, поэтому берётся funding за последние
-        OPEN_POSITIONS_LOOKBACK_DAYS дней по этому символу. Если позиция
-        по символу открывалась/закрывалась несколько раз за этот период —
-        в сумму попадёт funding и за предыдущие заходы тоже.
+      - Bybit, MEXC — ТОЧНО по времени: биржа отдаёт время открытия
+        позиции (createdTime/createTime), funding считается именно с
+        этого момента.
+      - Aster, Lighter, Gate — ТОЧНО по непрерывности начислений: биржа
+        не отдаёт время открытия позиции в API, поэтому берётся история
+        funding за последние OPEN_POSITIONS_LOOKBACK_DAYS дней (потолок
+        глубины поиска) и из неё оставляется только непрерывная цепочка
+        начислений от самого последнего назад — как только между двумя
+        соседними по времени начислениями обнаруживается разрыв заметно
+        больше обычного интервала, считаем, что до этого момента позиция
+        была закрыта (см. _trim_to_continuous_run).
 
     Если на бирже сейчас нет ни одной открытой позиции — биржа просто
     не попадает в результат (как будто не была запрошена), чтобы не
@@ -826,6 +897,9 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     _EXCHANGE_WINDOW_DAYS["aster"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
+                records = _trim_open_position_records(
+                    records, symbol_field="symbol", time_field="time", time_unit="ms",
+                )
                 results["aster"] = (records, None)
         except Exception as e:
             print(f"[Aster/positions] Ошибка: {e}")
@@ -868,6 +942,9 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     _EXCHANGE_WINDOW_DAYS["lighter"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
+                records = _trim_open_position_records(
+                    records, symbol_field="symbol", time_field="timestamp", time_unit="s",
+                )
                 results["lighter"] = (records, None)
         except Exception as e:
             print(f"[Lighter/positions] Ошибка: {e}")
@@ -908,6 +985,9 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     _EXCHANGE_WINDOW_DAYS["gate"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
+                records = _trim_open_position_records(
+                    records, symbol_field="symbol", time_field="time", time_unit="s",
+                )
                 results["gate"] = (records, None)
         except Exception as e:
             print(f"[Gate/positions] Ошибка: {e}")
@@ -924,9 +1004,7 @@ def build_open_positions_report(results: dict) -> str:
     обычном отчёте.
     """
     combined = [
-        "📈 Funding по всем открытым позициям",
-        "(Bybit, MEXC — точно с момента открытия; "
-        f"Aster, Lighter, Gate — за последние {OPEN_POSITIONS_LOOKBACK_DAYS} дн., приближённо)",
+        "📈 Funding по всем открытым позициям (с момента открытия каждой позиции)",
     ]
     field_map = {
         "aster":   ("Aster",   "income",  "symbol", "asset"),
