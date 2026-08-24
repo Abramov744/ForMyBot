@@ -734,18 +734,56 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
 
 # ── Funding по всем открытым сейчас позициям (за всё доступное время) ────────
 
+# Как далеко в прошлое "копаем" в поисках funding по текущим открытым
+# позициям. Большинство бирж не дают запросить весь диапазон разом (см.
+# _EXCHANGE_WINDOW_DAYS ниже) — приходится разбивать на окна, а раз так,
+# разумно ограничить и общую глубину, чтобы не делать сотни запросов.
+# Если позиция держится дольше — увеличьте это число.
+OPEN_POSITIONS_LOOKBACK_DAYS = 180
+
+# Максимальный диапазон дат в одном запросе истории funding — ограничение
+# самой биржи (не наше). Bybit/Aster подтверждено документацией и/или
+# реальной ошибкой 400; для Lighter точных цифр в доках нет, взято с запасом.
+_EXCHANGE_WINDOW_DAYS = {
+    "aster": 7,
+    "bybit": 7,
+    "lighter": 30,
+    "mexc": 90,
+    "gate": 30,
+}
+
+
+def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) -> list:
+    """
+    Вызывает fetch_fn(chunk_start_ms, chunk_end_ms) кусками не длиннее
+    window_days дней подряд и объединяет результаты в один список.
+    Нужно из-за ограничений бирж на максимальный диапазон дат в одном
+    запросе истории (см. _EXCHANGE_WINDOW_DAYS).
+    """
+    window_ms = window_days * 24 * 60 * 60 * 1000
+    all_records: list = []
+    cur_start = start_ms
+    while cur_start < end_ms:
+        cur_end = min(cur_start + window_ms, end_ms)
+        all_records.extend(fetch_fn(cur_start, cur_end))
+        cur_start = cur_end
+    return all_records
+
+
 def fetch_all_time_open_positions(secrets: dict) -> dict:
     """
     Для каждой подключённой биржи:
       1) получает список символов с открытой сейчас позицией;
-      2) если список не пуст — забирает всю доступную историю funding fee
-         (start_ms=0) и оставляет только записи по этим символам.
+      2) если список не пуст — забирает историю funding fee за последние
+         OPEN_POSITIONS_LOOKBACK_DAYS дней (кусками — биржи ограничивают
+         диапазон одного запроса) и оставляет только записи по этим символам.
     Если на бирже сейчас нет ни одной открытой позиции — биржа просто
     не попадает в результат (как будто не была запрошена), чтобы не
     засорять отчёт пустыми секциями.
     Формат результата — тот же, что и у fetch_all(): {"aster": (records, error), ...}
     """
     now_ms = int(time.time() * 1000)
+    lookback_start_ms = now_ms - OPEN_POSITIONS_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
     results: dict = {}
 
     if "user" in secrets:
@@ -755,10 +793,12 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 private_key=secrets["signer_private_key"],
             )
             if open_symbols:
-                records = fetch_aster(
-                    user=secrets["user"], signer=secrets["signer"],
-                    private_key=secrets["signer_private_key"],
-                    start_ms=0, end_ms=now_ms,
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_aster(
+                        user=secrets["user"], signer=secrets["signer"],
+                        private_key=secrets["signer_private_key"], start_ms=s, end_ms=e,
+                    ),
+                    _EXCHANGE_WINDOW_DAYS["aster"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 results["aster"] = (records, None)
@@ -770,9 +810,12 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_symbols = fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"])
             if open_symbols:
-                records = fetch_bybit(
-                    api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
-                    start_ms=0, end_ms=now_ms,
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_bybit(
+                        api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
+                        start_ms=s, end_ms=e,
+                    ),
+                    _EXCHANGE_WINDOW_DAYS["bybit"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 results["bybit"] = (records, None)
@@ -784,9 +827,12 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_symbols = fetch_lighter_open_symbols(secrets["lighter_account_index"], secrets["lighter_auth_token"])
             if open_symbols:
-                records = fetch_lighter(
-                    account_index=secrets["lighter_account_index"], auth_token=secrets["lighter_auth_token"],
-                    start_ms=0, end_ms=now_ms,
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_lighter(
+                        account_index=secrets["lighter_account_index"], auth_token=secrets["lighter_auth_token"],
+                        start_ms=s, end_ms=e,
+                    ),
+                    _EXCHANGE_WINDOW_DAYS["lighter"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 results["lighter"] = (records, None)
@@ -798,9 +844,12 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_symbols = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
             if open_symbols:
-                records = fetch_mexc(
-                    api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
-                    start_ms=0, end_ms=now_ms,
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_mexc(
+                        api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
+                        start_ms=s, end_ms=e,
+                    ),
+                    _EXCHANGE_WINDOW_DAYS["mexc"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 results["mexc"] = (records, None)
@@ -812,9 +861,12 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_symbols = fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"])
             if open_symbols:
-                records = fetch_gate(
-                    api_key=secrets["gate_api_key"], api_secret=secrets["gate_api_secret"],
-                    start_ms=0, end_ms=now_ms,
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_gate(
+                        api_key=secrets["gate_api_key"], api_secret=secrets["gate_api_secret"],
+                        start_ms=s, end_ms=e,
+                    ),
+                    _EXCHANGE_WINDOW_DAYS["gate"], lookback_start_ms, now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 results["gate"] = (records, None)
