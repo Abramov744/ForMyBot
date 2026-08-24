@@ -32,8 +32,84 @@ from funding_report import (
     fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate,
     fetch_aster_open_symbols, fetch_bybit_open_symbols, fetch_lighter_open_symbols,
     fetch_mexc_open_symbols, fetch_gate_open_symbols,
-    _fetch_in_windows, _EXCHANGE_WINDOW_DAYS,
+    _fetch_in_windows, _EXCHANGE_WINDOW_DAYS, _trim_to_continuous_run,
 )
+
+# Для КАЖДОГО символа биржа хранит funding-историю без разбивки на "эта
+# позиция" / "предыдущая позиция по тому же символу" — если монету уже
+# открывали и закрывали раньше в пределах выбранного периода, её funding
+# тоже попадёт в выборку по символу. bot_poll/funding_report для отчёта
+# "по открытым позициям" (fetch_all_time_open_positions) от этого защищён —
+# он обрезает историю каждого символа до момента, когда ТЕКУЩАЯ позиция
+# была открыта (точно — по createTime/transactionTime у Bybit/MEXC,
+# приближённо — по непрерывности начислений у Aster/Gate/Lighter, см.
+# _trim_to_continuous_run). Раньше калькулятор такой обрезки не делал вовсе
+# и просто суммировал все funding-записи по символу за весь период, который
+# выбрал пользователь (по умолчанию — последние 30 дней) — из-за этого при
+# автоподборе цены для монеты, которую открывали/закрывали больше одного
+# раза за это время, калькулятор мог показать сумму БОЛЬШЕ, чем реальный
+# funding текущей позиции, хотя бот в Telegram считал верно. Информация
+# ниже воспроизводит именно ту логику, что уже используется в отчёте по
+# открытым позициям — чтобы оба места считали одинаково.
+_EXACT_OPEN_TIME_FIELDS = {
+    "bybit": "transactionTime",
+    "mexc": "settleTime",
+}
+_CONTINUOUS_OPEN_TIME_FIELDS = {
+    "aster": ("time", "ms"),
+    "lighter": ("timestamp", "s"),
+    "gate": ("time", "s"),
+}
+
+
+def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, records: list) -> list:
+    """Оставляет только funding-записи, относящиеся к ТЕКУЩЕЙ открытой
+    позиции по символу — если позиция сейчас не открыта на бирже, обрезка
+    не применяется вовсе (в этом случае считаем, что пользователь осознанно
+    смотрит историческую сумму за произвольный период для уже закрытой
+    сделки, и её трогать не нужно)."""
+    try:
+        if exchange in _EXACT_OPEN_TIME_FIELDS:
+            fetch_open = {"bybit": fetch_bybit_open_symbols, "mexc": fetch_mexc_open_symbols}[exchange]
+            api_key_field, api_secret_field = {
+                "bybit": ("bybit_api_key", "bybit_api_secret"),
+                "mexc": ("mexc_api_key", "mexc_api_secret"),
+            }[exchange]
+            if api_key_field not in secrets:
+                return records
+            open_times = fetch_open(secrets[api_key_field], secrets[api_secret_field])
+            open_time = open_times.get(symbol)
+            if open_time is None:
+                return records  # сейчас не открыта — обрезка не применяется
+            time_field = _EXACT_OPEN_TIME_FIELDS[exchange]
+            return [r for r in records if int(r.get(time_field, 0) or 0) >= open_time]
+
+        if exchange in _CONTINUOUS_OPEN_TIME_FIELDS:
+            fetch_open = {
+                "aster": lambda: fetch_aster_open_symbols(
+                    secrets["user"], secrets["signer"], secrets["signer_private_key"],
+                ),
+                "lighter": lambda: fetch_lighter_open_symbols(
+                    secrets["lighter_account_index"], secrets["lighter_auth_token"],
+                ),
+                "gate": lambda: fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"]),
+            }.get(exchange)
+            required_key = {"aster": "user", "lighter": "lighter_account_index", "gate": "gate_api_key"}[exchange]
+            if required_key not in secrets or fetch_open is None:
+                return records
+            open_symbols = fetch_open()
+            if symbol not in open_symbols:
+                return records  # сейчас не открыта — обрезка не применяется
+            time_field, time_unit = _CONTINUOUS_OPEN_TIME_FIELDS[exchange]
+            return _trim_to_continuous_run(records, time_field, time_unit)
+    except Exception as e:
+        # Не удалось проверить статус позиции — лучше вернуть НЕобрезанные
+        # данные (старое поведение), чем уронить весь расчёт калькулятора
+        # из-за побочного запроса.
+        print(f"[calculator] Не удалось обрезать funding до времени открытия позиции ({exchange}/{symbol}): {e}")
+        return records
+
+    return records
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
@@ -103,6 +179,10 @@ def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: i
     if symbol:
         field = EXCHANGE_FIELDS[exchange]["symbol"]
         records = [r for r in records if r.get(field) == symbol]
+        # См. комментарий у _trim_to_current_open_position: без этого шага сюда
+        # попал бы funding и от предыдущих (уже закрытых) открытий того же
+        # символа внутри выбранного периода, а не только текущей позиции.
+        records = _trim_to_current_open_position(secrets, exchange, symbol, records)
 
     return records
 
