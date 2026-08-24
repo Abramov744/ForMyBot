@@ -381,13 +381,21 @@ _TESTNET_NAME_KEYWORDS = ("testnet", "sepolia", "goerli", "holesky", "devnet", "
 _evm_chainlist_cache: list = []
 _evm_chainlist_cache_ts: float = 0.0
 EVM_CHAINLIST_CACHE_TTL_S = 24 * 60 * 60  # список сетей почти не меняется — кэш на сутки
+# Сети, которые уже ответили "не поддерживается на бесплатном тарифе" или
+# "дневной лимит исчерпан" — запоминаем и больше НЕ дёргаем до следующего
+# обновления кэша сетей (см. _fetch_evm_chainlist), а не долбим их впустую
+# на каждый следующий поиск цены. Сбрасывается вместе с кэшем сетей — вдруг
+# тариф апгрейднули или дневной лимит уже сбросился.
+_evm_blocked_chains: set = set()
+_UNSUPPORTED_CHAIN_MSG_KEYWORDS = ("not supported for this chain", "api limit reached")
 
 _etherscan_rate_lock = threading.Lock()
 _etherscan_last_call_ts = [0.0]
-# Бесплатный тариф Etherscan — 5 запросов/сек НА КЛЮЧ (общий лимит для всех сетей
-# сразу, не по отдельности на каждую) — поэтому троттлим глобально одним локом,
-# а не по сети.
-ETHERSCAN_MIN_INTERVAL_S = 0.22
+# Реальный лимит бесплатного тарифа Etherscan — 3 запроса/сек на ключ (НЕ 5, как
+# можно было бы подумать по документации) — проверено на практике 24.08.2026: с
+# интервалом 0.22с (~4.5/сек) регулярно ловили "Max calls per sec rate limit
+# reached (3/сек)". Берём интервал с запасом ниже реального лимита.
+ETHERSCAN_MIN_INTERVAL_S = 0.4
 
 
 def _etherscan_get(params: dict, api_key: str) -> dict:
@@ -415,7 +423,7 @@ def _fetch_evm_chainlist(api_key: str) -> list:
     самом ответе; пропускаем только офлайновые (0), Degraded всё ещё
     опрашиваем — деградация обычно означает задержку индексации, а не
     недоступность API."""
-    global _evm_chainlist_cache, _evm_chainlist_cache_ts
+    global _evm_chainlist_cache, _evm_chainlist_cache_ts, _evm_blocked_chains
     now = time.time()
     if _evm_chainlist_cache and now - _evm_chainlist_cache_ts < EVM_CHAINLIST_CACHE_TTL_S:
         return _evm_chainlist_cache
@@ -449,6 +457,7 @@ def _fetch_evm_chainlist(api_key: str) -> list:
 
     _evm_chainlist_cache = chains
     _evm_chainlist_cache_ts = now
+    _evm_blocked_chains = set()
     return chains
 
 
@@ -473,14 +482,22 @@ def _fetch_uniswap_chain_transfers(chain_id: int, api_key: str, wallet: str) -> 
     return result if isinstance(result, list) else []
 
 
-def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
-    """symbol здесь — не биржевой тикер, а "BASE:QUOTE" (см. _uniswap_symbol_fn,
-    единственный источник, где формат символа отличается от остальных бирж)."""
+UNISWAP_QUOTE_CANDIDATES = ("USDT", "USDC", "WETH")
+
+
+def _fetch_uniswap_spot_trades_all_quotes(secrets: dict, base_asset: str, start_ms: int, end_ms: int) -> dict:
+    """{quote_asset: [trades...]} — ОДИН проход по всем EVM-сетям сразу, с
+    проверкой всех кандидатов котировки (USDT/USDC/WETH) внутри каждой найденной
+    транзакции. Раньше (до 24.08.2026) каждая сеть сканировалась ОТДЕЛЬНО под
+    каждую quote-кандидатуру из общего цикла в _search_spot_entry — то есть одни
+    и те же ~60 сетей опрашивались трижды на один поиск цены. Совершенно лишнее:
+    одна и та же выборка из 1000 последних переводов кошелька уже содержит
+    переводы во всех котируемых активах сразу, поэтому сканируем один раз и
+    сортируем результат по тому, какая котировка нашлась."""
     wallet = secrets.get("uniswap_wallet_address")
     api_key = secrets.get("etherscan_api_key")
     if not wallet or not api_key:
-        return []
-    base_asset, quote_asset = symbol.split(":", 1)
+        return {}
     wallet_lower = wallet.lower()
     start_s, end_s = start_ms // 1000, end_ms // 1000
 
@@ -488,13 +505,24 @@ def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms
         chains = _fetch_evm_chainlist(api_key)
     except Exception as e:
         print(f"[entry_price/uniswap] Не удалось получить список EVM-сетей: {e}")
-        return []
+        return {}
 
     def _scan_chain(chain_id: int, chain_name: str) -> list:
+        if chain_id in _evm_blocked_chains:
+            return []  # уже знаем, что сеть недоступна на текущем тарифе/лимите — не дёргаем зря
         try:
             transfers = _fetch_uniswap_chain_transfers(chain_id, api_key, wallet)
         except Exception as e:
-            print(f"[entry_price/uniswap/{chain_name}] Ошибка запроса переводов: {e}")
+            msg = str(e).lower()
+            if any(kw in msg for kw in _UNSUPPORTED_CHAIN_MSG_KEYWORDS):
+                # Ограничение тарифа Etherscan, не наша ошибка и не временный сбой —
+                # запоминаем сеть и больше не опрашиваем её до обновления кэша сетей.
+                _evm_blocked_chains.add(chain_id)
+                print(f"[entry_price/uniswap/{chain_name}] Сеть недоступна на текущем тарифе Etherscan — больше не опрашивается в этом кэш-цикле ({e})")
+            else:
+                # "Max calls per sec" и подобное — транзиентное, оставляем на
+                # следующую попытку без пометки как заблокированной сети.
+                print(f"[entry_price/uniswap/{chain_name}] Ошибка запроса переводов: {e}")
             return []
 
         by_hash: dict = defaultdict(list)
@@ -505,7 +533,8 @@ def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms
 
         found = []
         for group in by_hash.values():
-            base_in = quote_out = None
+            base_in = None
+            quote_out_by_symbol: dict = {}
             for t in group:
                 sym = (t.get("tokenSymbol") or "").upper()
                 try:
@@ -515,10 +544,15 @@ def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms
                     continue
                 if sym == base_asset.upper() and (t.get("to") or "").lower() == wallet_lower:
                     base_in = amount
-                if sym == quote_asset.upper() and (t.get("from") or "").lower() == wallet_lower:
-                    quote_out = amount
-            if base_in and quote_out and base_in > 0:
-                found.append({"price": quote_out / base_in, "qty": base_in, "side": "Buy", "chain": chain_name})
+                elif sym in UNISWAP_QUOTE_CANDIDATES and (t.get("from") or "").lower() == wallet_lower:
+                    quote_out_by_symbol[sym] = amount
+            if not base_in or base_in <= 0:
+                continue
+            for quote_sym, quote_out in quote_out_by_symbol.items():
+                found.append({
+                    "quote": quote_sym, "price": quote_out / base_in,
+                    "qty": base_in, "side": "Buy", "chain": chain_name,
+                })
         return found
 
     all_trades = []
@@ -530,31 +564,42 @@ def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms
         for f in concurrent.futures.as_completed(futures):
             all_trades.extend(f.result())
 
-    return all_trades
-
-
-def _uniswap_symbol_fn(base: str, quote: str) -> str:
-    return f"{base}:{quote}"
+    by_quote: dict = defaultdict(list)
+    for t in all_trades:
+        by_quote[t["quote"]].append(t)
+    return dict(by_quote)
 
 
 _SPOT_TRADE_FETCHERS = {
-    "bybit":    (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "mexc":     (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "gate":     (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
-    "uniswap":  (lambda secrets, symbol, s, e: _fetch_uniswap_spot_trades(secrets, symbol, s, e), _uniswap_symbol_fn),
+    "bybit": (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
+    "mexc":  (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
+    "gate":  (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
+    # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
+    # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
+    # _search_spot_entry), а не через этот реестр из (fetch_fn, symbol_fn) на
+    # каждую котировку, как у CEX-бирж.
 }
 
 _SPOT_EXCHANGE_SECRET_KEY = {
     "bybit": "bybit_api_key",
     "mexc": "mexc_api_key",
     "gate": "gate_api_key",
-    "uniswap": "uniswap_wallet_address",
 }
 
 
 def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_minutes: int) -> dict | None:
     start_ms = center_ms - window_minutes * 60 * 1000
     end_ms = center_ms + window_minutes * 60 * 1000
+
+    # Uniswap сканируется ОДИН раз на все котировки сразу (а не по разу на
+    # каждую котировку внутри цикла ниже, как CEX-биржи) — иначе на каждый
+    # поиск цены заново прогоняются все ~60 EVM-сетей по три раза подряд.
+    uniswap_by_quote: dict = {}
+    if "uniswap_wallet_address" in secrets:
+        try:
+            uniswap_by_quote = _fetch_uniswap_spot_trades_all_quotes(secrets, base_asset, start_ms, end_ms)
+        except Exception as e:
+            print(f"[entry_price/uniswap] Ошибка поиска спот-сделок: {e}")
 
     for quote in QUOTE_CANDIDATES:
         matches = []  # (exchange, [trades])
@@ -570,6 +615,10 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
                 continue
             if trades:
                 matches.append((exchange, trades))
+
+        uniswap_trades = uniswap_by_quote.get(quote)
+        if uniswap_trades:
+            matches.append(("uniswap", uniswap_trades))
 
         if matches:
             total_qty = sum(t["qty"] for _, trades in matches for t in trades)
