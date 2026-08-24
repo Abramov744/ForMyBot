@@ -141,6 +141,26 @@ def fetch_aster(user: str, signer: str, private_key: str,
     return all_records
 
 
+def fetch_aster_open_symbols(user: str, signer: str, private_key: str) -> set:
+    """GET /fapi/v3/positionRisk — возвращает набор символов с ненулевой позицией."""
+    nonce = int(time.time() * 1_000_000)
+    params = {
+        "timestamp": str(int(time.time() * 1000)),
+        "nonce":     str(nonce),
+        "user":      user,
+        "signer":    signer,
+    }
+    param_str = urllib.parse.urlencode(params)
+    sig = _aster_sign(param_str, private_key)
+    url = f"https://fapi.asterdex.com/fapi/v3/positionRisk?{param_str}&signature={sig}"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        raise RuntimeError(f"Aster positionRisk error: {data}")
+    return {p["symbol"] for p in data if abs(float(p.get("positionAmt", 0))) > 0}
+
+
 # ── Получение данных с Bybit ──────────────────────────────────────────────────
 
 def _get_proxies() -> dict | None:
@@ -249,6 +269,33 @@ def fetch_bybit(api_key: str, api_secret: str,
     return all_records
 
 
+def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> set:
+    """GET /v5/position/list, category=linear, settleCoin=USDT — набор символов с открытой позицией."""
+    base_url = "https://api.bybit.com"
+    recv_window = "5000"
+    proxies = _get_proxies()
+    api_key, api_secret = api_key.strip(), api_secret.strip()
+
+    timestamp = str(int(time.time() * 1000))
+    params_list = [("category", "linear"), ("settleCoin", "USDT"), ("limit", "200")]
+    query_string = urllib.parse.urlencode(params_list)
+    sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
+    headers = {
+        "X-BAPI-API-KEY":     api_key,
+        "X-BAPI-SIGN":        sig,
+        "X-BAPI-TIMESTAMP":   timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+    }
+    resp = requests.get(f"{base_url}/v5/position/list?{query_string}", headers=headers, timeout=30, proxies=proxies)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode", 0) != 0:
+        raise RuntimeError(f"Bybit position/list error {data.get('retCode')}: {data.get('retMsg')}")
+
+    items = data.get("result", {}).get("list", [])
+    return {p["symbol"] for p in items if float(p.get("size", 0)) > 0}
+
+
 # ── Получение данных с Lighter ────────────────────────────────────────────────
 #
 # Авторизация: read-only auth-токен (создаётся один раз на
@@ -327,6 +374,39 @@ def fetch_lighter(account_index: str, auth_token: str,
             break
 
     return all_records
+
+
+def fetch_lighter_open_symbols(account_index: str, auth_token: str) -> set:
+    """
+    GET /api/v1/account?by=index&value={account_index}&active_only=true
+    active_only=true просит сервер сразу отдать только рынки с реальной
+    открытой позицией (а не просто те, где выставлялось плечо когда-то).
+    Точные имена полей в ответе документированы не полностью, поэтому
+    разбор сделан с запасом — пробуем несколько вероятных вариантов ключей.
+    """
+    markets = fetch_lighter_markets()
+    headers = {"authorization": auth_token.strip()}
+    params = {"by": "index", "value": account_index, "active_only": "true"}
+
+    resp = requests.get(
+        f"{LIGHTER_BASE_URL}/api/v1/account",
+        params=params, headers=headers, timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code", 200) != 200:
+        raise RuntimeError(f"Lighter account error: {data}")
+
+    accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    open_symbols = set()
+    for acc in accounts:
+        for pos in acc.get("positions", []):
+            size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+            if size == 0:
+                continue
+            market_id = pos.get("market_id", pos.get("market_index"))
+            open_symbols.add(markets.get(market_id, f"MARKET_{market_id}"))
+    return open_symbols
 
 
 # ── Получение данных с MEXC ───────────────────────────────────────────────────
@@ -432,6 +512,25 @@ def fetch_mexc(api_key: str, api_secret: str,
     return all_records
 
 
+def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> set:
+    """GET /api/v1/private/position/open_positions — уже отдаёт только открытые позиции."""
+    base_url = "https://api.mexc.com"
+    api_key, api_secret = api_key.strip(), api_secret.strip()
+    timestamp = str(int(time.time() * 1000))
+
+    sig = _mexc_sign(api_key, api_secret, timestamp, [])
+    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
+
+    resp = requests.get(f"{base_url}/api/v1/private/position/open_positions", headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success", False):
+        raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
+
+    items = data.get("data") or []
+    return {p["symbol"] for p in items if float(p.get("holdVol", 0)) > 0}
+
+
 # ── Получение данных с Gate ───────────────────────────────────────────────────
 #
 # Авторизация Gate API v4 (своя, отличная от остальных):
@@ -534,6 +633,26 @@ def fetch_gate(api_key: str, api_secret: str,
     return all_records
 
 
+def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt") -> set:
+    """GET /api/v4/futures/{settle}/positions — набор контрактов с ненулевым размером."""
+    base_url = "https://api.gateio.ws"
+    url_path = f"/api/v4/futures/{settle}/positions"
+    proxies = _get_gate_proxies()
+    api_key, api_secret = api_key.strip(), api_secret.strip()
+
+    sig, timestamp = _gate_sign(api_secret, "GET", url_path, "")
+    headers = {"KEY": api_key, "Timestamp": timestamp, "SIGN": sig, "Accept": "application/json"}
+
+    resp = requests.get(f"{base_url}{url_path}", headers=headers, timeout=30, proxies=proxies)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("label"):
+        raise RuntimeError(f"Gate positions error {data.get('label')}: {data.get('message')}")
+
+    items = data if isinstance(data, list) else []
+    return {p["contract"] for p in items if float(p.get("size", 0)) != 0}
+
+
 # ── Опрос всех подключённых бирж за произвольный период ──────────────────────
 
 def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
@@ -611,6 +730,142 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
             results["gate"] = (None, str(e))
 
     return results
+
+
+# ── Funding по всем открытым сейчас позициям (за всё доступное время) ────────
+
+def fetch_all_time_open_positions(secrets: dict) -> dict:
+    """
+    Для каждой подключённой биржи:
+      1) получает список символов с открытой сейчас позицией;
+      2) если список не пуст — забирает всю доступную историю funding fee
+         (start_ms=0) и оставляет только записи по этим символам.
+    Если на бирже сейчас нет ни одной открытой позиции — биржа просто
+    не попадает в результат (как будто не была запрошена), чтобы не
+    засорять отчёт пустыми секциями.
+    Формат результата — тот же, что и у fetch_all(): {"aster": (records, error), ...}
+    """
+    now_ms = int(time.time() * 1000)
+    results: dict = {}
+
+    if "user" in secrets:
+        try:
+            open_symbols = fetch_aster_open_symbols(
+                user=secrets["user"], signer=secrets["signer"],
+                private_key=secrets["signer_private_key"],
+            )
+            if open_symbols:
+                records = fetch_aster(
+                    user=secrets["user"], signer=secrets["signer"],
+                    private_key=secrets["signer_private_key"],
+                    start_ms=0, end_ms=now_ms,
+                )
+                records = [r for r in records if r.get("symbol") in open_symbols]
+                results["aster"] = (records, None)
+        except Exception as e:
+            print(f"[Aster/positions] Ошибка: {e}")
+            results["aster"] = (None, str(e))
+
+    if "bybit_api_key" in secrets:
+        try:
+            open_symbols = fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"])
+            if open_symbols:
+                records = fetch_bybit(
+                    api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
+                    start_ms=0, end_ms=now_ms,
+                )
+                records = [r for r in records if r.get("symbol") in open_symbols]
+                results["bybit"] = (records, None)
+        except Exception as e:
+            print(f"[Bybit/positions] Ошибка: {e}")
+            results["bybit"] = (None, str(e))
+
+    if "lighter_account_index" in secrets:
+        try:
+            open_symbols = fetch_lighter_open_symbols(secrets["lighter_account_index"], secrets["lighter_auth_token"])
+            if open_symbols:
+                records = fetch_lighter(
+                    account_index=secrets["lighter_account_index"], auth_token=secrets["lighter_auth_token"],
+                    start_ms=0, end_ms=now_ms,
+                )
+                records = [r for r in records if r.get("symbol") in open_symbols]
+                results["lighter"] = (records, None)
+        except Exception as e:
+            print(f"[Lighter/positions] Ошибка: {e}")
+            results["lighter"] = (None, str(e))
+
+    if "mexc_api_key" in secrets:
+        try:
+            open_symbols = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
+            if open_symbols:
+                records = fetch_mexc(
+                    api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
+                    start_ms=0, end_ms=now_ms,
+                )
+                records = [r for r in records if r.get("symbol") in open_symbols]
+                results["mexc"] = (records, None)
+        except Exception as e:
+            print(f"[MEXC/positions] Ошибка: {e}")
+            results["mexc"] = (None, str(e))
+
+    if "gate_api_key" in secrets:
+        try:
+            open_symbols = fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"])
+            if open_symbols:
+                records = fetch_gate(
+                    api_key=secrets["gate_api_key"], api_secret=secrets["gate_api_secret"],
+                    start_ms=0, end_ms=now_ms,
+                )
+                records = [r for r in records if r.get("symbol") in open_symbols]
+                results["gate"] = (records, None)
+        except Exception as e:
+            print(f"[Gate/positions] Ошибка: {e}")
+            results["gate"] = (None, str(e))
+
+    return results
+
+
+def build_open_positions_report(results: dict) -> str:
+    """
+    Аналог build_report(), но без привязки к датам — заголовок и структура
+    под "суммарно по открытым сейчас позициям". Переиспользует _section_lines,
+    поэтому агрегация по активам/символам ведётся тем же кодом, что и в
+    обычном отчёте.
+    """
+    combined = ["📈 Funding по всем открытым позициям (за всё время удержания)"]
+    field_map = {
+        "aster":   ("Aster",   "income",  "symbol", "asset"),
+        "bybit":   ("Bybit",   "funding", "symbol", "currency"),
+        "lighter": ("Lighter", "change",  "symbol", "asset"),
+        "mexc":    ("MEXC",    "funding", "symbol", "asset"),
+        "gate":    ("Gate",    "change",  "symbol", "asset"),
+    }
+
+    all_totals: dict = defaultdict(float)
+    any_section = False
+    for key, (label, income_field, symbol_field, asset_field) in field_map.items():
+        if key not in results:
+            continue
+        records, error = results[key]
+        any_section = True
+        combined.append("")
+        lines, totals = _section_lines(label, records, error, income_field, symbol_field, asset_field)
+        combined.extend(lines)
+        for asset, val in totals.items():
+            all_totals[asset] += val
+
+    if not any_section:
+        combined.append("Сейчас нет ни одной открытой позиции ни на одной подключённой бирже.")
+        return "\n".join(combined)
+
+    if all_totals:
+        combined.append("")
+        combined.append("💰 Итого по всем биржам:")
+        for asset, val in sorted(all_totals.items()):
+            emoji = "🟢" if val >= 0 else "🔴"
+            combined.append(f"  {emoji} {asset}: {val:+.4f}")
+
+    return "\n".join(combined)
 
 
 # ── Формирование отчёта ───────────────────────────────────────────────────────
