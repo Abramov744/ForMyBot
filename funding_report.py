@@ -769,6 +769,18 @@ _EXCHANGE_WINDOW_DAYS = {
     "gate": 30,
 }
 
+# Некоторые биржи (подтверждено для Gate реальной ошибкой 400 "from time
+# exceeds 180-day limit") ограничивают не только диапазон ОДНОГО запроса,
+# но и то, насколько глубоко в прошлое вообще можно заглянуть — независимо
+# от OPEN_POSITIONS_LOOKBACK_DAYS. Берём на 1 день меньше официального
+# лимита биржи "про запас": пока опрашиваются другие биржи (это может
+# занять заметное время — например, десятки запросов к Bybit), реальное
+# "сейчас" успевает сдвинуться вперёд, и без запаса легко вылезти за
+# границу лимита по факту исполнения запроса, а не по факту его расчёта.
+_EXCHANGE_MAX_LOOKBACK_DAYS = {
+    "gate": 179,
+}
+
 
 def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) -> list:
     """
@@ -977,12 +989,20 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_symbols = fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"])
             if open_symbols:
+                # Свежее "сейчас" на момент непосредственно перед запросом — пока
+                # отрабатывали другие биржи (особенно Bybit, там может быть
+                # много запросов), время могло заметно сдвинуться вперёд.
+                gate_now_ms = int(time.time() * 1000)
+                gate_max_days = _EXCHANGE_MAX_LOOKBACK_DAYS.get("gate", OPEN_POSITIONS_LOOKBACK_DAYS)
+                gate_lookback_days = min(OPEN_POSITIONS_LOOKBACK_DAYS, gate_max_days)
+                gate_start_ms = gate_now_ms - gate_lookback_days * 24 * 60 * 60 * 1000
+
                 records = _fetch_in_windows(
                     lambda s, e: fetch_gate(
                         api_key=secrets["gate_api_key"], api_secret=secrets["gate_api_secret"],
                         start_ms=s, end_ms=e,
                     ),
-                    _EXCHANGE_WINDOW_DAYS["gate"], lookback_start_ms, now_ms,
+                    _EXCHANGE_WINDOW_DAYS["gate"], gate_start_ms, gate_now_ms,
                 )
                 records = [r for r in records if r.get("symbol") in open_symbols]
                 records = _trim_open_position_records(
