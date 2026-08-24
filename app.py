@@ -197,6 +197,9 @@ CALCULATOR_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Калькулятор funding</title>
+<!-- Фавикон — инлайн SVG data-URI прямо в HTML, без отдельного файла и без
+     настройки Flask static-папки (страница и так отдаётся одной строкой). -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💰</text></svg>">
 <style>
   :root {
     --bg: #0f1420; --panel: #161d2e; --border: #2a3348; --text: #e6ebf5;
