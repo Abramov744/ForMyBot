@@ -269,8 +269,14 @@ def fetch_bybit(api_key: str, api_secret: str,
     return all_records
 
 
-def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> set:
-    """GET /v5/position/list, category=linear, settleCoin=USDT — набор символов с открытой позицией."""
+def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> dict:
+    """
+    GET /v5/position/list, category=linear, settleCoin=USDT.
+    Возвращает {symbol: created_time_ms} — Bybit отдаёт точное время
+    открытия позиции в поле createdTime, поэтому здесь (в отличие от
+    большинства других бирж) можно посчитать funding именно "с момента
+    открытия", а не приближённо через фиксированную глубину поиска.
+    """
     base_url = "https://api.bybit.com"
     recv_window = "5000"
     proxies = _get_proxies()
@@ -293,7 +299,10 @@ def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> set:
         raise RuntimeError(f"Bybit position/list error {data.get('retCode')}: {data.get('retMsg')}")
 
     items = data.get("result", {}).get("list", [])
-    return {p["symbol"] for p in items if float(p.get("size", 0)) > 0}
+    return {
+        p["symbol"]: int(p["createdTime"])
+        for p in items if float(p.get("size", 0)) > 0
+    }
 
 
 # ── Получение данных с Lighter ────────────────────────────────────────────────
@@ -512,8 +521,13 @@ def fetch_mexc(api_key: str, api_secret: str,
     return all_records
 
 
-def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> set:
-    """GET /api/v1/private/position/open_positions — уже отдаёт только открытые позиции."""
+def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
+    """
+    GET /api/v1/private/position/open_positions — уже отдаёт только открытые
+    позиции. Возвращает {symbol: create_time_ms} — MEXC, как и Bybit, хранит
+    точное время создания позиции (поле createTime), поэтому funding можно
+    посчитать именно с этого момента, а не приближённо.
+    """
     base_url = "https://api.mexc.com"
     api_key, api_secret = api_key.strip(), api_secret.strip()
     timestamp = str(int(time.time() * 1000))
@@ -528,7 +542,10 @@ def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> set:
         raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
 
     items = data.get("data") or []
-    return {p["symbol"] for p in items if float(p.get("holdVol", 0)) > 0}
+    return {
+        p["symbol"]: int(p["createTime"])
+        for p in items if float(p.get("holdVol", 0)) > 0
+    }
 
 
 # ── Получение данных с Gate ───────────────────────────────────────────────────
@@ -774,9 +791,17 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
     """
     Для каждой подключённой биржи:
       1) получает список символов с открытой сейчас позицией;
-      2) если список не пуст — забирает историю funding fee за последние
-         OPEN_POSITIONS_LOOKBACK_DAYS дней (кусками — биржи ограничивают
-         диапазон одного запроса) и оставляет только записи по этим символам.
+      2) забирает funding fee и оставляет только записи по этим символам.
+
+    Точность различается по биржам:
+      - Bybit, MEXC — ТОЧНО: биржа отдаёт время открытия позиции
+        (createdTime/createTime), funding считается именно с этого момента.
+      - Aster, Lighter, Gate — ПРИБЛИЖЁННО: биржа не отдаёт время открытия
+        позиции в API, поэтому берётся funding за последние
+        OPEN_POSITIONS_LOOKBACK_DAYS дней по этому символу. Если позиция
+        по символу открывалась/закрывалась несколько раз за этот период —
+        в сумму попадёт funding и за предыдущие заходы тоже.
+
     Если на бирже сейчас нет ни одной открытой позиции — биржа просто
     не попадает в результат (как будто не была запрошена), чтобы не
     засорять отчёт пустыми секциями.
@@ -808,16 +833,24 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
 
     if "bybit_api_key" in secrets:
         try:
-            open_symbols = fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"])
-            if open_symbols:
+            open_times = fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"])
+            if open_times:
+                # Bybit отдаёт точное время открытия — начинаем именно с него,
+                # а не с общего lookback-окна (там, где оно раньше, разумеется)
+                earliest_ms = min(open_times.values())
+                fetch_start_ms = min(earliest_ms, now_ms)  # на случай часовых поясов/рассинхрона
                 records = _fetch_in_windows(
                     lambda s, e: fetch_bybit(
                         api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
                         start_ms=s, end_ms=e,
                     ),
-                    _EXCHANGE_WINDOW_DAYS["bybit"], lookback_start_ms, now_ms,
+                    _EXCHANGE_WINDOW_DAYS["bybit"], fetch_start_ms, now_ms,
                 )
-                records = [r for r in records if r.get("symbol") in open_symbols]
+                records = [
+                    r for r in records
+                    if r.get("symbol") in open_times
+                    and int(r.get("transactionTime", 0)) >= open_times[r["symbol"]]
+                ]
                 results["bybit"] = (records, None)
         except Exception as e:
             print(f"[Bybit/positions] Ошибка: {e}")
@@ -842,16 +875,22 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
 
     if "mexc_api_key" in secrets:
         try:
-            open_symbols = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            if open_symbols:
+            open_times = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
+            if open_times:
+                earliest_ms = min(open_times.values())
+                fetch_start_ms = min(earliest_ms, now_ms)
                 records = _fetch_in_windows(
                     lambda s, e: fetch_mexc(
                         api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
                         start_ms=s, end_ms=e,
                     ),
-                    _EXCHANGE_WINDOW_DAYS["mexc"], lookback_start_ms, now_ms,
+                    _EXCHANGE_WINDOW_DAYS["mexc"], fetch_start_ms, now_ms,
                 )
-                records = [r for r in records if r.get("symbol") in open_symbols]
+                records = [
+                    r for r in records
+                    if r.get("symbol") in open_times
+                    and int(r.get("settleTime", 0)) >= open_times[r["symbol"]]
+                ]
                 results["mexc"] = (records, None)
         except Exception as e:
             print(f"[MEXC/positions] Ошибка: {e}")
@@ -884,7 +923,11 @@ def build_open_positions_report(results: dict) -> str:
     поэтому агрегация по активам/символам ведётся тем же кодом, что и в
     обычном отчёте.
     """
-    combined = ["📈 Funding по всем открытым позициям (за всё время удержания)"]
+    combined = [
+        "📈 Funding по всем открытым позициям",
+        "(Bybit, MEXC — точно с момента открытия; "
+        f"Aster, Lighter, Gate — за последние {OPEN_POSITIONS_LOOKBACK_DAYS} дн., приближённо)",
+    ]
     field_map = {
         "aster":   ("Aster",   "income",  "symbol", "asset"),
         "bybit":   ("Bybit",   "funding", "symbol", "currency"),
