@@ -322,10 +322,21 @@ def _fetch_mexc_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: i
         f"https://api.mexc.com/api/v3/myTrades?{query_string}&signature={sig}",
         headers=headers, timeout=30,
     )
-    resp.raise_for_status()
-    data = resp.json()
+    # ВАЖНО: сначала пробуем разобрать тело ответа и проверить code/msg от MEXC,
+    # и только потом (если тело не JSON) — raise_for_status(). MEXC отдаёт
+    # содержательную причину ошибки в теле даже при HTTP 400 (например, "Invalid
+    # symbol." для пары без спот-листинга или конкретную причину невалидной
+    # подписи) — старый порядок вызовов терял это сообщение, потому что
+    # raise_for_status() бросает исключение раньше, чем тело успевали прочитать,
+    # и в логах оставалось бесполезное "400 Client Error: Bad Request".
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise
     if isinstance(data, dict) and data.get("code"):
         raise RuntimeError(f"MEXC myTrades error {data.get('code')}: {data.get('msg')}")
+    resp.raise_for_status()
     return [
         {"price": float(t["price"]), "qty": float(t["qty"]), "side": "Buy" if t.get("isBuyer") else "Sell"}
         for t in data if t.get("isBuyer")
