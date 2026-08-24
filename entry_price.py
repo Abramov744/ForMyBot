@@ -404,7 +404,17 @@ def _etherscan_get(params: dict, api_key: str) -> dict:
 
 def _fetch_evm_chainlist(api_key: str) -> list:
     """[(chain_id, chain_name), ...] — все майннет-сети, которые прямо сейчас
-    поддерживает единый Etherscan V2 API. Кэшируется на сутки в памяти процесса."""
+    поддерживает единый Etherscan V2 API. Кэшируется на сутки в памяти процесса.
+
+    ВАЖНО: у /v2/chainlist другой формат ответа, чем у остальных Etherscan-
+    эндпоинтов (module=.../action=...) — тут НЕТ обёртки status/message,
+    сразу {"comments": ..., "totalcount": N, "result": [...]}. Проверено
+    вручную реальным запросом 24.08.2026 — не полагаемся на документацию,
+    которая этот нюанс не описывала. Статус конкретной сети внутри result[]
+    (число, не строка) — 0=Offline/1=Ok/2=Degraded согласно "comments" в
+    самом ответе; пропускаем только офлайновые (0), Degraded всё ещё
+    опрашиваем — деградация обычно означает задержку индексации, а не
+    недоступность API."""
     global _evm_chainlist_cache, _evm_chainlist_cache_ts
     now = time.time()
     if _evm_chainlist_cache and now - _evm_chainlist_cache_ts < EVM_CHAINLIST_CACHE_TTL_S:
@@ -413,21 +423,29 @@ def _fetch_evm_chainlist(api_key: str) -> list:
     resp = requests.get(ETHERSCAN_CHAINLIST_URL, params={"apikey": api_key}, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    if str(data.get("status")) != "1":
-        raise RuntimeError(f"Etherscan chainlist error: {data.get('message')}")
+    result = data.get("result")
+    if not isinstance(result, list):
+        raise RuntimeError(f"Etherscan chainlist: неожиданный формат ответа: {data}")
 
     chains = []
-    for c in data.get("result", []):
+    for c in result:
         name = str(c.get("chainname", ""))
         try:
             chain_id = int(c.get("chainid"))
         except (TypeError, ValueError):
             continue
-        if int(c.get("status", 0) or 0) != 1:
+        try:
+            chain_status = int(c.get("status", 1) or 0)
+        except (TypeError, ValueError):
+            chain_status = 1
+        if chain_status == 0:
             continue
         if any(kw in name.lower() for kw in _TESTNET_NAME_KEYWORDS):
             continue
         chains.append((chain_id, name))
+
+    if not chains:
+        raise RuntimeError(f"Etherscan chainlist вернул пустой список сетей: {data}")
 
     _evm_chainlist_cache = chains
     _evm_chainlist_cache_ts = now
