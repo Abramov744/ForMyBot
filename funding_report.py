@@ -72,6 +72,16 @@ def load_secrets() -> dict:
         result["gate_api_key"]    = gate_api_key
         result["gate_api_secret"] = gate_api_secret
 
+    # Uniswap (Arbitrum + Base) — опционально, только для поиска спот-цены
+    # входа в entry_price.py (не биржа со своим API, а чтение истории
+    # ERC-20-переводов кошелька через Etherscan). Один и тот же кошелёк
+    # используется на обеих сетях — так подтвердил пользователь.
+    uniswap_wallet_address = os.environ.get("UNISWAP_WALLET_ADDRESS")
+    etherscan_api_key      = os.environ.get("ETHERSCAN_API_KEY")
+    if uniswap_wallet_address and etherscan_api_key:
+        result["uniswap_wallet_address"] = uniswap_wallet_address
+        result["etherscan_api_key"]      = etherscan_api_key
+
     return result
 
 

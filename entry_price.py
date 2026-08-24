@@ -21,8 +21,10 @@
     шире (см. WINDOW_MINUTES_APPROX) и это явно помечается в ответе.
 """
 
+import concurrent.futures
 import hmac
 import hashlib
+import threading
 import time
 import urllib.parse
 from collections import defaultdict
@@ -47,7 +49,10 @@ from funding_report import (
 
 WINDOW_MINUTES_EXACT = 20      # Bybit/MEXC — точное время открытия
 WINDOW_MINUTES_APPROX = 360    # Aster/Gate/Lighter — время оценено по funding
-QUOTE_CANDIDATES = ["USDT", "USDC"]
+# WETH — доп. котировка специально для Uniswap (там купленная монета часто в паре
+# с WETH, а не со стейблом); для CEX-бирж такая пара просто не найдётся и молча
+# пропустится (см. _search_spot_entry) — это не ошибка, ищем в порядке приоритета.
+QUOTE_CANDIDATES = ["USDT", "USDC", "WETH"]
 
 
 # ── Извлечение базового актива из формата символа конкретной биржи ───────────
@@ -351,10 +356,181 @@ def _fetch_gate_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: i
     ]
 
 
+# ── Uniswap (любая EVM-сеть) — поиск покупки через историю переводов кошелька ─
+#
+# У Uniswap/блокчейна нет REST-эндпоинта "история моих сделок по паре", как у
+# Bybit/MEXC/Gate — вместо этого ищем сами по истории ERC-20-переводов кошелька:
+# своп-покупка на Uniswap — это одна транзакция, в которой есть ОДНОВРЕМЕННО
+# исходящий перевод quote-актива (продали USDC/USDT/WETH) и входящий перевод
+# base-актива (получили купленную монету) на/с адреса самого кошелька. Что там
+# происходило внутри (через какие пулы/хопы прошёл своп) — не важно, это видно
+# по крайним звеньям цепочки, где стороной выступает сам кошелёк.
+#
+# Сеть заранее не фиксируем: пользователь торгует с одного кошелька на разных
+# EVM-сетях, поэтому вместо хардкода конкретных сетей опрашиваем ВСЕ майннеты,
+# которые поддерживает единый Etherscan V2 API (один и тот же ключ работает на
+# всех — см. https://docs.etherscan.io/v2-migration), список сетей берём
+# динамически из /v2/chainlist, чтобы не отставать от Etherscan вручную.
+
+ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
+ETHERSCAN_CHAINLIST_URL = "https://api.etherscan.io/v2/chainlist"
+# По этим словам в названии сети отсеиваем тестnetы — chainlist отдаёт их вперемешку
+# с майннетами, а тестовые переводы для калькулятора не нужны и только тратят лимит.
+_TESTNET_NAME_KEYWORDS = ("testnet", "sepolia", "goerli", "holesky", "devnet", "fuji", "mumbai", "chapel")
+
+_evm_chainlist_cache: list = []
+_evm_chainlist_cache_ts: float = 0.0
+EVM_CHAINLIST_CACHE_TTL_S = 24 * 60 * 60  # список сетей почти не меняется — кэш на сутки
+
+_etherscan_rate_lock = threading.Lock()
+_etherscan_last_call_ts = [0.0]
+# Бесплатный тариф Etherscan — 5 запросов/сек НА КЛЮЧ (общий лимит для всех сетей
+# сразу, не по отдельности на каждую) — поэтому троттлим глобально одним локом,
+# а не по сети.
+ETHERSCAN_MIN_INTERVAL_S = 0.22
+
+
+def _etherscan_get(params: dict, api_key: str) -> dict:
+    with _etherscan_rate_lock:
+        wait = ETHERSCAN_MIN_INTERVAL_S - (time.time() - _etherscan_last_call_ts[0])
+        if wait > 0:
+            time.sleep(wait)
+        _etherscan_last_call_ts[0] = time.time()
+
+    resp = requests.get(ETHERSCAN_BASE_URL, params={**params, "apikey": api_key}, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_evm_chainlist(api_key: str) -> list:
+    """[(chain_id, chain_name), ...] — все майннет-сети, которые прямо сейчас
+    поддерживает единый Etherscan V2 API. Кэшируется на сутки в памяти процесса."""
+    global _evm_chainlist_cache, _evm_chainlist_cache_ts
+    now = time.time()
+    if _evm_chainlist_cache and now - _evm_chainlist_cache_ts < EVM_CHAINLIST_CACHE_TTL_S:
+        return _evm_chainlist_cache
+
+    resp = requests.get(ETHERSCAN_CHAINLIST_URL, params={"apikey": api_key}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    if str(data.get("status")) != "1":
+        raise RuntimeError(f"Etherscan chainlist error: {data.get('message')}")
+
+    chains = []
+    for c in data.get("result", []):
+        name = str(c.get("chainname", ""))
+        try:
+            chain_id = int(c.get("chainid"))
+        except (TypeError, ValueError):
+            continue
+        if int(c.get("status", 0) or 0) != 1:
+            continue
+        if any(kw in name.lower() for kw in _TESTNET_NAME_KEYWORDS):
+            continue
+        chains.append((chain_id, name))
+
+    _evm_chainlist_cache = chains
+    _evm_chainlist_cache_ts = now
+    return chains
+
+
+def _fetch_uniswap_chain_transfers(chain_id: int, api_key: str, wallet: str) -> list:
+    """До 1000 последних ERC-20-переводов кошелька на конкретной сети, без
+    диапазона блоков — фильтруем по времени уже на своей стороне. Это на один
+    запрос дешевле на КАЖДУЮ из ~50+ сетей, чем сначала переводить время в номер
+    блока отдельным вызовом; для обычного кошелька 1000 последних переводов с
+    запасом покрывают любое разумное окно поиска (если у кошелька на конкретной
+    сети активность настолько высокая, что нужная сделка вышла за пределы
+    последних 1000 переводов — она не найдётся, это осознанный компромисс ради
+    скорости при опросе полусотни сетей разом)."""
+    data = _etherscan_get({
+        "module": "account", "action": "tokentx", "chainid": chain_id,
+        "address": wallet, "sort": "desc", "offset": "1000", "page": "1",
+    }, api_key)
+    status = str(data.get("status", ""))
+    message = str(data.get("message", ""))
+    if status != "1" and message != "No transactions found":
+        raise RuntimeError(f"Etherscan tokentx error (chain {chain_id}): {message} {data.get('result')}")
+    result = data.get("result")
+    return result if isinstance(result, list) else []
+
+
+def _fetch_uniswap_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+    """symbol здесь — не биржевой тикер, а "BASE:QUOTE" (см. _uniswap_symbol_fn,
+    единственный источник, где формат символа отличается от остальных бирж)."""
+    wallet = secrets.get("uniswap_wallet_address")
+    api_key = secrets.get("etherscan_api_key")
+    if not wallet or not api_key:
+        return []
+    base_asset, quote_asset = symbol.split(":", 1)
+    wallet_lower = wallet.lower()
+    start_s, end_s = start_ms // 1000, end_ms // 1000
+
+    try:
+        chains = _fetch_evm_chainlist(api_key)
+    except Exception as e:
+        print(f"[entry_price/uniswap] Не удалось получить список EVM-сетей: {e}")
+        return []
+
+    def _scan_chain(chain_id: int, chain_name: str) -> list:
+        try:
+            transfers = _fetch_uniswap_chain_transfers(chain_id, api_key, wallet)
+        except Exception as e:
+            print(f"[entry_price/uniswap/{chain_name}] Ошибка запроса переводов: {e}")
+            return []
+
+        by_hash: dict = defaultdict(list)
+        for t in transfers:
+            ts = int(t.get("timeStamp", 0) or 0)
+            if start_s <= ts <= end_s:
+                by_hash[t.get("hash")].append(t)
+
+        found = []
+        for group in by_hash.values():
+            base_in = quote_out = None
+            for t in group:
+                sym = (t.get("tokenSymbol") or "").upper()
+                try:
+                    decimals = int(t.get("tokenDecimal", 18) or 18)
+                    amount = int(t.get("value", "0")) / (10 ** decimals)
+                except (TypeError, ValueError):
+                    continue
+                if sym == base_asset.upper() and (t.get("to") or "").lower() == wallet_lower:
+                    base_in = amount
+                if sym == quote_asset.upper() and (t.get("from") or "").lower() == wallet_lower:
+                    quote_out = amount
+            if base_in and quote_out and base_in > 0:
+                found.append({"price": quote_out / base_in, "qty": base_in, "side": "Buy", "chain": chain_name})
+        return found
+
+    all_trades = []
+    # Сети опрашиваем параллельно потоками (I/O-bound — сеть, не CPU), но реальная
+    # скорость всё равно упирается в общий rate-limit из _etherscan_get: пул тут
+    # просто даёт запросам не ждать друг друга впустую на сетевых задержках.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_scan_chain, cid, cname) for cid, cname in chains]
+        for f in concurrent.futures.as_completed(futures):
+            all_trades.extend(f.result())
+
+    return all_trades
+
+
+def _uniswap_symbol_fn(base: str, quote: str) -> str:
+    return f"{base}:{quote}"
+
+
 _SPOT_TRADE_FETCHERS = {
-    "bybit": (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "mexc":  (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "gate":  (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
+    "bybit":    (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
+    "mexc":     (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
+    "gate":     (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
+    "uniswap":  (lambda secrets, symbol, s, e: _fetch_uniswap_spot_trades(secrets, symbol, s, e), _uniswap_symbol_fn),
+}
+
+_SPOT_EXCHANGE_SECRET_KEY = {
+    "bybit": "bybit_api_key",
+    "mexc": "mexc_api_key",
+    "gate": "gate_api_key",
+    "uniswap": "uniswap_wallet_address",
 }
 
 
@@ -365,10 +541,8 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
     for quote in QUOTE_CANDIDATES:
         matches = []  # (exchange, [trades])
         for exchange, (fetch_fn, symbol_fn) in _SPOT_TRADE_FETCHERS.items():
-            key = "bybit_api_key" if exchange == "bybit" else (
-                "mexc_api_key" if exchange == "mexc" else "gate_api_key"
-            )
-            if key not in secrets:
+            key = _SPOT_EXCHANGE_SECRET_KEY.get(exchange)
+            if not key or key not in secrets:
                 continue
             spot_symbol = symbol_fn(base_asset, quote)
             try:
