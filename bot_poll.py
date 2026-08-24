@@ -32,13 +32,16 @@ from funding_report import (
     MSK,
     load_secrets,
     fetch_all,
+    fetch_all_time_open_positions,
     build_report,
+    build_open_positions_report,
     send_telegram,
 )
 
 # /report, /report@ИмяБота, с необязательным аргументом-датой после пробела
 COMMAND_RE = re.compile(r"^/report(?:@\w+)?\s*(.*)$", re.IGNORECASE)
 CALENDAR_RE = re.compile(r"^/calendar(?:@\w+)?\s*$", re.IGNORECASE)
+POSITIONS_RE = re.compile(r"^/positions(?:@\w+)?\s*$", re.IGNORECASE)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
 
@@ -46,6 +49,7 @@ START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
 # Telegram отправляет боту этот же текст, как будто пользователь напечатал его сам
 BUTTON_REPORT = "📊 Отчёт за вчера"
 BUTTON_CALENDAR = "📅 Календарь"
+BUTTON_POSITIONS = "📈 Открытые позиции"
 
 MONTH_NAMES_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
@@ -66,6 +70,7 @@ def build_main_menu_keyboard() -> dict:
         "keyboard": [
             [{"text": BUTTON_REPORT}],
             [{"text": BUTTON_CALENDAR}],
+            [{"text": BUTTON_POSITIONS}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -229,6 +234,27 @@ def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: i
             print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
 
 
+def send_open_positions_report(secrets: dict, chat_id: str) -> None:
+    """
+    Отчёт по всем текущим открытым позициям — требует запроса списка
+    открытых позиций на каждой бирже плюс всей доступной истории funding,
+    поэтому может занять заметно больше времени, чем /report за один день.
+    """
+    token = secrets["telegram_token"]
+    try:
+        send_telegram(token, chat_id, "⏳ Собираю данные по открытым позициям, это может занять до минуты…")
+        results = fetch_all_time_open_positions(secrets)
+        report = build_open_positions_report(results)
+        send_telegram(token, chat_id, report)
+        print("Отправлен отчёт по открытым позициям.")
+    except Exception as e:
+        print(f"Ошибка при формировании отчёта по открытым позициям: {e}")
+        try:
+            send_telegram(token, chat_id, f"❌ Не получилось сформировать отчёт: {e}")
+        except Exception as e2:
+            print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+
+
 # ── Обработка входящих сообщений и нажатий на кнопки ──────────────────────────
 
 def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
@@ -244,14 +270,16 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         send_message(
             token, chat_id,
             "Готов присылать отчёты по funding fee.\n"
-            "Кнопки внизу — под рукой, либо команды /report и /calendar текстом.",
+            "Кнопки внизу — под рукой, либо команды /report, /calendar, /positions текстом.",
             reply_markup=build_main_menu_keyboard(),
         )
         return
 
     # Нажатие на постоянную кнопку — по сути то же самое, что и команда,
     # просто текст сообщения не начинается с "/"
-    if text == BUTTON_CALENDAR:
+    if text == BUTTON_POSITIONS:
+        text = "/positions"
+    elif text == BUTTON_CALENDAR:
         text = "/calendar"
     elif text == BUTTON_REPORT:
         text = "/report"
@@ -260,6 +288,11 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         now_msk = datetime.now(MSK)
         markup = build_calendar_markup(now_msk.year, now_msk.month)
         send_message(token, chat_id, "Выберите дату отчёта:", reply_markup=markup)
+        return
+
+    if POSITIONS_RE.match(text):
+        print("Обрабатываю команду: '/positions'")
+        send_open_positions_report(secrets, chat_id)
         return
 
     m = COMMAND_RE.match(text)
