@@ -128,6 +128,50 @@ def _bybit_position_entry(secrets: dict, symbol: str) -> dict | None:
     return None
 
 
+_mexc_contract_size_cache: dict = {}
+
+
+def _fetch_mexc_contract_size(symbol: str) -> float:
+    """Сколько монет в ОДНОМ контракте MEXC Futures для данного символа.
+
+    У MEXC объём позиции (`holdVol`) отдаётся в количестве КОНТРАКТОВ, а не
+    напрямую в монетах — у каждого символа свой множитель contractSize
+    (для дорогих монет вроде BTC он дробный, например 0.0001 BTC за
+    контракт; для дешёвых альткоинов, наоборот, один контракт может
+    представлять сотни монет). Без этого домножения `qty` в калькуляторе
+    получался заниженным в contractSize раз (например 4 вместо реальных
+    400 монет при contractSize=100) — обнаружено по расхождению с суммой
+    позиции на самой бирже 24.08.2026.
+
+    Публичный эндпоинт (без авторизации). Кэшируется в памяти процесса —
+    контрактные спецификации почти никогда не меняются. При любой
+    неожиданности в формате ответа — не роняем автоподбор цены целиком,
+    используем множитель 1 (старое поведение) и логируем предупреждение,
+    чтобы расхождение было видно и диагностируемо через логи Railway.
+    """
+    if symbol in _mexc_contract_size_cache:
+        return _mexc_contract_size_cache[symbol]
+    contract_size = 1.0
+    try:
+        resp = requests.get(
+            "https://contract.mexc.com/api/v1/contract/detail",
+            params={"symbol": symbol}, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        item = data.get("data")
+        if isinstance(item, list):
+            item = next((c for c in item if c.get("symbol") == symbol), None)
+        if not isinstance(item, dict) or item.get("contractSize") is None:
+            raise RuntimeError(f"неожиданный формат ответа: {data}")
+        contract_size = float(item["contractSize"])
+    except Exception as e:
+        print(f"[entry_price/mexc] Не удалось получить contractSize для {symbol}, использую 1 "
+              f"(объём позиции может быть занижен/завышен, если у контракта множитель ≠ 1): {e}")
+    _mexc_contract_size_cache[symbol] = contract_size
+    return contract_size
+
+
 def _mexc_position_entry(secrets: dict, symbol: str) -> dict | None:
     from funding_report import _mexc_sign  # приватная HMAC-подпись contract API
     base_url = "https://api.mexc.com"
@@ -144,9 +188,10 @@ def _mexc_position_entry(secrets: dict, symbol: str) -> dict | None:
     for p in data.get("data") or []:
         if p.get("symbol") == symbol and float(p.get("holdVol", 0)) > 0:
             price = p.get("openAvgPrice") or p.get("holdAvgPrice")
+            contract_size = _fetch_mexc_contract_size(symbol)
             return {
                 "price": float(price),
-                "qty": float(p["holdVol"]),
+                "qty": float(p["holdVol"]) * contract_size,
                 "entry_time_ms": int(p["createTime"]) if p.get("createTime") else None,
                 "time_is_exact": True,
             }
