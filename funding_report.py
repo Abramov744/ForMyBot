@@ -947,6 +947,18 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     if r.get("symbol") in open_times
                     and int(r.get("transactionTime", 0)) >= open_times[r["symbol"]]
                 ]
+                # Подстраховка сверх фильтра по createdTime: на практике у Bybit
+                # это поле не всегда сбрасывается при полном закрытии и повторном
+                # открытии позиции по тому же символу (иногда остаётся от более
+                # раннего "слота" позиции) — тогда фильтр выше пропускает и
+                # старые, не относящиеся к текущей позиции записи. Обрезаем ещё
+                # и по непрерывности начислений (тот же приём, что и для
+                # Aster/Lighter/Gate, где createdTime вовсе не отдаётся) — если
+                # он не понадобится (когда createdTime корректен), результат не
+                # изменится, а если понадобится — вырежет ложную старую историю.
+                records = _trim_open_position_records(
+                    records, symbol_field="symbol", time_field="transactionTime", time_unit="ms",
+                )
                 results["bybit"] = (records, None)
         except Exception as e:
             print(f"[Bybit/positions] Ошибка: {e}")
@@ -990,6 +1002,11 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     if r.get("symbol") in open_times
                     and int(r.get("settleTime", 0)) >= open_times[r["symbol"]]
                 ]
+                # Та же подстраховка, что и для Bybit выше — createTime теоретически
+                # может оказаться таким же "залипшим" от старого открытия позиции.
+                records = _trim_open_position_records(
+                    records, symbol_field="symbol", time_field="settleTime", time_unit="ms",
+                )
                 results["mexc"] = (records, None)
         except Exception as e:
             print(f"[MEXC/positions] Ошибка: {e}")
