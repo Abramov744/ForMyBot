@@ -34,6 +34,33 @@
 Те же get_open_positions()/get_predicted_rate() используются и для
 build_predicted_rates_report() — отчёта по запросу для команды /rates в
 Telegram-боте (см. bot_poll.py), не только для фонового цикла алертов.
+
+ГОДОВАЯ СТАВКА (APR) — периодичность выплат сильно различается по биржам
+(1ч/4ч/8ч в зависимости от биржи и даже конкретного символа), поэтому
+сравнивать сами ставки "за выплату" между биржами напрямую нельзя — нужно
+привести к общему знаменателю. get_predicted_rate() возвращает интервал
+выплат вместе со ставкой (третий элемент кортежа), и annualize() считает
+APR = ставка_за_выплату × (24 / интервал_в_часах) × 365. Источник интервала
+у каждой биржи свой (см. комментарии над каждым _fetch_*_predicted_rate):
+  - Bybit, MEXC, Gate — отдают интервал прямо в том же ответе, что и саму
+    ставку (fundingIntervalHour / collectCycle / funding_interval) —
+    ничего дополнительно запрашивать не нужно.
+  - Aster — интервал не в premiumIndex, а в отдельном публичном (без
+    подписи) эндпоинте /fapi/v1/fundingInfo, который отдаёт его только для
+    символов с НЕстандартным интервалом (документированное поведение
+    Binance-совместимых API) — для всех остальных подразумевается дефолт
+    8ч. Список кэшируется в памяти процесса на ASTER_FUNDING_INTERVALS_
+    CACHE_TTL_S, чтобы не дёргать лишний раз при каждом символе.
+  - Lighter — единственная биржа, где funding зафиксирован протоколом на
+    уровне "раз в час" для вообще всех рынков (не варьируется по символам,
+    задокументировано в docs.lighter.xyz/perpetual-futures/funding) —
+    поэтому просто константа, без похода в API за этим значением.
+Для Aster/Bybit/MEXC/Gate, если по какой-то причине поле интервала не
+пришло в ответе, используется задокументированный дефолт биржи (8ч почти
+везде) — это единственное разумное поведение при отсутствии данных, но
+из-за этого APR в таком случае может быть немного неточным именно для
+символов с нестандартным интервалом; такое расхождение проявится только
+если сама биржа перестанет отдавать это поле.
 """
 
 import os
@@ -65,6 +92,16 @@ EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate",
 }
+
+# Дефолтный интервал выплат (часы), используется только если биржа не
+# отдала его явно в ответе — см. докстринг модуля, раздел "ГОДОВАЯ СТАВКА".
+ASTER_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+MEXC_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+GATE_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+# У Lighter funding зафиксирован протоколом на "раз в час" для всех рынков
+# без исключений — не запрашивается через API, см. докстринг модуля.
+LIGHTER_FUNDING_INTERVAL_HOURS = 1.0
 
 
 # ── Список сейчас открытых позиций по всем подключённым биржам ───────────────
@@ -115,7 +152,39 @@ def get_open_positions(secrets: dict) -> dict:
 
 # ── Прогнозная ставка на следующую выплату — публичные эндпоинты бирж ────────
 
-def _fetch_aster_predicted_rate(symbol: str) -> tuple[float, int | None]:
+_aster_funding_intervals_cache: dict = {}
+_aster_funding_intervals_cache_ts: float = 0.0
+# Сами интервалы у биржи меняются крайне редко (это не рыночные данные,
+# а конфигурация символа), поэтому кэш держим долго — час.
+ASTER_FUNDING_INTERVALS_CACHE_TTL_S = 3600
+
+
+def _fetch_aster_funding_intervals() -> dict:
+    """
+    symbol -> fundingIntervalHours, ТОЛЬКО для символов с нестандартным
+    интервалом (см. докстринг модуля) — публичный эндпоинт без подписи.
+    Для символа, которого нет в результате, действует дефолт 8ч
+    (ASTER_DEFAULT_FUNDING_INTERVAL_HOURS) — это задокументированное
+    поведение Binance-совместимого API, не догадка.
+    """
+    global _aster_funding_intervals_cache, _aster_funding_intervals_cache_ts
+    now = time.time()
+    if _aster_funding_intervals_cache and now - _aster_funding_intervals_cache_ts <= ASTER_FUNDING_INTERVALS_CACHE_TTL_S:
+        return _aster_funding_intervals_cache
+
+    resp = requests.get("https://fapi.asterdex.com/fapi/v1/fundingInfo", timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    _aster_funding_intervals_cache = {
+        item["symbol"]: float(item["fundingIntervalHours"])
+        for item in data
+        if item.get("symbol") and item.get("fundingIntervalHours") is not None
+    }
+    _aster_funding_intervals_cache_ts = now
+    return _aster_funding_intervals_cache
+
+
+def _fetch_aster_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
     resp = requests.get(
         "https://fapi.asterdex.com/fapi/v3/premiumIndex",
         params={"symbol": symbol}, timeout=15,
@@ -125,10 +194,19 @@ def _fetch_aster_predicted_rate(symbol: str) -> tuple[float, int | None]:
     if isinstance(data, list):
         data = data[0] if data else {}
     next_ms = int(data["nextFundingTime"]) if data.get("nextFundingTime") else None
-    return float(data["lastFundingRate"]), next_ms
+
+    try:
+        interval_hours = _fetch_aster_funding_intervals().get(
+            symbol, ASTER_DEFAULT_FUNDING_INTERVAL_HOURS,
+        )
+    except Exception as e:
+        print(f"[rates/aster] Не удалось получить fundingInfo, беру дефолт {ASTER_DEFAULT_FUNDING_INTERVAL_HOURS:g}ч: {e}")
+        interval_hours = ASTER_DEFAULT_FUNDING_INTERVAL_HOURS
+
+    return float(data["lastFundingRate"]), next_ms, interval_hours
 
 
-def _fetch_bybit_predicted_rate(symbol: str) -> tuple[float, int | None]:
+def _fetch_bybit_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
     proxies = _get_proxies()
     resp = requests.get(
         "https://api.bybit.com/v5/market/tickers",
@@ -143,10 +221,17 @@ def _fetch_bybit_predicted_rate(symbol: str) -> tuple[float, int | None]:
         raise RuntimeError(f"Bybit: нет данных тикера по {symbol}")
     item = items[0]
     next_ms = int(item["nextFundingTime"]) if item.get("nextFundingTime") else None
-    return float(item["fundingRate"]), next_ms
+    # fundingIntervalHour — прямо в тикере (см. докстринг модуля), в тех же
+    # единицах (часах), что нам и нужно, без похода в instruments-info.
+    interval_hours = (
+        float(item["fundingIntervalHour"])
+        if item.get("fundingIntervalHour")
+        else BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS
+    )
+    return float(item["fundingRate"]), next_ms, interval_hours
 
 
-def _fetch_mexc_predicted_rate(symbol: str) -> tuple[float, int | None]:
+def _fetch_mexc_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
     proxies = _get_mexc_proxies()
     resp = requests.get(
         f"https://api.mexc.com/api/v1/contract/funding_rate/{symbol}",
@@ -158,10 +243,14 @@ def _fetch_mexc_predicted_rate(symbol: str) -> tuple[float, int | None]:
         raise RuntimeError(f"MEXC funding_rate error {data.get('code')}: {data.get('message') or data}")
     d = data.get("data") or {}
     next_ms = int(d["nextSettleTime"]) if d.get("nextSettleTime") else None
-    return float(d["fundingRate"]), next_ms
+    # collectCycle — интервал в часах прямо в том же ответе (см. докстринг модуля).
+    interval_hours = (
+        float(d["collectCycle"]) if d.get("collectCycle") else MEXC_DEFAULT_FUNDING_INTERVAL_HOURS
+    )
+    return float(d["fundingRate"]), next_ms, interval_hours
 
 
-def _fetch_gate_predicted_rate(symbol: str, settle: str = "usdt") -> tuple[float, int | None]:
+def _fetch_gate_predicted_rate(symbol: str, settle: str = "usdt") -> tuple[float, int | None, float]:
     proxies = _get_gate_proxies()
     resp = requests.get(
         f"https://api.gateio.ws/api/v4/futures/{settle}/contracts/{symbol}",
@@ -176,7 +265,12 @@ def _fetch_gate_predicted_rate(symbol: str, settle: str = "usdt") -> tuple[float
         rate = data.get("funding_rate")
     next_apply = data.get("funding_next_apply")
     next_ms = int(next_apply) * 1000 if next_apply else None
-    return float(rate), next_ms
+    # funding_interval — в СЕКУНДАХ (см. докстринг модуля), переводим в часы.
+    funding_interval_s = data.get("funding_interval")
+    interval_hours = (
+        float(funding_interval_s) / 3600.0 if funding_interval_s else GATE_DEFAULT_FUNDING_INTERVAL_HOURS
+    )
+    return float(rate), next_ms, interval_hours
 
 
 _lighter_markets_cache: dict = {}
@@ -196,7 +290,7 @@ def _lighter_symbol_to_market_id(symbol: str) -> int | None:
     return None
 
 
-def _fetch_lighter_predicted_rate(symbol: str) -> tuple[float, int | None]:
+def _fetch_lighter_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
     market_id = _lighter_symbol_to_market_id(symbol)
     resp = requests.get("https://mainnet.zklighter.elliot.ai/api/v1/funding-rates", timeout=15)
     resp.raise_for_status()
@@ -207,7 +301,7 @@ def _fetch_lighter_predicted_rate(symbol: str) -> tuple[float, int | None]:
         if item.get("exchange") == "lighter" and (
             item.get("market_id") == market_id or item.get("symbol") == symbol
         ):
-            return float(item["rate"]), None
+            return float(item["rate"]), None, LIGHTER_FUNDING_INTERVAL_HOURS
     raise RuntimeError(f"Lighter: ставка по {symbol} не найдена в ответе funding-rates")
 
 
@@ -220,12 +314,28 @@ _PREDICTED_RATE_FETCHERS = {
 }
 
 
-def get_predicted_rate(exchange: str, symbol: str) -> tuple[float, int | None]:
-    """(rate_as_fraction, next_funding_time_ms_or_None). Кидает исключение при ошибке."""
+def get_predicted_rate(exchange: str, symbol: str) -> tuple[float, int | None, float]:
+    """
+    (rate_as_fraction, next_funding_time_ms_or_None, funding_interval_hours).
+    Кидает исключение при ошибке.
+    """
     fetcher = _PREDICTED_RATE_FETCHERS.get(exchange)
     if fetcher is None:
         raise ValueError(f"Неизвестная биржа: {exchange}")
     return fetcher(symbol)
+
+
+def annualize(rate: float, interval_hours: float) -> float:
+    """
+    Ставка "за выплату" -> ставка годовых, в ПРОЦЕНТАХ (не долях).
+    Периодичность выплат разная по биржам и символам (1ч/4ч/8ч), поэтому
+    сравнивать ставки за выплату между собой напрямую нельзя — см. раздел
+    "ГОДОВАЯ СТАВКА" в докстринге модуля.
+    """
+    if not interval_hours or interval_hours <= 0:
+        return float("nan")
+    payments_per_year = (24.0 / interval_hours) * 365.0
+    return rate * payments_per_year * 100.0
 
 
 # ── Проверка и отправка алертов ───────────────────────────────────────────────
@@ -253,7 +363,7 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
             key = (exchange, symbol)
             seen_keys.add(key)
             try:
-                rate, next_ms = get_predicted_rate(exchange, symbol)
+                rate, next_ms, _interval_hours = get_predicted_rate(exchange, symbol)
             except Exception as e:
                 print(f"[alerts/{exchange}/{symbol}] Ошибка получения прогнозной ставки: {e}")
                 continue
@@ -330,21 +440,31 @@ def build_predicted_rates_report(secrets: dict) -> str:
         lines.append("")
         lines.append(f"── {label} ──")
 
-        rows = []    # (rate, symbol, next_ms) — успешно полученные ставки
+        rows = []    # (rate, symbol, next_ms, interval_hours) — успешно полученные ставки
         errors = []  # (symbol, текст_ошибки)
         for symbol in symbols:
             try:
-                rate, next_ms = get_predicted_rate(exchange, symbol)
-                rows.append((rate, symbol, next_ms))
+                rate, next_ms, interval_hours = get_predicted_rate(exchange, symbol)
+                rows.append((rate, symbol, next_ms, interval_hours))
                 any_rate = True
             except Exception as e:
                 errors.append((symbol, str(e)))
 
         # Сначала самые отрицательные (то, что заплатите) — так самое
         # срочное сразу видно вверху секции, а не теряется среди строк.
-        for rate, symbol, next_ms in sorted(rows, key=lambda x: x[0]):
+        # Показываем ОБА значения — ставку за конкретную выплату (сколько
+        # спишут/начислят в ближайший раз) и приведённую к году (APR), т.к.
+        # периодичность выплат разная по биржам/символам (1ч/4ч/8ч) и сами
+        # ставки "за выплату" между собой напрямую не сравнить — см.
+        # annualize() и докстринг модуля.
+        for rate, symbol, next_ms, interval_hours in sorted(rows, key=lambda x: x[0]):
             emoji = "🟢" if rate >= 0 else "🔴"
-            lines.append(f"{emoji} {symbol}: {rate * 100:+.4f}% ({_fmt_next_time(next_ms)})")
+            apr = annualize(rate, interval_hours)
+            lines.append(
+                f"{emoji} {symbol}: {rate * 100:+.4f}% за выплату "
+                f"(годовых {apr:+.1f}%) — {_fmt_next_time(next_ms)}, "
+                f"funding раз в {interval_hours:g}ч"
+            )
 
         for symbol, err in errors:
             lines.append(f"⚠️ {symbol}: не удалось получить ставку ({err})")
