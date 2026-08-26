@@ -57,7 +57,7 @@ matplotlib.use("Agg")  # без дисплея — рендерим сразу �
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-from funding_report import _get_mexc_proxies, _get_gate_proxies
+from funding_report import _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
 from funding_alerts import (
     get_predicted_rate,
     annualize,
@@ -91,6 +91,15 @@ GRID_STEP_HOURS = 4
 # 4-часовой сетке (см. _build_grid) — прореживаются только подписи осей,
 # не сама точность графика.
 MAX_TICKS_AT_FULL_RESOLUTION = 60
+
+# График в любом случае не заглядывает дальше этого числа дней назад, даже
+# если самая ранняя из открытых позиций старше — на практике связки редко
+# висят открытыми дольше месяца, а чем длиннее график, тем менее читаема
+# 4-часовая детализация на нём (см. MAX_TICKS_AT_FULL_RESOLUTION). Позиции
+# старше этого порога просто не показывают свою историю целиком — график
+# начинается с даты открытия САМОЙ РАННЕЙ позиции, но не раньше, чем
+# MAX_CHART_LOOKBACK_DAYS дней назад.
+MAX_CHART_LOOKBACK_DAYS = 30
 
 
 # ── Публичная история ставок funding — Aster, MEXC, Gate ─────────────────────
@@ -248,8 +257,14 @@ def _collect_series(open_results: dict) -> dict:
     Возвращает {(exchange, symbol): [(time_ms, rate, interval_hours), ...]}
     отсортированные по времени. Биржи/символы, для которых не удалось
     получить ни одной точки, просто отсутствуют в результате.
+
+    История дальше MAX_CHART_LOOKBACK_DAYS дней назад не собирается вовсе
+    (не только не показывается, а даже не запрашивается лишним запросом к
+    бирже для Aster/MEXC/Gate) — см. докстринг константы.
     """
     series: dict = {}
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - MAX_CHART_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
 
     for exchange, (records, error) in open_results.items():
         if error or not records:
@@ -257,6 +272,7 @@ def _collect_series(open_results: dict) -> dict:
 
         if exchange == "bybit":
             for symbol, points in _bybit_series_from_records(records).items():
+                points = [(t, r) for t, r in points if t >= cutoff_ms]
                 if not points:
                     continue
                 try:
@@ -268,6 +284,7 @@ def _collect_series(open_results: dict) -> dict:
 
         elif exchange == "lighter":
             for symbol, points in _lighter_series_from_records(records).items():
+                points = [(t, r) for t, r in points if t >= cutoff_ms]
                 if points:
                     series[("lighter", symbol)] = [(t, r, LIGHTER_FUNDING_INTERVAL_HOURS) for t, r in points]
 
@@ -283,9 +300,10 @@ def _collect_series(open_results: dict) -> dict:
                 t_ms = int(float(raw_t)) * (1000 if time_in_seconds else 1)
                 by_symbol_times[sym].append(t_ms)
 
-            now_ms = int(time.time() * 1000)
             for symbol, times in by_symbol_times.items():
-                start_ms = min(times)
+                # max(), не min() — не запрашиваем историю раньше cutoff_ms,
+                # даже если позиция открыта раньше (см. MAX_CHART_LOOKBACK_DAYS)
+                start_ms = max(min(times), cutoff_ms)
                 try:
                     if exchange == "aster":
                         raw_points = _fetch_aster_rate_history(symbol, start_ms, now_ms)
@@ -330,7 +348,19 @@ def _step_hold_on_grid(points: list, grid: list) -> list:
     rate, interval_hours) на этот момент или раньше, либо None, если такой
     точки ещё не было (позиция на этот момент ещё не существовала).
     points должны быть отсортированы по времени по возрастанию.
+
+    Значение "держится" вперёд только до CONTINUOUS_FUNDING_GAP_HOURS часов
+    от своего момента — тот же порог и то же обоснование, что и в
+    funding_report._trim_to_continuous_run (funding у перпетуалов идёт не
+    реже раза в 8ч, поэтому более длинный разрыв — надёжный признак, что
+    позиции в этот промежуток уже не было). Без этой границы одна закравшаяся
+    в данные старая/ошибочная запись (см. handoff про Bybit createdTime,
+    который не всегда сбрасывается при переоткрытии позиции) "протянула" бы
+    линию плоской вперёд вплоть до самого графика — эта граница не даёт
+    визуально исказить график, даже если выше по цепочке (funding_report.py)
+    в данные всё же просочится что-то лишнее.
     """
+    max_hold_ms = CONTINUOUS_FUNDING_GAP_HOURS * 60 * 60 * 1000
     result: list = []
     j, n = 0, len(points)
     last = None
@@ -338,7 +368,10 @@ def _step_hold_on_grid(points: list, grid: list) -> list:
         while j < n and points[j][0] <= gt:
             last = points[j]
             j += 1
-        result.append(last)
+        if last is not None and gt - last[0] > max_hold_ms:
+            result.append(None)
+        else:
+            result.append(last)
     return result
 
 
@@ -355,8 +388,12 @@ def build_positions_apr_chart(open_results: dict) -> str | None:
     if not series:
         return None
 
-    earliest_ms = min(points[0][0] for points in series.values())
     now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - MAX_CHART_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+    # _collect_series уже не собирает точки старше cutoff_ms, так что это
+    # избыточная подстраховка (на случай если сюда когда-нибудь передадут
+    # серии в обход _collect_series) — дешёвая и ничего не меняет в обычном случае.
+    earliest_ms = max(min(points[0][0] for points in series.values()), cutoff_ms)
     grid = _build_grid(earliest_ms, now_ms)
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=150)
