@@ -817,6 +817,15 @@ def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) ->
 # частоты начислений (та бывает чаще, не реже, так что 8ч-порог её не ловит).
 CONTINUOUS_FUNDING_GAP_HOURS = 16
 
+# Отдельный, куда более щедрый порог — только для подстраховки Bybit/MEXC от
+# "залипшего" createdTime (см. докстринг _trim_open_position_records). Здесь
+# нам не нужно ловить закрытие позиции с точностью до одного пропущенного
+# начисления (в отличие от Aster/Lighter/Gate) — реальный момент открытия и
+# так известен точно; эта обрезка должна сработать только на действительно
+# древнем "хвосте" (счёт на месяцы/годы), а не на паре часов задержки первой
+# записи после настоящего открытия.
+STALE_CREATEDTIME_GAP_HOURS = 72
+
 
 def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
                              gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS) -> list:
@@ -859,12 +868,25 @@ def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
 
 
 def _trim_open_position_records(records: list, symbol_field: str,
-                                 time_field: str, time_unit: str) -> list:
+                                 time_field: str, time_unit: str,
+                                 gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS) -> list:
     """
     Группирует записи funding по символу и для каждого символа отдельно
     оставляет только непрерывную цепочку начислений (см. _trim_to_continuous_run).
-    Используется для бирж без точного времени открытия позиции в API
-    (Aster, Lighter, Gate) — в отличие от Bybit/MEXC, где есть createdTime.
+
+    gap_threshold_hours по умолчанию — CONTINUOUS_FUNDING_GAP_HOURS (16ч),
+    рассчитанный на биржи БЕЗ точного времени открытия (Aster, Lighter,
+    Gate), где разрыв — единственный способ понять, что позиция была
+    закрыта, и его нужно ловить как можно точнее.
+
+    Для Bybit/MEXC, где createdTime и так даёт точное время открытия,
+    вызывающий код передаёт сюда более щедрый порог (см. вызовы ниже) —
+    там эта обрезка нужна только как подстраховка от "залипшего" (очень
+    старого) createdTime, а не для определения момента открытия с нуля.
+    Обычный 16-часовой порог для этой цели слишком строгий: любая мелкая
+    задержка биржи с первым начислением после реального открытия (что
+    случается на практике) ошибочно read-ается как "до этого позиции не
+    было" и срезает законное начало истории.
     """
     by_symbol: dict = defaultdict(list)
     for r in records:
@@ -872,7 +894,7 @@ def _trim_open_position_records(records: list, symbol_field: str,
 
     trimmed: list = []
     for _, sym_records in by_symbol.items():
-        trimmed.extend(_trim_to_continuous_run(sym_records, time_field, time_unit))
+        trimmed.extend(_trim_to_continuous_run(sym_records, time_field, time_unit, gap_threshold_hours))
     return trimmed
 
 
@@ -965,6 +987,7 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # изменится, а если понадобится — вырежет ложную старую историю.
                 records = _trim_open_position_records(
                     records, symbol_field="symbol", time_field="transactionTime", time_unit="ms",
+                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS,
                 )
                 results["bybit"] = (records, None)
         except Exception as e:
@@ -1015,6 +1038,7 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # может оказаться таким же "залипшим" от старого открытия позиции.
                 records = _trim_open_position_records(
                     records, symbol_field="symbol", time_field="settleTime", time_unit="ms",
+                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS,
                 )
                 results["mexc"] = (records, None)
         except Exception as e:
