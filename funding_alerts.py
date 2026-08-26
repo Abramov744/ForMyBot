@@ -30,6 +30,10 @@
   - Lighter — публичный эндпоинт funding-rates не документирует явно,
     прогноз это или последняя расчётная ставка; используется как есть,
     это лучшее, что доступно публично.
+
+Те же get_open_positions()/get_predicted_rate() используются и для
+build_predicted_rates_report() — отчёта по запросу для команды /rates в
+Telegram-боте (см. bot_poll.py), не только для фонового цикла алертов.
 """
 
 import os
@@ -295,6 +299,61 @@ def alert_loop(secrets: dict | None = None) -> None:
         except Exception as e:
             print(f"[alerts] Ошибка цикла проверки: {e}", flush=True)
         time.sleep(interval_s)
+
+
+# ── Отчёт по запросу: прогнозная ставка для команды /rates в Telegram ────────
+
+def build_predicted_rates_report(secrets: dict) -> str:
+    """
+    В отличие от build_open_positions_report в funding_report.py (это уже
+    НАЧИСЛЕННЫЙ funding с момента открытия позиции), здесь — чего ждать на
+    СЛЕДУЮЩУЮ выплату. Переиспользует get_open_positions()/get_predicted_rate()
+    — те же функции, что и check_funding_alerts(), поэтому если логика
+    получения прогнозной ставки когда-нибудь изменится (например, уточнится
+    источник для Lighter, см. докстринг модуля), эта команда останется
+    согласована с алертами автоматически, а не разъедется как отдельная
+    копия того же самого.
+    """
+    lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
+    open_positions = get_open_positions(secrets)
+
+    if not any(open_positions.values()):
+        lines.append("")
+        lines.append("Сейчас нет ни одной открытой позиции ни на одной подключённой бирже.")
+        return "\n".join(lines)
+
+    any_rate = False
+    for exchange, symbols in open_positions.items():
+        if not symbols:
+            continue
+        label = EXCHANGE_LABELS.get(exchange, exchange)
+        lines.append("")
+        lines.append(f"── {label} ──")
+
+        rows = []    # (rate, symbol, next_ms) — успешно полученные ставки
+        errors = []  # (symbol, текст_ошибки)
+        for symbol in symbols:
+            try:
+                rate, next_ms = get_predicted_rate(exchange, symbol)
+                rows.append((rate, symbol, next_ms))
+                any_rate = True
+            except Exception as e:
+                errors.append((symbol, str(e)))
+
+        # Сначала самые отрицательные (то, что заплатите) — так самое
+        # срочное сразу видно вверху секции, а не теряется среди строк.
+        for rate, symbol, next_ms in sorted(rows, key=lambda x: x[0]):
+            emoji = "🟢" if rate >= 0 else "🔴"
+            lines.append(f"{emoji} {symbol}: {rate * 100:+.4f}% ({_fmt_next_time(next_ms)})")
+
+        for symbol, err in errors:
+            lines.append(f"⚠️ {symbol}: не удалось получить ставку ({err})")
+
+    if not any_rate:
+        lines.append("")
+        lines.append("Не удалось получить прогнозную ставку ни по одной позиции.")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
