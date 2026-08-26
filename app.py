@@ -4,7 +4,11 @@
   1) веб-страница с калькулятором funding (эта же страница защищена Basic Auth);
   2) фоново — Telegram-бот (long polling, тот же код, что в bot_worker.py);
   3) фоново — почасовая проверка прогнозного funding по открытым позициям
-     и алерты в Telegram при уходе в минус (funding_alerts.py).
+     и алерты в Telegram при уходе в минус (funding_alerts.py);
+  4) фоново, ОПЦИОНАЛЬНО (только если заданы GOOGLE_SHEET_ID и
+     GOOGLE_SERVICE_ACCOUNT_JSON) — периодическая запись funding по
+     открытым позициям в столбец P Google Sheet взамен ручного ввода
+     (sheets_sync.py).
 
 Раньше (см. bot_worker.py) сервис на Railway был "worker" — процесс без
 входящего HTTP и без публичного адреса. Теперь нужен и публичный веб —
@@ -26,6 +30,16 @@ $PORT. bot_worker.py и bot_poll.py при этом не удалены и по-
   FUNDING_ALERT_THRESHOLD       — порог ставки (доля, не %) для алерта,
                                    по умолчанию 0.0 (алерт при любой ставке < 0)
 
+Опционально — синхронизация с Google Sheet (см. sheets_sync.py, поток #4
+выше). Если GOOGLE_SHEET_ID не задан, поток просто не запускается —
+остальная часть приложения (веб-калькулятор, бот, алерты) работает как
+обычно:
+  GOOGLE_SHEET_ID               — id таблицы
+  GOOGLE_SERVICE_ACCOUNT_JSON   — JSON-ключ сервисного аккаунта Google целиком
+  GOOGLE_SHEET_TAB              — опционально, имя вкладки (по умолчанию —
+                                   первая в файле)
+  SHEET_SYNC_INTERVAL_MINUTES   — период синхронизации, по умолчанию 60
+
 Запуск локально для проверки: PORT=8080 python app.py
 """
 
@@ -40,6 +54,7 @@ import entry_price
 from bot_worker import poll_forever
 from funding_alerts import alert_loop
 from funding_report import load_secrets
+from sheets_sync import sheet_sync_loop
 
 app = Flask(__name__)
 
@@ -520,6 +535,15 @@ def main():
 
     threading.Thread(target=poll_forever, daemon=True, name="telegram-poll").start()
     threading.Thread(target=alert_loop, args=(secrets,), daemon=True, name="funding-alerts").start()
+
+    # Опционально: пользователь может не подключать Google Sheet вовсе —
+    # тогда просто не запускаем поток, а не падаем и не блокируем всё
+    # остальное (веб-калькулятор/бот/алерты по-прежнему работают).
+    if os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        threading.Thread(target=sheet_sync_loop, args=(secrets,), daemon=True, name="sheet-sync").start()
+    else:
+        print("[app] GOOGLE_SHEET_ID/GOOGLE_SERVICE_ACCOUNT_JSON не заданы — "
+              "синхронизация с Google Sheet отключена.", flush=True)
 
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)
