@@ -932,9 +932,18 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
             open_times = fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"])
             if open_times:
                 # Bybit отдаёт точное время открытия — начинаем именно с него,
-                # а не с общего lookback-окна (там, где оно раньше, разумеется)
+                # а не с общего lookback-окна (там, где оно раньше, разумеется).
+                # НО: на практике createdTime не всегда сбрасывается при полном
+                # закрытии и повторном открытии позиции по тому же символу и
+                # может указывать на дату из далёкого прошлого (см. подстраховку
+                # ниже) — если довериться ему слепо, отсюда же получаем и лавину
+                # запросов к Bybit (по 7-дневным окнам вплоть до этой древней
+                # даты), упирающуюся в лимиты/таймауты прокси ещё ДО того, как
+                # подстраховка успевает что-то обрезать. Поэтому дополнительно
+                # не уходим глубже общего lookback_start_ms — так же, как уже
+                # сделано для Aster/Lighter/Gate.
                 earliest_ms = min(open_times.values())
-                fetch_start_ms = min(earliest_ms, now_ms)  # на случай часовых поясов/рассинхрона
+                fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
                 records = _fetch_in_windows(
                     lambda s, e: fetch_bybit(
                         api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
@@ -947,13 +956,11 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     if r.get("symbol") in open_times
                     and int(r.get("transactionTime", 0)) >= open_times[r["symbol"]]
                 ]
-                # Подстраховка сверх фильтра по createdTime: на практике у Bybit
-                # это поле не всегда сбрасывается при полном закрытии и повторном
-                # открытии позиции по тому же символу (иногда остаётся от более
-                # раннего "слота" позиции) — тогда фильтр выше пропускает и
-                # старые, не относящиеся к текущей позиции записи. Обрезаем ещё
-                # и по непрерывности начислений (тот же приём, что и для
-                # Aster/Lighter/Gate, где createdTime вовсе не отдаётся) — если
+                # Подстраховка сверх фильтра по createdTime: та же ситуация
+                # ("залипшее" createdTime) может пропустить в результат старые,
+                # не относящиеся к текущей позиции записи — обрезаем ещё и по
+                # непрерывности начислений (тот же приём, что и для
+                # Aster/Lighter/Gate, где createdTime вовсе не отдаётся). Если
                 # он не понадобится (когда createdTime корректен), результат не
                 # изменится, а если понадобится — вырежет ложную старую историю.
                 records = _trim_open_position_records(
@@ -988,8 +995,10 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_times = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
             if open_times:
+                # Тот же потолок глубины, что и у Bybit выше, и по той же причине
+                # (не доверяем createTime слепо на случай, если он "залип").
                 earliest_ms = min(open_times.values())
-                fetch_start_ms = min(earliest_ms, now_ms)
+                fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
                 records = _fetch_in_windows(
                     lambda s, e: fetch_mexc(
                         api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
