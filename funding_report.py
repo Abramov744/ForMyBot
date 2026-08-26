@@ -828,7 +828,8 @@ STALE_CREATEDTIME_GAP_HOURS = 72
 
 
 def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
-                             gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS) -> list:
+                             gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS,
+                             debug_label: str | None = None) -> list:
     """
     Для записей funding ОДНОГО символа: сортирует по времени (от новых
     к старым) и оставляет только непрерывную цепочку начислений от самой
@@ -841,6 +842,11 @@ def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
     порога (не путает смену частоты начислений с закрытием позиции).
 
     time_unit: "ms" или "s" — единицы измерения значения в time_field.
+
+    debug_label — если задан, при реальной обрезке (не при "и так всё
+    подряд") печатает в лог, где именно нашёлся разрыв и сколько записей
+    отрезано — чтобы расследовать похожие случаи не гаданием по скриншоту
+    графика, а по факту из лога (см. историю с Bybit createdTime).
     """
     def _time_ms(r):
         raw = r.get(time_field)
@@ -862,6 +868,15 @@ def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
     for i in range(len(timed) - 1):
         gap = timed[i][0] - timed[i + 1][0]
         if gap > threshold_ms:
+            if debug_label:
+                cut_after = datetime.fromtimestamp(timed[i][0] / 1000, tz=timezone.utc)
+                cut_before = datetime.fromtimestamp(timed[i + 1][0] / 1000, tz=timezone.utc)
+                print(
+                    f"[trim/{debug_label}] Найден разрыв {gap / 3600000:.1f}ч "
+                    f"(порог {gap_threshold_hours}ч) между {cut_before.strftime('%Y-%m-%d %H:%M')} UTC "
+                    f"и {cut_after.strftime('%Y-%m-%d %H:%M')} UTC — оставляю только {len(result)} "
+                    f"запись(ей) из {len(timed)} (более старые отрезаны)."
+                )
             break
         result.append(timed[i + 1][1])
     return result
@@ -869,7 +884,8 @@ def _trim_to_continuous_run(records: list, time_field: str, time_unit: str,
 
 def _trim_open_position_records(records: list, symbol_field: str,
                                  time_field: str, time_unit: str,
-                                 gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS) -> list:
+                                 gap_threshold_hours: float = CONTINUOUS_FUNDING_GAP_HOURS,
+                                 debug_label: str | None = None) -> list:
     """
     Группирует записи funding по символу и для каждого символа отдельно
     оставляет только непрерывную цепочку начислений (см. _trim_to_continuous_run).
@@ -887,14 +903,19 @@ def _trim_open_position_records(records: list, symbol_field: str,
     задержка биржи с первым начислением после реального открытия (что
     случается на практике) ошибочно read-ается как "до этого позиции не
     было" и срезает законное начало истории.
+
+    debug_label — см. _trim_to_continuous_run; здесь дополняется символом
+    (например "Bybit/SIRENUSDT"), чтобы в логе было видно, какого именно
+    символа касается срез.
     """
     by_symbol: dict = defaultdict(list)
     for r in records:
         by_symbol[r.get(symbol_field)].append(r)
 
     trimmed: list = []
-    for _, sym_records in by_symbol.items():
-        trimmed.extend(_trim_to_continuous_run(sym_records, time_field, time_unit, gap_threshold_hours))
+    for symbol, sym_records in by_symbol.items():
+        label = f"{debug_label}/{symbol}" if debug_label else None
+        trimmed.extend(_trim_to_continuous_run(sym_records, time_field, time_unit, gap_threshold_hours, debug_label=label))
     return trimmed
 
 
@@ -966,6 +987,13 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # сделано для Aster/Lighter/Gate.
                 earliest_ms = min(open_times.values())
                 fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
+                print(
+                    "[Bybit/positions] createdTime по символам: " +
+                    ", ".join(
+                        f"{sym}={datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+                        for sym, ts in open_times.items()
+                    ) + f"; запрашиваю с {datetime.fromtimestamp(fetch_start_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+                )
                 records = _fetch_in_windows(
                     lambda s, e: fetch_bybit(
                         api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
@@ -973,11 +1001,13 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     ),
                     _EXCHANGE_WINDOW_DAYS["bybit"], fetch_start_ms, now_ms,
                 )
+                print(f"[Bybit/positions] Получено сырых записей: {len(records)}")
                 records = [
                     r for r in records
                     if r.get("symbol") in open_times
                     and int(r.get("transactionTime", 0)) >= open_times[r["symbol"]]
                 ]
+                print(f"[Bybit/positions] После фильтра по символу+createdTime: {len(records)}")
                 # Подстраховка сверх фильтра по createdTime: та же ситуация
                 # ("залипшее" createdTime) может пропустить в результат старые,
                 # не относящиеся к текущей позиции записи — обрезаем ещё и по
@@ -987,8 +1017,9 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # изменится, а если понадобится — вырежет ложную старую историю.
                 records = _trim_open_position_records(
                     records, symbol_field="symbol", time_field="transactionTime", time_unit="ms",
-                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS,
+                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS, debug_label="Bybit",
                 )
+                print(f"[Bybit/positions] После обрезки по непрерывности: {len(records)}")
                 results["bybit"] = (records, None)
         except Exception as e:
             print(f"[Bybit/positions] Ошибка: {e}")
@@ -1022,6 +1053,13 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # (не доверяем createTime слепо на случай, если он "залип").
                 earliest_ms = min(open_times.values())
                 fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
+                print(
+                    "[MEXC/positions] createTime по символам: " +
+                    ", ".join(
+                        f"{sym}={datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+                        for sym, ts in open_times.items()
+                    ) + f"; запрашиваю с {datetime.fromtimestamp(fetch_start_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+                )
                 records = _fetch_in_windows(
                     lambda s, e: fetch_mexc(
                         api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
@@ -1029,17 +1067,20 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                     ),
                     _EXCHANGE_WINDOW_DAYS["mexc"], fetch_start_ms, now_ms,
                 )
+                print(f"[MEXC/positions] Получено сырых записей: {len(records)}")
                 records = [
                     r for r in records
                     if r.get("symbol") in open_times
                     and int(r.get("settleTime", 0)) >= open_times[r["symbol"]]
                 ]
+                print(f"[MEXC/positions] После фильтра по символу+createTime: {len(records)}")
                 # Та же подстраховка, что и для Bybit выше — createTime теоретически
                 # может оказаться таким же "залипшим" от старого открытия позиции.
                 records = _trim_open_position_records(
                     records, symbol_field="symbol", time_field="settleTime", time_unit="ms",
-                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS,
+                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS, debug_label="MEXC",
                 )
+                print(f"[MEXC/positions] После обрезки по непрерывности: {len(records)}")
                 results["mexc"] = (records, None)
         except Exception as e:
             print(f"[MEXC/positions] Ошибка: {e}")
