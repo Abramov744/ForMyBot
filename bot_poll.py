@@ -19,6 +19,11 @@
   /calendar               — прислать интерактивный календарь с кнопками:
                              стрелки « / » листают месяцы, нажатие на число
                              сразу присылает отчёт за этот день
+  /positions               — суммарный НАЧИСЛЕННЫЙ funding по открытым сейчас
+                             позициям (с момента открытия каждой)
+  /rates                    — ПРОГНОЗНАЯ ставка funding по открытым сейчас
+                             позициям на следующую выплату (см. funding_alerts.py
+                             — та же логика, что и в фоновых алертах)
 """
 
 import calendar as calendar_mod
@@ -37,11 +42,13 @@ from funding_report import (
     build_open_positions_report,
     send_telegram,
 )
+from funding_alerts import build_predicted_rates_report
 
 # /report, /report@ИмяБота, с необязательным аргументом-датой после пробела
 COMMAND_RE = re.compile(r"^/report(?:@\w+)?\s*(.*)$", re.IGNORECASE)
 CALENDAR_RE = re.compile(r"^/calendar(?:@\w+)?\s*$", re.IGNORECASE)
 POSITIONS_RE = re.compile(r"^/positions(?:@\w+)?\s*$", re.IGNORECASE)
+RATES_RE = re.compile(r"^/rates(?:@\w+)?\s*$", re.IGNORECASE)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
 
@@ -50,6 +57,7 @@ START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
 BUTTON_REPORT = "📊 Отчёт за вчера"
 BUTTON_CALENDAR = "📅 Календарь"
 BUTTON_POSITIONS = "📈 Открытые позиции"
+BUTTON_RATES = "🔮 Ставка финансирования"
 
 MONTH_NAMES_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
@@ -71,6 +79,7 @@ def build_main_menu_keyboard() -> dict:
             [{"text": BUTTON_REPORT}],
             [{"text": BUTTON_CALENDAR}],
             [{"text": BUTTON_POSITIONS}],
+            [{"text": BUTTON_RATES}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -255,6 +264,27 @@ def send_open_positions_report(secrets: dict, chat_id: str) -> None:
             print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
 
 
+def send_predicted_rates_report(secrets: dict, chat_id: str) -> None:
+    """
+    Прогнозная ставка funding по открытым сейчас позициям (build_predicted_rates_report
+    в funding_alerts.py — та же логика, что и в фоновых алертах на отрицательный
+    фандинг, просто по запросу и сразу по всем позициям, а не только при
+    переходе в минус).
+    """
+    token = secrets["telegram_token"]
+    try:
+        send_telegram(token, chat_id, "⏳ Запрашиваю прогнозные ставки по открытым позициям…")
+        report = build_predicted_rates_report(secrets)
+        send_telegram(token, chat_id, report)
+        print("Отправлен отчёт по прогнозным ставкам.")
+    except Exception as e:
+        print(f"Ошибка при формировании отчёта по прогнозным ставкам: {e}")
+        try:
+            send_telegram(token, chat_id, f"❌ Не получилось сформировать отчёт: {e}")
+        except Exception as e2:
+            print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+
+
 # ── Обработка входящих сообщений и нажатий на кнопки ──────────────────────────
 
 def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
@@ -270,7 +300,7 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         send_message(
             token, chat_id,
             "Готов присылать отчёты по funding fee.\n"
-            "Кнопки внизу — под рукой, либо команды /report, /calendar, /positions текстом.",
+            "Кнопки внизу — под рукой, либо команды /report, /calendar, /positions, /rates текстом.",
             reply_markup=build_main_menu_keyboard(),
         )
         return
@@ -283,6 +313,8 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         text = "/calendar"
     elif text == BUTTON_REPORT:
         text = "/report"
+    elif text == BUTTON_RATES:
+        text = "/rates"
 
     if CALENDAR_RE.match(text):
         now_msk = datetime.now(MSK)
@@ -293,6 +325,11 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
     if POSITIONS_RE.match(text):
         print("Обрабатываю команду: '/positions'")
         send_open_positions_report(secrets, chat_id)
+        return
+
+    if RATES_RE.match(text):
+        print("Обрабатываю команду: '/rates'")
+        send_predicted_rates_report(secrets, chat_id)
         return
 
     m = COMMAND_RE.match(text)
