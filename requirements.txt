@@ -2,3 +2,4 @@ eth_account
 requests
 Flask
 gspread
+matplotlib

@@ -28,6 +28,7 @@
 
 import calendar as calendar_mod
 import json
+import os
 import re
 from datetime import datetime, timedelta
 
@@ -43,6 +44,7 @@ from funding_report import (
     send_telegram,
 )
 from funding_alerts import build_predicted_rates_report
+from funding_chart import build_positions_apr_chart
 
 # /report, /report@ИмяБота, с необязательным аргументом-датой после пробела
 COMMAND_RE = re.compile(r"^/report(?:@\w+)?\s*(.*)$", re.IGNORECASE)
@@ -192,6 +194,19 @@ def send_message(token: str, chat_id: str, text: str, reply_markup: dict | None 
     resp.raise_for_status()
 
 
+def send_photo(token: str, chat_id: str, photo_path: str, caption: str | None = None) -> None:
+    """Отправляет локальный файл как фото (multipart/form-data), в отличие
+    от send_message — тут нельзя просто передать JSON с URL, т.к. график
+    рендерится на лету и существует только на диске самого процесса."""
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+    with open(photo_path, "rb") as f:
+        resp = requests.post(url, data=data, files={"photo": f}, timeout=60)
+    resp.raise_for_status()
+
+
 def edit_message_reply_markup(token: str, chat_id: str, message_id: int, reply_markup: dict) -> None:
     url = f"https://api.telegram.org/bot{token}/editMessageReplyMarkup"
     payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": json.dumps(reply_markup)}
@@ -262,6 +277,27 @@ def send_open_positions_report(secrets: dict, chat_id: str) -> None:
             send_telegram(token, chat_id, f"❌ Не получилось сформировать отчёт: {e}")
         except Exception as e2:
             print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+        return
+
+    # График APR — отдельным шагом со своим try/except: к этому моменту
+    # текстовый отчёт уже успешно ушёл, поэтому проблема именно с графиком
+    # не должна "откатывать" уже отправленный текст или ронять весь метод.
+    # results уже содержит всё нужное (те же открытые позиции, что и в
+    # тексте выше) — заново запрашивать биржи не нужно.
+    chart_path = None
+    try:
+        chart_path = build_positions_apr_chart(results)
+        if chart_path:
+            send_photo(
+                token, chat_id, chart_path,
+                caption="Годовая ставка funding (APR) по открытым позициям — раз в 4ч, по времени открытия самой ранней позиции",
+            )
+            print("Отправлен график APR по открытым позициям.")
+    except Exception as e:
+        print(f"Ошибка при построении/отправке графика APR: {e}")
+    finally:
+        if chart_path and os.path.exists(chart_path):
+            os.remove(chart_path)
 
 
 def send_predicted_rates_report(secrets: dict, chat_id: str) -> None:
