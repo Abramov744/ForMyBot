@@ -58,6 +58,7 @@ import matplotlib
 matplotlib.use("Agg")  # без дисплея — рендерим сразу в файл
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.patheffects as pe
 
 from funding_report import _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
 from funding_alerts import (
@@ -75,13 +76,19 @@ EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate",
 }
+# Кислотная неоновая палитра — тёмный фон + свечение линий, см. build_positions_apr_chart.
 EXCHANGE_COLORS = {
-    "aster":   "#4f8cff",
-    "bybit":   "#f7a600",
-    "lighter": "#8b5cf6",
-    "mexc":    "#00b67a",
-    "gate":    "#e6484b",
+    "aster":   "#00f0ff",  # кислотный циан
+    "bybit":   "#faff00",  # кислотный жёлтый
+    "lighter": "#ff00e6",  # кислотный маджента
+    "mexc":    "#39ff14",  # кислотный зелёный
+    "gate":    "#ff3d3d",  # кислотный красный
 }
+
+# Оформление графика: тёмный фон + светящиеся линии.
+CHART_BG_COLOR = "#0a0a0a"
+CHART_FG_COLOR = "#dcdcdc"
+CHART_GRID_COLOR = "#2a2a2a"
 
 # Шаг сетки по оси X — см. докстринг модуля, раздел "ЧТО НА ГРАФИКЕ".
 GRID_STEP_HOURS = 4
@@ -408,7 +415,13 @@ def build_positions_apr_chart(open_results: dict) -> str | None:
     earliest_ms = max(min(points[0][0] for points in series.values()), cutoff_ms)
     grid = _build_grid(earliest_ms, now_ms)
 
+    # Тёмная неоновая тема: тёмный фон, кислотные линии со свечением
+    # (несколько всё более тонких и ярких полупрозрачных слоёв поверх
+    # базовой линии + лёгкий контурный path_effect) — чисто визуальное
+    # оформление, логика графика (сетка/step-hold/аннуализация) не меняется.
     fig, ax = plt.subplots(figsize=(11, 6), dpi=150)
+    fig.patch.set_facecolor(CHART_BG_COLOR)
+    ax.set_facecolor(CHART_BG_COLOR)
 
     for (exchange, symbol), points in sorted(series.items()):
         held = _step_hold_on_grid(points, grid)
@@ -424,13 +437,22 @@ def build_positions_apr_chart(open_results: dict) -> str | None:
 
         color = EXCHANGE_COLORS.get(exchange, "#999999")
         label = f"{EXCHANGE_LABELS.get(exchange, exchange)}: {symbol}"
-        ax.plot(xs, ys, color=color, linewidth=1.6, marker="o", markersize=2.5, label=label)
+        # Слои свечения (широкие, полупрозрачные, снизу) + основная яркая линия сверху.
+        for lw, alpha in [(6, 0.10), (4, 0.18), (2.4, 0.35)]:
+            ax.plot(xs, ys, color=color, linewidth=lw, alpha=alpha, solid_capstyle="round")
+        ax.plot(
+            xs, ys, color=color, linewidth=1.4, marker="o", markersize=2.2, label=label,
+            path_effects=[pe.Stroke(linewidth=2.2, foreground=color, alpha=0.5), pe.Normal()],
+        )
 
-    ax.set_title("Годовая ставка funding (APR) по открытым позициям")
-    ax.set_xlabel("Время (UTC)")
-    ax.set_ylabel("APR, %")
-    ax.axhline(0, color="#888888", linewidth=0.8, linestyle="--")
-    ax.grid(True, alpha=0.25)
+    ax.set_title("Годовая ставка funding (APR) по открытым позициям", color=CHART_FG_COLOR)
+    ax.set_xlabel("Время (UTC)", color=CHART_FG_COLOR)
+    ax.set_ylabel("APR, %", color=CHART_FG_COLOR)
+    ax.axhline(0, color="#666666", linewidth=0.8, linestyle="--")
+    ax.grid(True, color=CHART_GRID_COLOR, alpha=0.5)
+    ax.tick_params(colors=CHART_FG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_color(CHART_GRID_COLOR)
 
     if len(grid) <= MAX_TICKS_AT_FULL_RESOLUTION:
         ax.xaxis.set_major_locator(mdates.HourLocator(interval=GRID_STEP_HOURS))
@@ -441,10 +463,12 @@ def build_positions_apr_chart(open_results: dict) -> str | None:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m %H:%M"))
     fig.autofmt_xdate(rotation=45)
 
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    legend = ax.legend(loc="upper left", fontsize=8, ncol=2, facecolor=CHART_BG_COLOR, edgecolor=CHART_GRID_COLOR)
+    for text in legend.get_texts():
+        text.set_color(CHART_FG_COLOR)
     fig.tight_layout()
 
     path = f"/tmp/positions_apr_chart_{int(time.time())}.png"
-    fig.savefig(path)
+    fig.savefig(path, facecolor=CHART_BG_COLOR)
     plt.close(fig)
     return path
