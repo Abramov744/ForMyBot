@@ -55,6 +55,7 @@ from bot_worker import poll_forever
 from funding_alerts import alert_loop
 from funding_report import load_secrets
 from sheets_sync import sheet_sync_loop
+from sltp_alerts import sltp_alert_loop
 
 app = Flask(__name__)
 
@@ -535,6 +536,7 @@ def main():
 
     threading.Thread(target=poll_forever, daemon=True, name="telegram-poll").start()
     threading.Thread(target=alert_loop, args=(secrets,), daemon=True, name="funding-alerts").start()
+    threading.Thread(target=sltp_alert_loop, args=(secrets,), daemon=True, name="sltp-alerts").start()
 
     # Опционально: пользователь может не подключать Google Sheet вовсе —
     # тогда просто не запускаем поток, а не падаем и не блокируем всё

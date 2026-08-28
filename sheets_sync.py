@@ -123,10 +123,28 @@ _COL_COIN = 0        # B — монета
 _COL_STATUS = 1      # C — статус (active/done/пусто)
 _COL_EXCHANGE2 = 13  # O — Биржа 2
 
+# Ячейка, откуда берётся "снимок" текущего времени при закрытии позиции —
+# по всей видимости живая формула вроде =NOW(), которую пользователь при
+# ручном закрытии сделки копирует в F как статичное значение (см.
+# докстринг record_position_close). Сам скрипт её не создаёт и не меняет.
+_CLOSE_TIMESTAMP_CELL = "F6"
+
 
 def _extract_coin_base(label: str) -> str:
     """'ZRO( (spot/perp)' -> 'ZRO', 'CC (пул)' -> 'CC', 'COAI' -> 'COAI'."""
     return re.split(r"\(", label)[0].strip().upper()
+
+
+def _open_worksheet():
+    """Общий хелпер подключения к листу — переиспользуется и sync_once(),
+    и record_position_close(), чтобы не дублировать одни и те же 4 строки."""
+    sheet_id = os.environ["GOOGLE_SHEET_ID"]
+    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    tab_name = os.environ.get("GOOGLE_SHEET_TAB")
+
+    gc = gspread.service_account_from_dict(creds_info)
+    sh = gc.open_by_key(sheet_id)
+    return sh.worksheet(tab_name) if tab_name else sh.get_worksheet(0)
 
 
 def build_open_symbol_index(secrets: dict) -> dict:
@@ -210,13 +228,7 @@ def compute_funding_total(secrets: dict, exchange: str, symbol: str, open_time_m
 
 
 def sync_once(secrets: dict) -> None:
-    sheet_id = os.environ["GOOGLE_SHEET_ID"]
-    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    tab_name = os.environ.get("GOOGLE_SHEET_TAB")
-
-    gc = gspread.service_account_from_dict(creds_info)
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name) if tab_name else sh.get_worksheet(0)
+    ws = _open_worksheet()
 
     open_symbol_index = build_open_symbol_index(secrets)
 
@@ -264,6 +276,76 @@ def sync_once(secrets: dict) -> None:
     print(f"[sheets_sync] Обновлено ячеек P: {len(updates)}.", flush=True)
     for row_number, coin, exchange_raw, reason in skipped:
         print(f"[sheets_sync] Пропущена строка {row_number} ({coin!r}, биржа={exchange_raw!r}): {reason}", flush=True)
+
+
+def record_position_close(exchange: str, symbol: str) -> bool:
+    """
+    Записывает дату закрытия позиции в столбец F соответствующей строки —
+    вызывается из sltp_alerts.py сразу при обнаружении закрытия (независимо
+    от причины — SL/TP/вручную), а не по расписанию, как sync_once().
+
+    ЧТО ИМЕННО ПИШЕТСЯ: не "текущее время выполнения скрипта", а значение
+    ячейки _CLOSE_TIMESTAMP_CELL (F6) на этот момент — по всей видимости
+    живая формула вроде =NOW(), которую пользователь при ручном закрытии
+    сделки в таблице копирует в F как статичный "снимок" времени, а не как
+    формулу/ссылку (иначе она продолжала бы пересчитываться и дальше).
+    Здесь делается ровно то же самое, только автоматически: читается
+    ТЕКУЩЕЕ вычисленное значение F6 и копируется в F{row} как значение.
+
+    Читается и пишется НЕФОРМАТИРОВАННОЕ (числовое, serial-date) значение,
+    а не отображаемая строка (value_render_option="UNFORMATTED_VALUE") —
+    так в F{row} попадает настоящее числовое представление даты/времени
+    (в уже отформатированную как дата ячейку столбца F), а не текстовая
+    строка, которую Google Sheets не распознает как дату и не учтёт в
+    формулах вроде статуса в колонке C.
+
+    Строка ищется тем же способом (биржа + базовый актив), что и в
+    sync_once() для колонки P, но НЕ через build_open_symbol_index() —
+    закрывшаяся позиция уже не входит в список открытых на бирже, поэтому
+    ищем среди строк со статусом "active" в самой таблице напрямую.
+
+    Возвращает True, если запись удалась (нашлась ровно одна подходящая
+    активная строка), False — если не нашлось ни одной / нашлось
+    несколько, или Google Sheets не подключены вовсе (тогда ничего не
+    трогаем — как и в sync_once, лучше не тронуть, чем один раз угадать
+    неправильно в финансовой таблице).
+    """
+    if not (os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")):
+        return False  # Google Sheets не подключены — тихо ничего не делаем
+
+    ws = _open_worksheet()
+    target_base = _base_asset(exchange, symbol)
+
+    rows = ws.get(f"B{_FIRST_DATA_ROW}:O")
+    matches = []
+    for offset, row in enumerate(rows):
+        row_number = _FIRST_DATA_ROW + offset
+        coin = row[_COL_COIN].strip() if len(row) > _COL_COIN and row[_COL_COIN] else ""
+        if not coin:
+            continue
+        status = row[_COL_STATUS].strip().lower() if len(row) > _COL_STATUS and row[_COL_STATUS] else ""
+        if status != "active":
+            continue
+        exchange_raw = row[_COL_EXCHANGE2].strip().lower() if len(row) > _COL_EXCHANGE2 and row[_COL_EXCHANGE2] else ""
+        if exchange_raw != exchange:
+            continue
+        if _extract_coin_base(coin) == target_base:
+            matches.append(row_number)
+
+    if len(matches) != 1:
+        reason = "нет подходящей активной строки" if not matches else f"неоднозначно — подошло несколько строк: {matches}"
+        print(f"[sheets_sync] Не удалось записать дату закрытия {exchange}/{symbol} в F: {reason}", flush=True)
+        return False
+
+    row_number = matches[0]
+    close_time_value = ws.acell(_CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE").value
+    if close_time_value is None:
+        print(f"[sheets_sync] Ячейка {_CLOSE_TIMESTAMP_CELL} пуста — нечего записать в F{row_number} для {exchange}/{symbol}.", flush=True)
+        return False
+
+    ws.batch_update([{"range": f"F{row_number}", "values": [[close_time_value]]}])
+    print(f"[sheets_sync] Записана дата закрытия в F{row_number} для {exchange}/{symbol}.", flush=True)
+    return True
 
 
 SHEET_SYNC_INTERVAL_MINUTES = float(os.environ.get("SHEET_SYNC_INTERVAL_MINUTES", "60"))
