@@ -301,7 +301,7 @@ def _fetch_lighter_predicted_rate(symbol: str) -> tuple[float, int | None, float
         if item.get("exchange") == "lighter" and (
             item.get("market_id") == market_id or item.get("symbol") == symbol
         ):
-            return float(item["rate"]), None, LIGHTER_FUNDING_INTERVAL_HOURS
+            return float(item["rate"]) / 8.0, None, LIGHTER_FUNDING_INTERVAL_HOURS
     raise RuntimeError(f"Lighter: ставка по {symbol} не найдена в ответе funding-rates")
 
 
