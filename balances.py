@@ -255,7 +255,7 @@ def _bybit_signed_post(path: str, body: dict, api_key: str, api_secret: str) -> 
     return data
 
 
-def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> float:
+def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> tuple[float, list]:
     """
     GET /v5/earn/position, отдельно category=FlexibleSaving и category=OnChain
     (стейкинг) — category обязателен, одним запросом оба сразу не получить.
@@ -264,13 +264,19 @@ def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> float:
     зачисленные проценты (claimableYield и т.п.) сознательно не считаем —
     это не деньги "на счету", а то, что можно ЗАБРАТЬ, разумно исключить,
     чтобы не завышать баланс тем, чего ещё физически нет.
+
+    Возвращает (сумма, [текст ошибки по каждой упавшей категории]) — раньше
+    ошибка только печаталась в лог Railway и была не видна ни на /balances,
+    ни в Telegram, из-за чего расследовать "почему 0" можно было только по
+    логам. Теперь текст ошибки идёт вместе с числом дальше в отчёт.
     """
     coins: dict = {}
+    errors = []
     for category in ("FlexibleSaving", "OnChain"):
         try:
             data = _bybit_signed_get("/v5/earn/position", [("category", category)], api_key, api_secret)
         except Exception as e:
-            print(f"[balances/bybit/earn] Категория {category}: {e}")
+            errors.append(f"{category}: {e}")
             continue
         for pos in data.get("result", {}).get("list", []):
             coin = pos.get("coin")
@@ -280,10 +286,10 @@ def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> float:
                 continue
             if coin and amount > 0:
                 coins[coin] = coins.get(coin, 0.0) + amount
-    return price_spot_balances_usd(coins)
+    return price_spot_balances_usd(coins), errors
 
 
-def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
+def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, str | None]:
     """
     Средства в запущенном Spot Grid Bot — ОТДЕЛЬНЫЙ от Unified/Funding пул:
     при создании бота Bybit сам переводит нужную сумму ИЗ Funding-кошелька
@@ -300,8 +306,14 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
     от спот-бота; 2) для каждого найденного бота — POST
     /v5/grid/query-grid-detail с его gridId; 3) сумма инвестиций ищется
     перебором нескольких вероятных имён поля (тот же приём, что и для
-    Lighter в fetch_lighter_balance) — если реальный ответ окажется другим,
-    просто вернётся 0 для этого бота, а не исключение.
+    Lighter в fetch_lighter_balance).
+
+    Возвращает (сумма, текст ошибки или None) — см. докстринг
+    fetch_bybit_earn_balance про то, зачем текст ошибки идёт наружу, а не
+    только в лог. Если запущенных ботов 0 (а не ошибка) — это НЕ ошибка,
+    сумма просто 0 и errors=None; если бот найден, но ни одно из вероятных
+    имён поля инвестиций не совпало — это тоже не считается ошибкой (сумма
+    для этого бота 0), потому что сама структура нам заранее неизвестна.
     """
     try:
         summary = _bybit_signed_post(
@@ -310,11 +322,12 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
             api_key, api_secret,
         )
     except Exception as e:
-        print(f"[balances/bybit/grid] Список ботов: {e}")
-        return 0.0
+        return 0.0, f"список ботов: {e}"
 
+    bots = summary.get("result", {}).get("bots", [])
     total_usd = 0.0
-    for bot in summary.get("result", {}).get("bots", []):
+    detail_errors = []
+    for bot in bots:
         grid = bot.get("grid", {}) or {}
         grid_id = grid.get("grid_id") or grid.get("gridId")
         if not grid_id:
@@ -324,7 +337,7 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
                 "/v5/grid/query-grid-detail", {"gridId": grid_id}, api_key, api_secret,
             )
         except Exception as e:
-            print(f"[balances/bybit/grid] Детали бота {grid_id}: {e}")
+            detail_errors.append(f"{grid_id}: {e}")
             continue
 
         result = detail.get("result", {}) or {}
@@ -336,10 +349,12 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
                     break
                 except (TypeError, ValueError):
                     continue
-    return total_usd
+
+    error = f"боты найдены ({len(bots)}), но детали не получены: {'; '.join(detail_errors)}" if detail_errors else None
+    return total_usd, error
 
 
-def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> float:
+def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[float, str | None]:
     """
     Крипто-займы (залоговое кредитование) — чистая стоимость (залог минус
     долг), GET /v5/crypto-loan-common/position (текущий "общий" эндпоинт,
@@ -350,12 +365,13 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> float:
     имена полей перебираются по нескольким вероятным вариантам. Залог и долг
     в ответе — предположительно по каждой монете отдельно (не сразу в USD),
     оцениваются через price_spot_balances_usd.
+
+    Возвращает (сумма, текст ошибки или None).
     """
     try:
         data = _bybit_signed_get("/v5/crypto-loan-common/position", [], api_key, api_secret)
     except Exception as e:
-        print(f"[balances/bybit/crypto-loan] {e}")
-        return 0.0
+        return 0.0, str(e)
 
     result = data.get("result", {}) or {}
     positions = result.get("list") if isinstance(result.get("list"), list) else [result]
@@ -388,10 +404,11 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> float:
                         break
                 break
 
-    return price_spot_balances_usd(collateral_coins) - price_spot_balances_usd(debt_coins)
+    net = price_spot_balances_usd(collateral_coins) - price_spot_balances_usd(debt_coins)
+    return net, None
 
 
-def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
+def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     """
     Unified Trading Account (totalEquity, /v5/account/wallet-balance) +
     Funding-кошелёк + Earn (Flexible Savings/стейкинг) + Spot Grid Bot +
@@ -401,15 +418,24 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
     Unified/Funding проверены на практике, Earn документирован уверенно,
     Grid Bot и крипто-займы — экспериментально).
 
-    Ошибка в любой ОТДЕЛЬНОЙ части (кроме Unified — без него нет смысла
-    продолжать) не должна занижать баланс молча до нуля и не должна ронять
-    весь Bybit — считаем что смогли, про остальное печатаем в лог.
+    Возвращает {"total": float, "parts": {"unified":, "funding":, "earn":,
+    "grid_bot":, "crypto_loan":: {"value": float, "error": str|None}}} —
+    раньше это была просто float, и ошибка любой отдельной части была видна
+    только в логах Railway (fetch_all_balances/build_balances_report/
+    /api/balances показывали только итоговую сумму). Разбивка по частям
+    нужна именно для того, чтобы разобраться, ПОЧЕМУ конкретная часть дала 0
+    — не хватает прав у API-ключа (Bybit выдаёт права на Earn/Bot/Loan
+    отдельными переключателями от прав на Wallet/Trade, которых достаточно
+    для остального бота), реальный ответ API отличается от того, что здесь
+    предполагалось, или там действительно пусто — не отличить одно от
+    другого без текста ошибки под рукой.
     """
     unified = _bybit_signed_get(
         "/v5/account/wallet-balance", [("accountType", "UNIFIED")], api_key, api_secret,
     )
     lst = unified.get("result", {}).get("list", [])
-    total = float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
+    unified_usd = float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
+    parts = {"unified": {"value": unified_usd, "error": None}}
 
     try:
         funding = _bybit_signed_get(
@@ -420,26 +446,34 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
             for c in funding.get("result", {}).get("balance", [])
             if float(c.get("walletBalance", 0) or 0) > 0
         }
-        total += price_spot_balances_usd(funding_coins)
+        parts["funding"] = {"value": price_spot_balances_usd(funding_coins), "error": None}
     except Exception as e:
-        print(f"[balances/bybit/funding] {e}")
+        parts["funding"] = {"value": 0.0, "error": str(e)}
 
     try:
-        total += fetch_bybit_earn_balance(api_key, api_secret)
+        earn_usd, earn_errors = fetch_bybit_earn_balance(api_key, api_secret)
+        parts["earn"] = {"value": earn_usd, "error": "; ".join(earn_errors) if earn_errors else None}
     except Exception as e:
-        print(f"[balances/bybit/earn] {e}")
+        parts["earn"] = {"value": 0.0, "error": str(e)}
 
     try:
-        total += fetch_bybit_grid_bot_balance(api_key, api_secret)
+        grid_usd, grid_error = fetch_bybit_grid_bot_balance(api_key, api_secret)
+        parts["grid_bot"] = {"value": grid_usd, "error": grid_error}
     except Exception as e:
-        print(f"[balances/bybit/grid] {e}")
+        parts["grid_bot"] = {"value": 0.0, "error": str(e)}
 
     try:
-        total += fetch_bybit_crypto_loan_balance(api_key, api_secret)
+        loan_usd, loan_error = fetch_bybit_crypto_loan_balance(api_key, api_secret)
+        parts["crypto_loan"] = {"value": loan_usd, "error": loan_error}
     except Exception as e:
-        print(f"[balances/bybit/crypto-loan] {e}")
+        parts["crypto_loan"] = {"value": 0.0, "error": str(e)}
 
-    return total
+    for name, p in parts.items():
+        if p["error"]:
+            print(f"[balances/bybit/{name}] {p['error']}")
+
+    total = sum(p["value"] for p in parts.values())
+    return {"total": total, "parts": parts}
 
 
 def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
@@ -747,7 +781,17 @@ def fetch_all_balances(secrets: dict) -> dict:
     _try("aster", lambda: fetch_aster_balance(secrets["user"], secrets["signer"], secrets["signer_private_key"]))
 
     if "bybit_api_key" in secrets:
-        _try("bybit", lambda: fetch_bybit_balance(secrets["bybit_api_key"], secrets["bybit_api_secret"]))
+        # Bybit — особый случай: fetch_bybit_balance отдаёт не число, а разбивку
+        # по пяти частям (unified/funding/earn/grid_bot/crypto_loan) — чтобы
+        # ошибка КОНКРЕТНОЙ части была видна в /balances и в Telegram, а не
+        # только в логах Railway (см. докстринг fetch_bybit_balance).
+        try:
+            bybit = fetch_bybit_balance(secrets["bybit_api_key"], secrets["bybit_api_secret"])
+            exchanges["bybit"] = {"value": bybit["total"], "error": None, "parts": bybit["parts"]}
+            total += bybit["total"]
+        except Exception as e:
+            print(f"[balances/bybit] Ошибка: {e}")
+            exchanges["bybit"] = {"value": None, "error": str(e)}
 
     if "lighter_account_index" in secrets:
         _try("lighter", lambda: fetch_lighter_balance(secrets["lighter_account_index"]))
@@ -789,6 +833,10 @@ EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate",
 }
+_BYBIT_PART_LABELS = {
+    "unified": "Unified", "funding": "Funding", "earn": "Earn",
+    "grid_bot": "Spot Grid Bot", "crypto_loan": "Крипто-займы (net)",
+}
 _AAVE_CHAIN_NAMES = {1: "Ethereum", 42161: "Arbitrum One", 8453: "Base"}
 
 
@@ -804,6 +852,14 @@ def build_balances_report(result: dict) -> str:
             lines.append(f"{label}: ❌ {v['error']}")
         else:
             lines.append(f"{label}: ${v['value']:,.2f}")
+
+        if key == "bybit" and v.get("parts"):
+            for part_name, p in v["parts"].items():
+                part_label = _BYBIT_PART_LABELS.get(part_name, part_name)
+                if p["error"]:
+                    lines.append(f"  · {part_label}: ${p['value']:,.2f} ⚠️ {p['error']}")
+                else:
+                    lines.append(f"  · {part_label}: ${p['value']:,.2f}")
 
     aave = result.get("aave")
     if aave is None:
