@@ -627,7 +627,8 @@ function renderExchanges(exchanges) {
     if (v.error) {
       html += `<tr><td>${label}</td><td class="err">Ошибка: ${v.error}</td></tr>`;
     } else {
-      html += `<tr><td>${label}</td><td>${fmt(v.value)}</td></tr>`;
+      const noteSpan = v.note ? `<span class="muted" title="${v.note}"> ℹ️ ${v.note}</span>` : '';
+      html += `<tr><td>${label}</td><td>${fmt(v.value)}${noteSpan}</td></tr>`;
     }
     // Bybit — разбивка по частям (Unified/Funding/Earn/займы), с текстом
     // ошибки прямо тут, а не только в логах Railway — см. докстринг

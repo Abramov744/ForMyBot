@@ -193,17 +193,25 @@ def _coingecko_symbol_to_id(symbol: str) -> str | None:
     return None
 
 
-def price_spot_balances_usd(balances: dict) -> float:
+def price_spot_balances_usd(balances: dict) -> tuple[float, list]:
     """
-    {ASSET: amount} → суммарная оценка в USD. Стейблкоины — по номиналу без
-    обращения к CoinGecko (см. STABLECOIN_SYMBOLS), остальное — батч-запросом
-    через _coingecko_symbol_to_id/_coingecko_simple_prices. Монета, для
-    которой цена не нашлась вообще нигде — просто не попадает в сумму (не
-    оценивается наугад), но с полным списком тикеров CoinGecko такое должно
-    быть редкостью — используется MEXC/Gate-спотом (fetch_all_balances) и
-    Bybit Funding-кошельком.
+    {ASSET: amount} → (суммарная оценка в USD, список НЕ оценённых монет).
+    Стейблкоины — по номиналу без обращения к CoinGecko (см.
+    STABLECOIN_SYMBOLS), остальное — батч-запросом через
+    _coingecko_symbol_to_id/_coingecko_simple_prices.
+
+    Монета, для которой цена не нашлась вообще нигде (ни в CoinGecko-id по
+    тикеру, ни цена по найденному id), НЕ оценивается наугад — просто не
+    попадает в сумму, но теперь ЯВНО возвращается вторым элементом, а не
+    тихо пропадает: на реальном аккаунте оказалось, что так теряется
+    заметная часть баланса (см. историю с MEXC — там ушло ~40% суммы
+    именно так, а не из-за бага в подсчёте), и раньше эту потерю нельзя
+    было увидеть нигде, кроме как вручную сверяя с биржей. Используется
+    MEXC/Gate-спотом (fetch_all_balances) и Bybit Funding/Earn/крипто-
+    займами.
     """
     total = 0.0
+    unpriced = []
     ids_by_symbol = {}
     for sym, amt in balances.items():
         if sym.upper() in STABLECOIN_SYMBOLS:
@@ -212,6 +220,8 @@ def price_spot_balances_usd(balances: dict) -> float:
         cid = _coingecko_symbol_to_id(sym)
         if cid:
             ids_by_symbol[sym] = cid
+        else:
+            unpriced.append(f"{sym} {amt:g}")
 
     if ids_by_symbol:
         prices = _coingecko_simple_prices(set(ids_by_symbol.values()))
@@ -219,8 +229,10 @@ def price_spot_balances_usd(balances: dict) -> float:
             price = prices.get(cid)
             if price is not None:
                 total += balances[sym] * price
+            else:
+                unpriced.append(f"{sym} {balances[sym]:g}")
 
-    return total
+    return total, unpriced
 
 
 # ── Биржи ──────────────────────────────────────────────────────────────────────
@@ -305,7 +317,10 @@ def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> tuple[float, list
                 continue
             if coin and amount > 0:
                 coins[coin] = coins.get(coin, 0.0) + amount
-    return price_spot_balances_usd(coins), errors
+    usd, unpriced = price_spot_balances_usd(coins)
+    if unpriced:
+        errors.append(f"без оценки в USD: {', '.join(unpriced)}")
+    return usd, errors
 
 
 def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: dict) -> tuple[bool, bool]:
@@ -422,7 +437,8 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
             elif len(key_dumps) < 2:
                 key_dumps.append(f"flexible: {sorted(pos.keys())}")
 
-    net = -price_spot_balances_usd(debt_coins)  # только долг — залог тут не отдаётся вовсе
+    debt_usd, debt_unpriced = price_spot_balances_usd(debt_coins)
+    net = -debt_usd  # только долг — залог тут не отдаётся вовсе
 
     notes = []
     if common_error:
@@ -435,6 +451,8 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
         notes.append(f"flexible: найдено позиций {positions_found}, долг распознан у {debt_matched_count} (залог не отдаётся этим эндпоинтом)")
     elif flexible is not None:
         notes.append("flexible: активных займов не найдено")
+    if debt_unpriced:
+        notes.append(f"без оценки в USD: {', '.join(debt_unpriced)}")
     if key_dumps:
         notes.append(" | ".join(key_dumps))
     return net, "; ".join(notes)
@@ -476,7 +494,9 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
             for c in funding.get("result", {}).get("balance", [])
             if float(c.get("walletBalance", 0) or 0) > 0
         }
-        parts["funding"] = {"value": price_spot_balances_usd(funding_coins), "error": None}
+        funding_usd, funding_unpriced = price_spot_balances_usd(funding_coins)
+        funding_error = f"без оценки в USD: {', '.join(funding_unpriced)}" if funding_unpriced else None
+        parts["funding"] = {"value": funding_usd, "error": funding_error}
     except Exception as e:
         parts["funding"] = {"value": 0.0, "error": str(e)}
 
@@ -804,8 +824,8 @@ def fetch_all_balances(secrets: dict) -> dict:
     остальным (тот же принцип, что и funding_report.fetch_all) — каждый
     источник в результате отдельно помечен либо значением, либо ошибкой.
 
-    Возвращает {"exchanges": {name: {"value": float|None, "error": str|None}},
-                 "aave": {...}|None, "total_usd": float}
+    Возвращает {"exchanges": {name: {"value": float|None, "error": str|None,
+                 "note": str|None}}, "aave": {...}|None, "total_usd": float}
     """
     exchanges: dict = {}
     total = 0.0
@@ -815,6 +835,27 @@ def fetch_all_balances(secrets: dict) -> dict:
         try:
             value = fn()
             exchanges[name] = {"value": value, "error": None}
+            total += value
+        except Exception as e:
+            print(f"[balances/{name}] Ошибка: {e}")
+            exchanges[name] = {"value": None, "error": str(e)}
+
+    def _try_spot_futures(name, futures_fn, spot_fn):
+        """
+        Для MEXC/Gate: futures + оценка спота в USD, С ЯВНОЙ заметкой, если
+        часть спот-баланса не удалось оценить в USD (см. price_spot_balances_usd).
+        На реальном аккаунте оказалось, что так пропадает заметная часть
+        баланса (~40% у MEXC) — раньше это было видно только по расхождению
+        с суммой в приложении биржи, без единой подсказки, где искать причину.
+        """
+        nonlocal total
+        try:
+            futures = futures_fn()
+            spot = spot_fn()
+            spot_usd, unpriced = price_spot_balances_usd(spot)
+            value = futures + spot_usd
+            note = f"без оценки в USD на споте: {', '.join(unpriced)}" if unpriced else None
+            exchanges[name] = {"value": value, "error": None, "note": note}
             total += value
         except Exception as e:
             print(f"[balances/{name}] Ошибка: {e}")
@@ -839,18 +880,18 @@ def fetch_all_balances(secrets: dict) -> dict:
         _try("lighter", lambda: fetch_lighter_balance(secrets["lighter_account_index"]))
 
     if "mexc_api_key" in secrets:
-        def _mexc_total():
-            futures = fetch_mexc_futures_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            spot = fetch_mexc_spot_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            return futures + price_spot_balances_usd(spot)
-        _try("mexc", _mexc_total)
+        _try_spot_futures(
+            "mexc",
+            lambda: fetch_mexc_futures_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
+            lambda: fetch_mexc_spot_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
+        )
 
     if "gate_api_key" in secrets:
-        def _gate_total():
-            futures = fetch_gate_futures_balance(secrets["gate_api_key"], secrets["gate_api_secret"])
-            spot = fetch_gate_spot_balance(secrets["gate_api_key"], secrets["gate_api_secret"])
-            return futures + price_spot_balances_usd(spot)
-        _try("gate", _gate_total)
+        _try_spot_futures(
+            "gate",
+            lambda: fetch_gate_futures_balance(secrets["gate_api_key"], secrets["gate_api_secret"]),
+            lambda: fetch_gate_spot_balance(secrets["gate_api_key"], secrets["gate_api_secret"]),
+        )
 
     wallet_secrets = load_wallet_secrets()
     aave_result = None
@@ -899,6 +940,11 @@ def build_balances_report(result: dict) -> str:
             lines.append(f"{label}: ❌ {v['error']}")
         else:
             lines.append(f"{label}: ${v['value']:,.2f}")
+        # note — не ошибка, а диагностика вроде "часть спот-баланса не
+        # удалось оценить в USD" (MEXC/Gate) — короткая, поэтому не
+        # прячем в веб-страницу, в отличие от разбивки Bybit по частям выше.
+        if v.get("note"):
+            lines.append(f"  ℹ️ {v['note']}")
 
     aave = result.get("aave")
     if aave is None:
