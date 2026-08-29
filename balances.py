@@ -17,8 +17,15 @@
     и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
   - Gate   — отдельно фьючерсный и спот-баланс, обе подписи запросов — тот же
     HMAC-SHA512-механизм, что уже используется в funding_report._gate_sign.
-  - Aster  — фьючерсный баланс (споta у Aster нет вовсе, см. README).
-  - Lighter — баланс на счету (споta нет, только перпетуалы).
+  - Aster  — баланс кошелька + нереализованный PnL открытых позиций
+    (positionRisk, поле unRealizedProfit — тот же эндпоинт и то же поле,
+    что использует Binance Futures API, форком которого является Aster;
+    без PnL баланс не совпадал с реальным при открытых позициях). Споta у
+    Aster нет вовсе, см. README.
+  - Lighter — collateral (обеспечение) + сумма unrealized_pnl по всем
+    открытым позициям — по документации Lighter Total Account Value =
+    Collateral + Unrealized PnL, а готового поля с суммой в API нет, считаем
+    сами (см. fetch_lighter_balance).
   - Aave v3 — ON-CHAIN, чистая стоимость позиции (обеспечение минус долг)
     через view-функцию Pool.getUserAccountData(address).
 
@@ -351,12 +358,7 @@ def fetch_gate_spot_balance(api_key: str, api_secret: str) -> dict:
     return out
 
 
-def fetch_aster_balance(user: str, signer: str, private_key: str) -> float:
-    """GET /fapi/v3/balance — тот же стиль запроса (nonce+подпись через
-    funding_report._aster_sign), что и остальные Aster-эндпоинты; версия
-    пути (v3) взята той же, что уже подтверждена рабочей для /fapi/v3/income
-    и /fapi/v3/positionRisk у этой биржи (форк API Binance Futures). Спота у
-    Aster нет вовсе (см. README) — это весь баланс аккаунта."""
+def _aster_signed_get(path: str, user: str, signer: str, private_key: str) -> list:
     nonce = int(time.time() * 1_000_000)
     params = {
         "timestamp": str(int(time.time() * 1000)),
@@ -366,30 +368,63 @@ def fetch_aster_balance(user: str, signer: str, private_key: str) -> float:
     }
     param_str = urllib.parse.urlencode(params)
     sig = _aster_sign(param_str, private_key)
-    url = f"https://fapi.asterdex.com/fapi/v3/balance?{param_str}&signature={sig}"
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(f"https://fapi.asterdex.com{path}?{param_str}&signature={sig}", timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, dict):
-        raise RuntimeError(f"Aster balance error: {data}")
-    return sum(float(a.get("balance", 0) or 0) for a in data if a.get("asset") == "USDT")
+        raise RuntimeError(f"Aster {path} error: {data}")
+    return data
+
+
+def fetch_aster_balance(user: str, signer: str, private_key: str) -> float:
+    """
+    GET /fapi/v3/balance (кошелёк) + GET /fapi/v3/positionRisk (нереализованный
+    PnL открытых позиций, поле unRealizedProfit) — тот же стиль запроса
+    (nonce+подпись через funding_report._aster_sign) и та же версия пути
+    (v3), что уже подтверждена рабочей для /fapi/v3/income в funding_report.py
+    (форк API Binance Futures).
+
+    Без PnL баланс не совпадал с реальным при открытых позициях — "balance"
+    в /fapi/v3/balance это кошелёк БЕЗ учёта текущего нереализованного
+    результата по открытым позициям (см. также аналогичный фикс для Lighter
+    в fetch_lighter_balance). Поле unRealizedProfit — то же самое, что
+    использует официальный Binance Futures API (developers.binance.com,
+    Position Information V2/V3) — отдельно на реальном ответе именно Aster
+    не сверено, но positionAmt/symbol из этого же эндпоинта уже используются
+    в funding_report.fetch_aster_open_symbols и совпадают с Binance 1:1.
+    Спота у Aster нет вовсе (см. README).
+    """
+    wallet = _aster_signed_get("/fapi/v3/balance", user, signer, private_key)
+    wallet_usd = sum(float(a.get("balance", 0) or 0) for a in wallet if a.get("asset") == "USDT")
+
+    positions = _aster_signed_get("/fapi/v3/positionRisk", user, signer, private_key)
+    unrealized_pnl = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
+
+    return wallet_usd + unrealized_pnl
 
 
 def fetch_lighter_balance(account_index: str) -> float:
     """
-    GET /api/v1/account?by=index&value={account_index} — тот же эндпоинт,
-    что и funding_report.fetch_lighter_open_symbols использует для списка
-    позиций; здесь читаем из ТОГО ЖЕ ответа общую стоимость счёта.
+    GET /api/v1/account?by=index&value={account_index}&active_only=true —
+    тот же эндпоинт, что и funding_report.fetch_lighter_open_symbols
+    использует для списка позиций.
 
-    НЕ ПРОВЕРЕНО на реальном аккаунте: имя поля с итоговой стоимостью счёта
-    в документации Lighter не описано полностью (см. тот же комментарий в
-    funding_report.py), поэтому перебираются несколько вероятных вариантов
-    ключа — сверьте результат с приложением Lighter, прежде чем полагаться
-    на число.
+    ПОДТВЕРЖДЕНО по официальной документации полей SDK (elliottech/lighter-
+    python, docs/Account.md и docs/AccountPosition.md, дословный список
+    полей на 29.08.2026): на уровне аккаунта есть только collateral —
+    обеспечение БЕЗ учёта результата по открытым позициям, готового поля
+    "итог с учётом PnL" в API нет. При этом по документации Lighter (Total
+    Account Value = Collateral + Unrealized PnL) полный баланс — это
+    collateral ПЛЮС unrealized_pnl каждой открытой позиции (поле
+    AccountPosition.unrealized_pnl) — раньше считался только collateral,
+    поэтому PnL открытых позиций не попадал в баланс. Реальный ответ Lighter
+    напрямую не проверялся (доступа к его API из этой среды разработки не
+    было) — имена полей взяты из офиц. SDK, но однократно сверить с
+    приложением Lighter после деплоя всё равно стоит.
     """
     resp = requests.get(
         f"{LIGHTER_BASE_URL}/api/v1/account",
-        params={"by": "index", "value": account_index}, timeout=30,
+        params={"by": "index", "value": account_index, "active_only": "true"}, timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -397,14 +432,18 @@ def fetch_lighter_balance(account_index: str) -> float:
         raise RuntimeError(f"Lighter account error: {data}")
 
     accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    total = 0.0
     for acc in accounts:
-        for key in ("collateral", "portfolio_value", "account_value", "total_asset_value", "available_balance"):
-            if acc.get(key) is not None:
-                try:
-                    return float(acc[key])
-                except (TypeError, ValueError):
-                    continue
-    return 0.0
+        try:
+            total += float(acc.get("collateral", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        for pos in acc.get("positions", []):
+            try:
+                total += float(pos.get("unrealized_pnl", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
 
 
 # ── Aave v3 (on-chain, Pool.getUserAccountData) ────────────────────────────────
