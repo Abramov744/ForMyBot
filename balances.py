@@ -22,6 +22,12 @@
     позиций, поле unrealised_pnl — тот же случай, что и у Aster/Lighter
     ниже) и спот-баланс, обе подписи запросов — тот же HMAC-SHA512-
     механизм, что уже используется в funding_report._gate_sign.
+  - KuCoin — отдельно фьючерсный (GET /api/v1/account-overview по каждой
+    валюте маржи — USDT/USDC/XBT, единого "всё сразу" эндпоинта нет) и
+    спот-баланс (GET /api/v1/accounts без фильтра — сразу все счета:
+    main/trade/margin). В отличие от Aster/Bybit/Lighter/MEXC/Gate НЕ часть
+    funding-стратегии — используется только здесь, для сводного баланса
+    (см. fetch_kucoin_*_balance).
   - Aster  — баланс кошелька + нереализованный PnL открытых позиций
     (positionRisk, поле unRealizedProfit — тот же эндпоинт и то же поле,
     что использует Binance Futures API, форком которого является Aster;
@@ -74,6 +80,7 @@ Etherscan), Fluid, Spot Grid Bot на Bybit и MEXC Loans сознательно
 наугад (см. price_spot_balances_usd).
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -738,6 +745,184 @@ def fetch_gate_spot_balance(api_key: str, api_secret: str) -> dict:
     return out
 
 
+def _get_kucoin_proxies() -> dict | None:
+    """Прокси для запросов к KuCoin — тот же паттерн, что и у остальных бирж
+    (funding_report._get_mexc_proxies/_get_gate_proxies): сначала KUCOIN_PROXY,
+    иначе общие HTTPS_PROXY/HTTP_PROXY."""
+    proxy = (
+        os.environ.get("KUCOIN_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
+def _kucoin_signed_get(base_url: str, path: str, api_key: str, api_secret: str,
+                        api_passphrase: str, params: dict | None = None) -> dict:
+    """
+    Подпись приватных GET-запросов KuCoin — общая что для спота
+    (api.kucoin.com), что для фьючерсов (api-futures.kucoin.com), формула
+    одна и та же, разные только базовый URL и порт. ПОДТВЕРЖДЕНО по офиц.
+    SDK `ccxt` (`ccxt/kucoin.py`, метод `sign()`) и по официальному
+    "KuCoin API Key Upgrade Guideline" — версия ключа KC-API-KEY-VERSION=2
+    (текущая рекомендуемая KuCoin версия для всех ключей, созданных после
+    обновления):
+
+      endpoint  = path + ("?" + urlencode(params), если params не пусты)
+      timestamp = миллисекунды, строкой
+      payload   = timestamp + "GET" + endpoint  (тело у GET-запроса пустое)
+      KC-API-SIGN       = base64(HMAC-SHA256(secret, payload))
+      KC-API-PASSPHRASE = base64(HMAC-SHA256(secret, passphrase)) — в
+                          версии 2 пассфраза тоже подписывается тем же
+                          ключом, а не передаётся в заголовке как есть
+                          (это единственное отличие от более старых,
+                          созданных до версии 2, ключей — с ними этот
+                          заголовок будет неверным).
+
+    НЕ ПРОВЕРЕНО на реальном аккаунте (в отличие от схем подписи остальных
+    бирж в этом файле, переиспользующих уже боевые формулы из
+    funding_report.py) — перед тем как полагаться на число, сверьте с
+    балансом в приложении KuCoin хотя бы раз.
+    """
+    api_key, api_secret, api_passphrase = api_key.strip(), api_secret.strip(), api_passphrase.strip()
+    endpoint = path
+    if params:
+        endpoint += "?" + urllib.parse.urlencode(params)
+
+    timestamp = str(int(time.time() * 1000))
+    payload = timestamp + "GET" + endpoint
+    sig = base64.b64encode(hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).digest()).decode()
+    passphrase_sig = base64.b64encode(
+        hmac.new(api_secret.encode(), api_passphrase.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    headers = {
+        "KC-API-KEY": api_key,
+        "KC-API-SIGN": sig,
+        "KC-API-TIMESTAMP": timestamp,
+        "KC-API-PASSPHRASE": passphrase_sig,
+        "KC-API-KEY-VERSION": "2",
+    }
+    resp = requests.get(f"{base_url}{endpoint}", headers=headers, timeout=30, proxies=_get_kucoin_proxies())
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"KuCoin {path} error {data.get('code')}: {data.get('msg')}")
+    return data
+
+
+def fetch_kucoin_ticker_prices() -> dict:
+    """GET /api/v1/market/allTickers — публичный (без ключа) эндпоинт KuCoin,
+    аналог fetch_mexc_ticker_prices/fetch_gate_ticker_prices выше (см. их
+    докстринги про то, зачем нужна цена именно с самой биржи, а не только
+    через CoinGecko). У KuCoin символы через дефис ({BASE}-USDT), не слитно
+    (MEXC) и не через подчёркивание (Gate)."""
+    cache_key = "kucoin"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for t in ((data.get("data") or {}).get("ticker") or []):
+        symbol = str(t.get("symbol", ""))
+        if symbol.endswith("-USDT"):
+            try:
+                prices[symbol[:-5]] = float(t["last"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def fetch_kucoin_spot_balance(api_key: str, api_secret: str, api_passphrase: str) -> dict:
+    """
+    GET /api/v1/accounts без параметров — ПОДТВЕРЖДЕНО (офиц. документация
+    KuCoin, раздел Get Accounts), что без фильтра отдаются СРАЗУ ВСЕ счета:
+    main (в терминологии KuCoin это "Funding Account" — тот же случай, что
+    Funding-кошелёк у Bybit, деньги туда оседают по умолчанию и не видны в
+    trade-аккаунте, пока не перевести явно), trade (собственно спот),
+    margin и т.п. Каждая запись — отдельная пара (currency, type), записи
+    не пересекаются, поэтому суммировать поле balance по всем записям без
+    разбора на type безопасно и не задваивает.
+
+    Возвращает {CURRENCY: сумма balance по всем типам счёта}.
+    """
+    data = _kucoin_signed_get("https://api.kucoin.com", "/api/v1/accounts", api_key, api_secret, api_passphrase)
+    out: dict = {}
+    for a in (data.get("data") or []):
+        try:
+            amount = float(a.get("balance", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            currency = a.get("currency")
+            if currency:
+                out[currency] = out.get(currency, 0.0) + amount
+    return out
+
+
+def fetch_kucoin_futures_balance(api_key: str, api_secret: str, api_passphrase: str) -> float:
+    """
+    GET /api/v1/account-overview?currency={CUR} — в отличие от Bybit UNIFIED
+    (один запрос сразу на всё), у KuCoin фьючерсный счёт считается ОТДЕЛЬНО
+    по каждой валюте маржи, единого "дай всё сразу" эндпоинта нет. Опрашивает
+    по очереди USDT, USDC (обе маржа 1:1 к доллару) и XBT (так у KuCoin
+    называется BTC для монеты-маржи — конвертируется в USD через
+    price_spot_balances_usd).
+
+    ПОДТВЕРЖДЕНО (офиц. Go SDK `Kucoin/kucoin-futures-go-sdk`, докстринг
+    поля AccountEquity, и формула из офиц. документации/Futures Glossary:
+    accountEquity = unrealisedPNL + marginBalance): поле accountEquity УЖЕ
+    включает нереализованный PnL открытых позиций — в отличие от Aster/
+    Gate/Lighter выше, где базовое поле баланса кошелька результат по
+    открытым позициям НЕ включает и его нужно прибавлять отдельно. Здесь
+    прибавлять отдельно НЕ нужно — задвоило бы PnL.
+
+    Валюта, в которой у пользователя вообще не открыт фьючерсный счёт
+    (не создавался — не то же самое, что "баланс 0"), у KuCoin отдаёт
+    ошибку — это нормальный случай (не все маржи используются сразу),
+    поэтому такая валюта просто пропускается (с логом в Railway), а не
+    роняет всю функцию.
+    """
+    total = 0.0
+    for currency in ("USDT", "USDC", "XBT"):
+        try:
+            data = _kucoin_signed_get(
+                "https://api-futures.kucoin.com", "/api/v1/account-overview",
+                api_key, api_secret, api_passphrase, {"currency": currency},
+            )
+        except Exception as e:
+            print(f"[balances/kucoin/futures/{currency}] {e}")
+            continue
+        equity = float((data.get("data") or {}).get("accountEquity", 0) or 0)
+        if not equity:
+            continue
+        if currency == "XBT":
+            usd, unpriced = price_spot_balances_usd({"BTC": equity})
+            if unpriced:
+                print(f"[balances/kucoin/futures/XBT] без оценки в USD: {', '.join(unpriced)}")
+            total += usd
+        else:
+            total += equity  # USDT/USDC — маржа 1:1 к доллару, CoinGecko не нужен
+    return total
+
+
 def _aster_signed_get(path: str, user: str, signer: str, private_key: str) -> list:
     nonce = int(time.time() * 1_000_000)
     params = {
@@ -1010,6 +1195,19 @@ def fetch_all_balances(secrets: dict) -> dict:
             fetch_gate_ticker_prices,
         )
 
+    if "kucoin_api_key" in secrets:
+        # KuCoin используется только для сводного баланса (в отличие от
+        # Aster/Bybit/Lighter/MEXC/Gate он не часть funding-стратегии и не
+        # опрашивается funding_report.py/calculator.py/funding_alerts.py) —
+        # секреты для него всё равно приходят из общего load_secrets(), как
+        # и у остальных бирж.
+        _try_spot_futures(
+            "kucoin",
+            lambda: fetch_kucoin_futures_balance(secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"]),
+            lambda: fetch_kucoin_spot_balance(secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"]),
+            fetch_kucoin_ticker_prices,
+        )
+
     wallet_secrets = load_wallet_secrets()
     aave_result = None
     if wallet_secrets:
@@ -1031,7 +1229,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",
