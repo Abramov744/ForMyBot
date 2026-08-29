@@ -337,12 +337,20 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
                      # чтобы в следующий раз не гадать имя поля, а взять точное
     for bot in bots:
         grid = bot.get("grid", {}) or {}
-        grid_id = grid.get("grid_id") or grid.get("gridId")
+        # На верхнем уровне grid у реального ответа только info/profit (не
+        # grid_id/symbol, как предполагалось раньше) — сам id вероятнее
+        # всего внутри info, пробуем там несколько вероятных имён.
+        info = grid.get("info", {}) or {}
+        grid_id = (
+            grid.get("grid_id") or grid.get("gridId")
+            or info.get("grid_id") or info.get("gridId")
+            or info.get("id") or info.get("strategy_id") or info.get("strategyId")
+        )
         if not grid_id:
             unmatched_ids.append("без grid_id в ответе списка")
             if len(key_dumps) < 2:
-                inner_keys = f", ключи grid: {sorted(grid.keys())}" if grid else " (ключа grid нет вовсе)"
-                key_dumps.append(f"ключи бота: {sorted(bot.keys())}{inner_keys}")
+                info_keys = f", ключи grid.info: {sorted(info.keys())}" if info else " (ключа grid.info тоже нет)"
+                key_dumps.append(f"ключи бота: {sorted(bot.keys())}, ключи grid: {sorted(grid.keys())}{info_keys}")
             continue
         try:
             detail = _bybit_signed_post(
@@ -421,73 +429,96 @@ def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: 
 def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[float, str]:
     """
     Крипто-займы (залоговое кредитование) — чистая стоимость (залог минус
-    долг). У Bybit это ТРИ разных продукта с разными эндпоинтами (общий,
-    гибкий, фиксированный срок) — опрашиваются все три, у "общего" (common)
-    без параметров, у гибкого (flexible) — список активных займов по
-    монетам, у займа с фиксированным сроком (fixed) он один на orderId,
-    поэтому без списка активных orderId'ов его отдельно не опросить —
-    сознательно пропущен, если есть именно такой займ, чистая позиция будет
-    занижена (см. заметку в отчёте, если сумма расходится с реальной).
+    долг).
 
-    ЭКСПЕРИМЕНТАЛЬНО, как и fetch_bybit_grid_bot_balance выше: официальная
-    документация не даёт примера JSON-ответа с полями залога/долга, поэтому
-    имена полей перебираются по нескольким вероятным вариантам. Залог и долг
-    в ответе — предположительно по каждой монете отдельно (не сразу в USD),
-    оцениваются через price_spot_balances_usd.
+    ПОДТВЕРЖДЕНО реальным ответом API (не угадано с нуля — предыдущая
+    версия перебирала имена полей вслепую и не находила совпадений):
+    GET /v5/crypto-loan-common/position отдаёт ОДИН агрегированный объект на
+    верхнем уровне result — totalCollateral/totalDebt/totalSupply/ltv, БЕЗ
+    списка по монетам. Соседство с ltv (LTV не посчитать без общего
+    знаменателя для разных монет) означает, что totalCollateral/totalDebt
+    уже в единой валюте (доллары) — та же идея, что и у Aave
+    getUserAccountData (totalCollateralBase/totalDebtBase), отдельно в USD
+    переводить не нужно.
 
-    Возвращает (сумма, диагностическая заметка) — см. докстринг
-    fetch_bybit_grid_bot_balance про то, почему заметка нужна даже когда
-    ошибки формально нет.
+    GET /v5/crypto-loan-flexible/ongoing-coin при этом отдаёт ТУ ЖЕ
+    задолженность в разрезе по монетам (loanCurrency+totalDebt на позицию,
+    без залога вообще) — это другой ВИД того же самого долга с общего
+    эндпоинта common, а не дополнительный долг сверх него, поэтому
+    складывать оба нельзя — задвоило бы сумму долга. Используется ТОЛЬКО
+    как fallback, если common пуст (например, займов через "старый",
+    не-unified интерфейс).
+
+    Займ с фиксированным сроком (`/v5/crypto-loan-fixed/borrow-order-info`)
+    по-прежнему не опрашивается — у него нет списка активных orderId для
+    перебора; если totalCollateral/totalDebt из common это не покрывают —
+    сумма может быть занижена.
+
+    Возвращает (сумма, диагностическая заметка).
     """
-    collateral_coins: dict = {}
+    try:
+        common = _bybit_signed_get("/v5/crypto-loan-common/position", [], api_key, api_secret)
+    except Exception as e:
+        common = None
+        common_error = str(e)
+    else:
+        common_error = None
+
+    if common is not None:
+        result = common.get("result", {}) or {}
+        try:
+            total_collateral = float(result.get("totalCollateral", 0) or 0)
+            total_debt = float(result.get("totalDebt", 0) or 0)
+        except (TypeError, ValueError):
+            total_collateral = total_debt = 0.0
+
+        if total_collateral or total_debt:
+            note = f"common: обеспечение ${total_collateral:,.2f}, долг ${total_debt:,.2f}"
+            return total_collateral - total_debt, note
+
+    # common пуст (нет открытого unified-займа) или недоступен — пробуем
+    # flexible как fallback (только долг, без залога, см. докстринг выше).
     debt_coins: dict = {}
     positions_found = 0
-    collateral_matched_count = 0
     debt_matched_count = 0
-    endpoint_errors = []
-    key_dumps = []  # реальные ключи позиции там, где залог или долг не распознались
+    key_dumps = []
+    try:
+        flexible = _bybit_signed_get("/v5/crypto-loan-flexible/ongoing-coin", [], api_key, api_secret)
+    except Exception as e:
+        flexible_error = str(e)
+        flexible = None
+    else:
+        flexible_error = None
 
-    def _pull(path: str, params_list: list):
-        nonlocal positions_found, collateral_matched_count, debt_matched_count
-        try:
-            data = _bybit_signed_get(path, params_list, api_key, api_secret)
-        except Exception as e:
-            endpoint_errors.append(f"{path}: {e}")
-            return
-        result = data.get("result", {}) or {}
+    if flexible is not None:
+        result = flexible.get("result", {}) or {}
         positions = result.get("list") if isinstance(result.get("list"), list) else ([result] if result else [])
         for pos in positions:
             if not isinstance(pos, dict) or not pos:
                 continue
             positions_found += 1
-            collateral_ok, debt_ok = _bybit_extract_loan_position(pos, collateral_coins, debt_coins)
-            if collateral_ok:
-                collateral_matched_count += 1
+            _, debt_ok = _bybit_extract_loan_position(pos, {}, debt_coins)
             if debt_ok:
                 debt_matched_count += 1
-            if (not collateral_ok or not debt_ok) and len(key_dumps) < 2:
-                key_dumps.append(f"{path}: {sorted(pos.keys())}")
+            elif len(key_dumps) < 2:
+                key_dumps.append(f"flexible: {sorted(pos.keys())}")
 
-    _pull("/v5/crypto-loan-common/position", [])
-    _pull("/v5/crypto-loan-flexible/ongoing-coin", [])
+    net = -price_spot_balances_usd(debt_coins)  # только долг — залог тут не отдаётся вовсе
 
-    net = price_spot_balances_usd(collateral_coins) - price_spot_balances_usd(debt_coins)
-
-    if not positions_found and not endpoint_errors:
-        note = "открытых займов не найдено (common + flexible; фиксированный срок — не опрашивается, см. докстринг)"
-    else:
-        notes = []
-        if positions_found:
-            notes.append(
-                f"найдено позиций: {positions_found}, залог распознан у {collateral_matched_count}, "
-                f"долг распознан у {debt_matched_count}"
-            )
-        if key_dumps:
-            notes.append(" | ".join(key_dumps))
-        if endpoint_errors:
-            notes.append("; ".join(endpoint_errors))
-        note = "; ".join(notes)
-    return net, note
+    notes = []
+    if common_error:
+        notes.append(f"common: {common_error}")
+    elif common is not None:
+        notes.append("common: открытого unified-займа нет")
+    if flexible_error:
+        notes.append(f"flexible: {flexible_error}")
+    elif positions_found:
+        notes.append(f"flexible: найдено позиций {positions_found}, долг распознан у {debt_matched_count} (залог не отдаётся этим эндпоинтом)")
+    elif flexible is not None:
+        notes.append("flexible: активных займов не найдено")
+    if key_dumps:
+        notes.append(" | ".join(key_dumps))
+    return net, "; ".join(notes)
 
 
 def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
