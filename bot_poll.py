@@ -24,9 +24,8 @@
   /rates                    — ПРОГНОЗНАЯ ставка funding по открытым сейчас
                              позициям на следующую выплату (см. funding_alerts.py
                              — та же логика, что и в фоновых алертах)
-  /balance                  — сводный баланс по всем биржам + Rabby wallet +
-                             Aave (см. balances.py); подробная разбивка по
-                             сетям/токенам — на веб-странице /balances
+  /balance                  — сводный баланс по всем биржам + Aave (см.
+                             balances.py); подробная разбивка — на веб-странице /balances
 """
 
 import calendar as calendar_mod
@@ -329,11 +328,7 @@ def send_predicted_rates_report(secrets: dict, chat_id: str) -> None:
 
 
 def send_balances_report(secrets: dict, chat_id: str) -> None:
-    """
-    Сводный баланс по всем биржам + Rabby wallet + Aave (balances.py) — может
-    занять до ~30 секунд из-за полного скана EVM-сетей кошелька, поэтому
-    сразу шлём "жду" сообщение (тот же приём, что и в /positions и /rates).
-    """
+    """Сводный баланс по всем биржам + Aave (balances.py)."""
     token = secrets["telegram_token"]
     try:
         send_telegram(token, chat_id, "⏳ Собираю балансы (биржи + скан сетей кошелька — может занять до ~30 секунд)…")
