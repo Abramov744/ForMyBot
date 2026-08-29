@@ -72,6 +72,19 @@ def load_secrets() -> dict:
         result["gate_api_key"]    = gate_api_key
         result["gate_api_secret"] = gate_api_secret
 
+    # KuCoin — опционально, только для сводного баланса (balances.py), не
+    # часть funding-стратегии и не используется в этом файле/calculator.py/
+    # funding_alerts.py. В отличие от остальных бирж KuCoin требует ТРИ
+    # значения ключа, не два — passphrase задаётся отдельно при создании
+    # ключа и обязателен для подписи запроса (см. balances._kucoin_signed_get).
+    kucoin_api_key        = os.environ.get("KUCOIN_API_KEY")
+    kucoin_api_secret     = os.environ.get("KUCOIN_API_SECRET")
+    kucoin_api_passphrase = os.environ.get("KUCOIN_API_PASSPHRASE")
+    if kucoin_api_key and kucoin_api_secret and kucoin_api_passphrase:
+        result["kucoin_api_key"]        = kucoin_api_key
+        result["kucoin_api_secret"]     = kucoin_api_secret
+        result["kucoin_api_passphrase"] = kucoin_api_passphrase
+
     # Uniswap (Arbitrum + Base) — опционально, только для поиска спот-цены
     # входа в entry_price.py (не биржа со своим API, а чтение истории
     # ERC-20-переводов кошелька через Etherscan). Один и тот же кошелёк
