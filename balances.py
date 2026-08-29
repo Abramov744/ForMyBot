@@ -333,11 +333,16 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
     matched_count = 0
     unmatched_ids = []
     detail_errors = []
+    key_dumps = []  # реальные ключи ответа там, где угаданное имя поля не совпало —
+                     # чтобы в следующий раз не гадать имя поля, а взять точное
     for bot in bots:
         grid = bot.get("grid", {}) or {}
         grid_id = grid.get("grid_id") or grid.get("gridId")
         if not grid_id:
             unmatched_ids.append("без grid_id в ответе списка")
+            if len(key_dumps) < 2:
+                inner_keys = f", ключи grid: {sorted(grid.keys())}" if grid else " (ключа grid нет вовсе)"
+                key_dumps.append(f"ключи бота: {sorted(bot.keys())}{inner_keys}")
             continue
         try:
             detail = _bybit_signed_post(
@@ -361,23 +366,30 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
                     continue
         if not matched:
             unmatched_ids.append(str(grid_id))
+            if len(key_dumps) < 2:
+                key_dumps.append(f"ключи query-grid-detail для {grid_id}: {sorted(d.keys())}")
 
     notes = [f"найдено ботов: {len(bots)}"]
     if matched_count:
         notes.append(f"сумма прочитана у {matched_count}")
     if unmatched_ids:
         notes.append(f"не удалось прочитать сумму у {len(unmatched_ids)} ({', '.join(unmatched_ids)}) — вероятно, неверное имя поля в query-grid-detail")
+    if key_dumps:
+        notes.append(" | ".join(key_dumps))
     if detail_errors:
         notes.append(f"ошибка деталей: {'; '.join(detail_errors)}")
     return total_usd, "; ".join(notes)
 
 
-def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: dict) -> bool:
+def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: dict) -> tuple[bool, bool]:
     """Разбирает одну позицию крипто-займа в collateral_coins/debt_coins
-    (мутирует их на месте). Возвращает True, если удалось распознать хотя бы
-    одно из двух (залог или долг) — используется вызывающим кодом только для
-    диагностики ("нашли позиции, но не смогли прочитать суммы")."""
-    matched = False
+    (мутирует их на месте). Возвращает (распознан_ли_залог, распознан_ли_долг)
+    ОТДЕЛЬНО — раньше это был один общий флаг "распознано хоть что-то",
+    из-за чего "распознан залог, но не распознан долг" (или наоборот)
+    выглядело как полный успех, хотя реальная сумма всё равно была неверной
+    (см. реальный ответ: "найдено позиций: 2, суммы прочитаны у 1" — какая
+    именно половина не прочиталась, было не видно)."""
+    collateral_matched = False
     for key in ("collateralCoin", "collateralCurrency"):
         coin = pos.get(key)
         if coin:
@@ -385,11 +397,12 @@ def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: 
                 if pos.get(amt_key) is not None:
                     try:
                         collateral_coins[coin] = collateral_coins.get(coin, 0.0) + float(pos[amt_key])
-                        matched = True
+                        collateral_matched = True
                     except (TypeError, ValueError):
                         pass
                     break
             break
+    debt_matched = False
     for key in ("loanCoin", "loanCurrency"):
         coin = pos.get(key)
         if coin:
@@ -397,12 +410,12 @@ def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: 
                 if pos.get(amt_key) is not None:
                     try:
                         debt_coins[coin] = debt_coins.get(coin, 0.0) + float(pos[amt_key])
-                        matched = True
+                        debt_matched = True
                     except (TypeError, ValueError):
                         pass
                     break
             break
-    return matched
+    return collateral_matched, debt_matched
 
 
 def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[float, str]:
@@ -429,11 +442,13 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
     collateral_coins: dict = {}
     debt_coins: dict = {}
     positions_found = 0
-    positions_matched = 0
+    collateral_matched_count = 0
+    debt_matched_count = 0
     endpoint_errors = []
+    key_dumps = []  # реальные ключи позиции там, где залог или долг не распознались
 
     def _pull(path: str, params_list: list):
-        nonlocal positions_found, positions_matched
+        nonlocal positions_found, collateral_matched_count, debt_matched_count
         try:
             data = _bybit_signed_get(path, params_list, api_key, api_secret)
         except Exception as e:
@@ -445,8 +460,13 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
             if not isinstance(pos, dict) or not pos:
                 continue
             positions_found += 1
-            if _bybit_extract_loan_position(pos, collateral_coins, debt_coins):
-                positions_matched += 1
+            collateral_ok, debt_ok = _bybit_extract_loan_position(pos, collateral_coins, debt_coins)
+            if collateral_ok:
+                collateral_matched_count += 1
+            if debt_ok:
+                debt_matched_count += 1
+            if (not collateral_ok or not debt_ok) and len(key_dumps) < 2:
+                key_dumps.append(f"{path}: {sorted(pos.keys())}")
 
     _pull("/v5/crypto-loan-common/position", [])
     _pull("/v5/crypto-loan-flexible/ongoing-coin", [])
@@ -458,7 +478,12 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
     else:
         notes = []
         if positions_found:
-            notes.append(f"найдено позиций: {positions_found}, суммы прочитаны у {positions_matched}")
+            notes.append(
+                f"найдено позиций: {positions_found}, залог распознан у {collateral_matched_count}, "
+                f"долг распознан у {debt_matched_count}"
+            )
+        if key_dumps:
+            notes.append(" | ".join(key_dumps))
         if endpoint_errors:
             notes.append("; ".join(endpoint_errors))
         note = "; ".join(notes)
