@@ -613,6 +613,11 @@ function fmt(n, digits) {
 
 const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', mexc: 'MEXC', gate: 'Gate' };
 
+const BYBIT_PART_LABELS = {
+  unified: 'Unified', funding: 'Funding', earn: 'Earn',
+  grid_bot: 'Spot Grid Bot', crypto_loan: 'Крипто-займы (net)',
+};
+
 function renderExchanges(exchanges) {
   const rows = Object.entries(exchanges);
   if (rows.length === 0) { return '<div class="empty">Нет подключённых бирж</div>'; }
@@ -623,6 +628,16 @@ function renderExchanges(exchanges) {
       html += `<tr><td>${label}</td><td class="err">Ошибка: ${v.error}</td></tr>`;
     } else {
       html += `<tr><td>${label}</td><td>${fmt(v.value)}</td></tr>`;
+    }
+    // Bybit — разбивка по 5 частям (Unified/Funding/Earn/Grid Bot/займы),
+    // с текстом ошибки прямо тут, а не только в логах Railway — см.
+    // докстринг balances.fetch_bybit_balance про то, зачем это нужно.
+    if (key === 'bybit' && v.parts) {
+      for (const [partKey, p] of Object.entries(v.parts)) {
+        const partLabel = BYBIT_PART_LABELS[partKey] || partKey;
+        const errCell = p.error ? `<span class="err" title="${p.error}"> ⚠️ ${p.error}</span>` : '';
+        html += `<tr><td class="muted" style="padding-left:20px;">· ${partLabel}</td><td>${fmt(p.value)}${errCell}</td></tr>`;
+      }
     }
   }
   html += '</tbody></table>';
