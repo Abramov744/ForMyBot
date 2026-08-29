@@ -615,7 +615,7 @@ const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', me
 
 const BYBIT_PART_LABELS = {
   unified: 'Unified', funding: 'Funding', earn: 'Earn',
-  grid_bot: 'Spot Grid Bot', crypto_loan: 'Крипто-займы (net)',
+  crypto_loan: 'Крипто-займы (net)',
 };
 
 function renderExchanges(exchanges) {
@@ -629,9 +629,9 @@ function renderExchanges(exchanges) {
     } else {
       html += `<tr><td>${label}</td><td>${fmt(v.value)}</td></tr>`;
     }
-    // Bybit — разбивка по 5 частям (Unified/Funding/Earn/Grid Bot/займы),
-    // с текстом ошибки прямо тут, а не только в логах Railway — см.
-    // докстринг balances.fetch_bybit_balance про то, зачем это нужно.
+    // Bybit — разбивка по частям (Unified/Funding/Earn/займы), с текстом
+    // ошибки прямо тут, а не только в логах Railway — см. докстринг
+    // balances.fetch_bybit_balance про то, зачем это нужно.
     if (key === 'bybit' && v.parts) {
       for (const [partKey, p] of Object.entries(v.parts)) {
         const partLabel = BYBIT_PART_LABELS[partKey] || partKey;

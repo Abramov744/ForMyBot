@@ -10,12 +10,12 @@
 
 Источники и как берётся баланс:
   - Bybit  — Unified Trading Account (totalEquity) + Funding-кошелёк + Earn
-    (Flexible Savings/стейкинг) + Spot Grid Bot + крипто-займы (net) — у
-    Bybit деньги могут лежать в ПЯТИ разных местах одновременно, и каждое
-    требует своего запроса (см. докстринги fetch_bybit_*_balance — там же и
-    разница в степени уверенности: Unified/Funding проверены на практике,
-    Grid Bot и крипто-займы — экспериментально, документация Bybit не даёт
-    точных полей ответа).
+    (Flexible Savings/стейкинг) + крипто-займы (net) — у Bybit деньги могут
+    лежать в ЧЕТЫРЁХ разных местах одновременно, и каждое требует своего
+    запроса (см. докстринги fetch_bybit_*_balance — там же и разница в
+    степени уверенности: Unified/Funding/Earn проверены, крипто-займы —
+    подтверждены реальным ответом API). Spot Grid Bot сознательно НЕ
+    мониторится — см. ниже.
   - MEXC   — отдельно фьючерсный (тот же API, что и funding_report.fetch_mexc)
     и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
   - Gate   — отдельно фьючерсный и спот-баланс, обе подписи запросов — тот же
@@ -33,7 +33,7 @@
     через view-функцию Pool.getUserAccountData(address).
 
 Rabby wallet (сканирование ERC-20/нативных балансов по всем EVM-сетям через
-Etherscan) и Fluid сознательно НЕ мониторятся:
+Etherscan), Fluid и Spot Grid Bot на Bybit сознательно НЕ мониторятся:
   - Rabby wallet — полный скан ~60 сетей на каждый вызов был слишком
     медленным (десятки секунд) и на реальном аккаунте ронял отправку в
     Telegram (см. send_telegram — сообщение либо не успевало уложиться в
@@ -46,6 +46,16 @@ Etherscan) и Fluid сознательно НЕ мониторятся:
     on-chain resolver-контракты со сложным, не до конца документированным
     ABI (вложенные структуры) — разбирать их вслепую для финансового
     инструмента рискованно (см. историю обсуждения в PR).
+  - Spot Grid Bot на Bybit — на практике (реальный ответ API пользователя)
+    эндпоинты Trading Bot API (POST /v5/botsummary/list-all-bots,
+    POST /v5/grid/query-grid-detail) отдают "10005: Permission denied" даже
+    при включённых правах Spot на ключе, и эти эндпоинты ОТСУТСТВУЮТ в самой
+    полной сторонней библиотеке-обёртке над официальным V5 API
+    (tiagosiebler/bybit-api) — то есть это, похоже, не публичный API для
+    сторонних ключей вообще (внутренний эндпоинт веб/приложения Bybit с
+    сессионной авторизацией), а не вопрос конкретной галочки в правах ключа.
+    Раньше здесь была попытка автоматизации (см. git-историю) — убрана как
+    бесперспективная, а не оставлена наполовину рабочей.
 
 Оценка стоимости в USD для не-стейблкоинов на споте берётся с бесплатного
 публичного CoinGecko API (без ключа, с кэшем на 5 минут) — единственный
@@ -289,106 +299,6 @@ def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> tuple[float, list
     return price_spot_balances_usd(coins), errors
 
 
-def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, str]:
-    """
-    Средства в запущенном Spot Grid Bot — ОТДЕЛЬНЫЙ от Unified/Funding пул:
-    при создании бота Bybit сам переводит нужную сумму ИЗ Funding-кошелька
-    под управление бота, поэтому без этого запроса такие деньги не видны
-    вообще нигде в остальном балансе (см. README).
-
-    ЭКСПЕРИМЕНТАЛЬНО, ниже уверенность, чем у остального кода в этом файле:
-    официальная документация Bybit не даёт готового примера ответа с суммой
-    инвестиций бота — только что она вообще где-то в структуре ответа
-    детального эндпоинта есть. Поэтому: 1) список запущенных ботов — через
-    POST /v5/botsummary/list-all-bots (status=0 — только запущенные), тип
-    BOT_TYPE_ENUM_GRID_SPOT — фьючерсные грид/мартингейл-боты НЕ считаем: их
-    маржа остаётся частью Unified Trading Account (totalEquity), в отличие
-    от спот-бота; 2) для каждого найденного бота — POST
-    /v5/grid/query-grid-detail с его gridId; 3) сумма инвестиций ищется
-    перебором нескольких вероятных имён поля (тот же приём, что и для
-    Lighter в fetch_lighter_balance).
-
-    Возвращает (сумма, диагностическая заметка) — заметка заполняется
-    ВСЕГДА, не только при ошибке: для этой экспериментальной части "0 и всё
-    в порядке" ничем не отличается от "0 из-за того, что не совпало
-    угаданное имя поля" без явного объяснения, что именно было найдено —
-    именно это и не получилось различить в первый раз (см. историю PR:
-    "Spot Grid Bot: $0.00" без ошибки — а был ли бот вообще найден,
-    оставалось неизвестным).
-    """
-    try:
-        summary = _bybit_signed_post(
-            "/v5/botsummary/list-all-bots",
-            {"status": 0, "page": 0, "limit": 50, "type": "BOT_TYPE_ENUM_GRID_SPOT"},
-            api_key, api_secret,
-        )
-    except Exception as e:
-        return 0.0, f"не удалось получить список ботов: {e}"
-
-    bots = summary.get("result", {}).get("bots", [])
-    if not bots:
-        return 0.0, "запущенных Spot Grid ботов не найдено (status=0 — если бот на паузе, а не полностью остановлен, он может не попасть в этот список)"
-
-    total_usd = 0.0
-    matched_count = 0
-    unmatched_ids = []
-    detail_errors = []
-    key_dumps = []  # реальные ключи ответа там, где угаданное имя поля не совпало —
-                     # чтобы в следующий раз не гадать имя поля, а взять точное
-    for bot in bots:
-        grid = bot.get("grid", {}) or {}
-        # На верхнем уровне grid у реального ответа только info/profit (не
-        # grid_id/symbol, как предполагалось раньше) — сам id вероятнее
-        # всего внутри info, пробуем там несколько вероятных имён.
-        info = grid.get("info", {}) or {}
-        grid_id = (
-            grid.get("grid_id") or grid.get("gridId")
-            or info.get("grid_id") or info.get("gridId")
-            or info.get("id") or info.get("strategy_id") or info.get("strategyId")
-        )
-        if not grid_id:
-            unmatched_ids.append("без grid_id в ответе списка")
-            if len(key_dumps) < 2:
-                info_keys = f", ключи grid.info: {sorted(info.keys())}" if info else " (ключа grid.info тоже нет)"
-                key_dumps.append(f"ключи бота: {sorted(bot.keys())}, ключи grid: {sorted(grid.keys())}{info_keys}")
-            continue
-        try:
-            detail = _bybit_signed_post(
-                "/v5/grid/query-grid-detail", {"gridId": grid_id}, api_key, api_secret,
-            )
-        except Exception as e:
-            detail_errors.append(f"{grid_id}: {e}")
-            continue
-
-        result = detail.get("result", {}) or {}
-        d = result.get("detail", result)
-        matched = False
-        for key in ("totalInvestment", "investment", "totalInvestAmount", "investAmount", "quoteInvestment"):
-            if d.get(key) is not None:
-                try:
-                    total_usd += float(d[key])
-                    matched_count += 1
-                    matched = True
-                    break
-                except (TypeError, ValueError):
-                    continue
-        if not matched:
-            unmatched_ids.append(str(grid_id))
-            if len(key_dumps) < 2:
-                key_dumps.append(f"ключи query-grid-detail для {grid_id}: {sorted(d.keys())}")
-
-    notes = [f"найдено ботов: {len(bots)}"]
-    if matched_count:
-        notes.append(f"сумма прочитана у {matched_count}")
-    if unmatched_ids:
-        notes.append(f"не удалось прочитать сумму у {len(unmatched_ids)} ({', '.join(unmatched_ids)}) — вероятно, неверное имя поля в query-grid-detail")
-    if key_dumps:
-        notes.append(" | ".join(key_dumps))
-    if detail_errors:
-        notes.append(f"ошибка деталей: {'; '.join(detail_errors)}")
-    return total_usd, "; ".join(notes)
-
-
 def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: dict) -> tuple[bool, bool]:
     """Разбирает одну позицию крипто-займа в collateral_coins/debt_coins
     (мутирует их на месте). Возвращает (распознан_ли_залог, распознан_ли_долг)
@@ -524,22 +434,20 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
 def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     """
     Unified Trading Account (totalEquity, /v5/account/wallet-balance) +
-    Funding-кошелёк + Earn (Flexible Savings/стейкинг) + Spot Grid Bot +
-    крипто-займы (net) — у Bybit это ПЯТЬ разных мест, где могут лежать
-    деньги, и каждое требует своего запроса (см. докстринги отдельных
-    fetch_bybit_*_balance выше — там же и разница в степени уверенности:
-    Unified/Funding проверены на практике, Earn документирован уверенно,
-    Grid Bot и крипто-займы — экспериментально).
+    Funding-кошелёк + Earn (Flexible Savings/стейкинг) + крипто-займы (net)
+    — у Bybit это ЧЕТЫРЕ разных места, где могут лежать деньги, и каждое
+    требует своего запроса (см. докстринги отдельных fetch_bybit_*_balance
+    выше). Spot Grid Bot сознательно не мониторится — см. докстринг модуля.
 
     Возвращает {"total": float, "parts": {"unified":, "funding":, "earn":,
-    "grid_bot":, "crypto_loan":: {"value": float, "error": str|None}}} —
-    раньше это была просто float, и ошибка любой отдельной части была видна
-    только в логах Railway (fetch_all_balances/build_balances_report/
-    /api/balances показывали только итоговую сумму). Разбивка по частям
-    нужна именно для того, чтобы разобраться, ПОЧЕМУ конкретная часть дала 0
-    — не хватает прав у API-ключа (Bybit выдаёт права на Earn/Bot/Loan
-    отдельными переключателями от прав на Wallet/Trade, которых достаточно
-    для остального бота), реальный ответ API отличается от того, что здесь
+    "crypto_loan":: {"value": float, "error": str|None}}} — раньше это была
+    просто float, и ошибка любой отдельной части была видна только в логах
+    Railway (fetch_all_balances/build_balances_report/api/balances
+    показывали только итоговую сумму). Разбивка по частям нужна именно для
+    того, чтобы разобраться, ПОЧЕМУ конкретная часть дала 0 — не хватает
+    прав у API-ключа (Bybit выдаёт права на Earn/Loan отдельными
+    переключателями от прав на Wallet/Trade, которых достаточно для
+    остального бота), реальный ответ API отличается от того, что здесь
     предполагалось, или там действительно пусто — не отличить одно от
     другого без текста ошибки под рукой.
     """
@@ -569,17 +477,10 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     except Exception as e:
         parts["earn"] = {"value": 0.0, "error": str(e)}
 
-    # Grid Bot и крипто-займы — экспериментальные части: диагностическая
-    # заметка (note) заполняется ВСЕГДА, а не только при ошибке (см.
-    # докстринги fetch_bybit_grid_bot_balance/fetch_bybit_crypto_loan_balance)
-    # — "error" тут используется только если сама функция неожиданно упала
+    # Крипто-займы — диагностическая заметка (note) заполняется ВСЕГДА, а не
+    # только при ошибке (см. докстринг fetch_bybit_crypto_loan_balance) —
+    # "error" тут используется только если сама функция неожиданно упала
     # исключением мимо своего внутреннего try/except.
-    try:
-        grid_usd, grid_note = fetch_bybit_grid_bot_balance(api_key, api_secret)
-        parts["grid_bot"] = {"value": grid_usd, "error": None, "note": grid_note}
-    except Exception as e:
-        parts["grid_bot"] = {"value": 0.0, "error": str(e), "note": None}
-
     try:
         loan_usd, loan_note = fetch_bybit_crypto_loan_balance(api_key, api_secret)
         parts["crypto_loan"] = {"value": loan_usd, "error": None, "note": loan_note}
@@ -902,9 +803,9 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     if "bybit_api_key" in secrets:
         # Bybit — особый случай: fetch_bybit_balance отдаёт не число, а разбивку
-        # по пяти частям (unified/funding/earn/grid_bot/crypto_loan) — чтобы
-        # ошибка КОНКРЕТНОЙ части была видна в /balances и в Telegram, а не
-        # только в логах Railway (см. докстринг fetch_bybit_balance).
+        # по частям (unified/funding/earn/crypto_loan) — чтобы ошибка
+        # КОНКРЕТНОЙ части была видна в /balances и в Telegram, а не только
+        # в логах Railway (см. докстринг fetch_bybit_balance).
         try:
             bybit = fetch_bybit_balance(secrets["bybit_api_key"], secrets["bybit_api_secret"])
             exchanges["bybit"] = {"value": bybit["total"], "error": None, "parts": bybit["parts"]}
@@ -955,7 +856,7 @@ EXCHANGE_LABELS = {
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",
-    "grid_bot": "Spot Grid Bot", "crypto_loan": "Крипто-займы (net)",
+    "crypto_loan": "Крипто-займы (net)",
 }
 _AAVE_CHAIN_NAMES = {1: "Ethereum", 42161: "Arbitrum One", 8453: "Base"}
 
