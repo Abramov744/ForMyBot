@@ -200,15 +200,25 @@ def price_spot_balances_usd(balances: dict) -> tuple[float, list]:
     STABLECOIN_SYMBOLS), остальное — батч-запросом через
     _coingecko_symbol_to_id/_coingecko_simple_prices.
 
+    ВАЖНО (найдено на реальном аккаунте): у CoinGecko тикеры НЕ уникальны, и
+    для малоизвестных/биржевых токенов (например MEXC-листинги вроде BTW,
+    GUA) поиск по тикеру в общем списке CoinGecko может зацепить СОВСЕМ
+    ДРУГУЮ монету с тем же тикером — результат не "монета не оценена"
+    (это было бы безопасно и видно), а СИЛЬНО ЗАНИЖЕННАЯ (или любая другая
+    неверная) цена без каких-либо признаков ошибки. Поэтому там, где у
+    самой биржи есть публичный тикер по паре ASSET/USDT (сейчас — MEXC, см.
+    price_spot_balances_usd_native ниже), эта функция используется ТОЛЬКО
+    как fallback для того, что не нашлось у биржи напрямую — так коллизия
+    тикеров у CoinGecko почти не встречается на практике (обычно ей
+    достаётся только по-настоящему экзотическое, чего у самой биржи как раз
+    и не находится).
+
     Монета, для которой цена не нашлась вообще нигде (ни в CoinGecko-id по
     тикеру, ни цена по найденному id), НЕ оценивается наугад — просто не
     попадает в сумму, но теперь ЯВНО возвращается вторым элементом, а не
-    тихо пропадает: на реальном аккаунте оказалось, что так теряется
-    заметная часть баланса (см. историю с MEXC — там ушло ~40% суммы
-    именно так, а не из-за бага в подсчёте), и раньше эту потерю нельзя
-    было увидеть нигде, кроме как вручную сверяя с биржей. Используется
-    MEXC/Gate-спотом (fetch_all_balances) и Bybit Funding/Earn/крипто-
-    займами.
+    тихо пропадает — используется Bybit Funding/Earn/крипто-займами (там
+    биржевого тикера по определению нет — Earn/займы это не спот-пара) и
+    как fallback в price_spot_balances_usd_native.
     """
     total = 0.0
     unpriced = []
@@ -233,6 +243,92 @@ def price_spot_balances_usd(balances: dict) -> tuple[float, list]:
                 unpriced.append(f"{sym} {balances[sym]:g}")
 
     return total, unpriced
+
+
+_exchange_ticker_cache: dict = {}     # cache_key -> {base_asset: price_usdt}
+_exchange_ticker_cache_ts: dict = {}
+EXCHANGE_TICKER_CACHE_TTL_S = 60      # цены на бирже меняются быстро, но и не нужно точнее раза в минуту
+
+
+def fetch_mexc_ticker_prices() -> dict:
+    """
+    GET /api/v3/ticker/price — публичный (без ключа) эндпоинт MEXC, отдаёт
+    последнюю цену сразу по ВСЕМ спот-парам. Возвращает {base_asset:
+    price_usdt} только по парам вида {ASSET}USDT — см. докстринг
+    price_spot_balances_usd про то, почему это надёжнее общего поиска по
+    тикеру в CoinGecko для малоизвестных монет."""
+    cache_key = "mexc"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get("https://api.mexc.com/api/v3/ticker/price", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for t in (data if isinstance(data, list) else []):
+        symbol = str(t.get("symbol", ""))
+        if symbol.endswith("USDT"):
+            try:
+                prices[symbol[:-4]] = float(t["price"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def fetch_gate_ticker_prices() -> dict:
+    """GET /api/v4/spot/tickers — публичный эндпоинт Gate, аналог
+    fetch_mexc_ticker_prices выше, для пар вида {ASSET}_USDT."""
+    cache_key = "gate"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get("https://api.gateio.ws/api/v4/spot/tickers", timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for t in (data if isinstance(data, list) else []):
+        pair = str(t.get("currency_pair", ""))
+        if pair.endswith("_USDT"):
+            try:
+                prices[pair[:-5]] = float(t["last"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def price_spot_balances_usd_native(balances: dict, exchange_prices: dict) -> tuple[float, list]:
+    """
+    Как price_spot_balances_usd, но СНАЧАЛА пробует цену по паре ASSET/USDT
+    С САМОЙ БИРЖИ (exchange_prices — см. fetch_mexc_ticker_prices/
+    fetch_gate_ticker_prices), и только для того, что не нашлось там —
+    CoinGecko как fallback. Однозначная пара на самой бирже, где реально
+    куплена монета, не может перепутаться с чужой монетой под тем же
+    тикером — в отличие от общего поиска по CoinGecko (см. докстринг
+    price_spot_balances_usd про реальный случай с BTW/GUA на MEXC, где
+    именно так цена оказалась в разы заниженной без единой ошибки).
+    """
+    total = 0.0
+    remaining = {}
+    for sym, amt in balances.items():
+        if sym.upper() in STABLECOIN_SYMBOLS:
+            total += amt
+            continue
+        price = exchange_prices.get(sym.upper())
+        if price is not None:
+            total += amt * price
+        else:
+            remaining[sym] = amt
+
+    fallback_usd, unpriced = price_spot_balances_usd(remaining)
+    return total + fallback_usd, unpriced
 
 
 # ── Биржи ──────────────────────────────────────────────────────────────────────
@@ -840,26 +936,32 @@ def fetch_all_balances(secrets: dict) -> dict:
             print(f"[balances/{name}] Ошибка: {e}")
             exchanges[name] = {"value": None, "error": str(e)}
 
-    def _try_spot_futures(name, futures_fn, spot_fn):
+    def _try_spot_futures(name, futures_fn, spot_fn, ticker_prices_fn=None):
         """
         Для MEXC/Gate: futures + оценка спота в USD.
 
-        Заметка (note) показывает РАЗБИВКУ futures/spot и что именно
-        нашлось на споте (монета: количество) ВСЕГДА, не только если что-то
-        не оценилось в USD — на реальном аккаунте (MEXC) итог расходился с
-        суммой в приложении биржи (~$289 не хватало), при этом ни одна
-        монета не попадала в "без оценки" — то есть спот-эндпоинт (GET
-        /api/v3/account) в принципе не отдаёт часть баланса, а не просто не
-        может её оценить в USD (поле free/locked и сама подпись запроса уже
-        сверены с ccxt — совпадают один в один, дело не в них). Разбивка
-        нужна, чтобы увидеть, каких именно монет не хватает в самом ответе
-        API, а не гадать дальше.
+        ticker_prices_fn (если задан) — публичный тикер цен самой биржи
+        (fetch_mexc_ticker_prices/fetch_gate_ticker_prices), используется
+        В ПЕРВУЮ очередь через price_spot_balances_usd_native: на реальном
+        аккаунте выяснилось, что оценка через общий поиск тикера в CoinGecko
+        может зацепить ЧУЖУЮ монету под тем же тикером (малоизвестные
+        MEXC-листинги BTW/GUA — цена в разы заниженная, без единой ошибки,
+        просто совпадение тикера с другой монетой) — цена с самой биржи,
+        где эта монета реально куплена, такой проблемы не имеет.
+
+        Заметка (note) — разбивка futures/spot и что именно нашлось на
+        споте (монета: количество), чтобы ошибку в составе (не в цене) было
+        видно сразу, а не только в логах.
         """
         nonlocal total
         try:
             futures = futures_fn()
             spot = spot_fn()
-            spot_usd, unpriced = price_spot_balances_usd(spot)
+            if ticker_prices_fn is not None:
+                exchange_prices = ticker_prices_fn()
+                spot_usd, unpriced = price_spot_balances_usd_native(spot, exchange_prices)
+            else:
+                spot_usd, unpriced = price_spot_balances_usd(spot)
             value = futures + spot_usd
             spot_breakdown = ", ".join(f"{sym} {amt:g}" for sym, amt in spot.items()) or "пусто"
             note = f"фьючерсы: ${futures:,.2f}, спот: ${spot_usd:,.2f} (найдено на споте: {spot_breakdown})"
@@ -894,6 +996,7 @@ def fetch_all_balances(secrets: dict) -> dict:
             "mexc",
             lambda: fetch_mexc_futures_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
             lambda: fetch_mexc_spot_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
+            fetch_mexc_ticker_prices,
         )
 
     if "gate_api_key" in secrets:
@@ -901,6 +1004,7 @@ def fetch_all_balances(secrets: dict) -> dict:
             "gate",
             lambda: fetch_gate_futures_balance(secrets["gate_api_key"], secrets["gate_api_secret"]),
             lambda: fetch_gate_spot_balance(secrets["gate_api_key"], secrets["gate_api_secret"]),
+            fetch_gate_ticker_prices,
         )
 
     wallet_secrets = load_wallet_secrets()
