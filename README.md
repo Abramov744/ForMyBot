@@ -232,7 +232,10 @@ BNB Smart Chain, OP Mainnet, Avalanche C-Chain, Celo. Arbitrum на беспла
   `_coingecko_symbol_to_id` в `balances.py`). Раньше ценился только
   курируемый список из ~24 монет — любая монета за его пределами молча
   выпадала из суммы; это и было причиной, почему у MEXC "не все суммы
-  учтены".
+  учтены". Фьючерсный счёт Gate — `total` **+** `unrealised_pnl`
+  (подтверждено официальной моделью `FuturesAccount` в `gateapi-go`: `total`
+  явно исключает нереализованный PnL — тот же случай, что у Aster/Lighter
+  ниже).
 - **Aster** — баланс кошелька (`/fapi/v3/balance`) **+** нереализованный
   PnL открытых позиций (`/fapi/v3/positionRisk`, поле `unRealizedProfit`,
   как у Binance Futures API, форком которого является Aster). Спота у
@@ -242,9 +245,10 @@ BNB Smart Chain, OP Mainnet, Avalanche C-Chain, Celo. Arbitrum на беспла
   Collateral + Unrealized PnL, готового поля с суммой в API нет. Спота у
   Lighter нет вовсе.
 
-  Для обеих бирж раньше учитывался только сам кошелёк/collateral, без PnL
-  открытых позиций — из-за этого баланс расходился с реальным, пока
-  позиции были открыты (замечено на реальном аккаунте).
+  Для всех трёх бирж (Gate/Aster/Lighter) раньше учитывался только сам
+  кошелёк/collateral, без PnL открытых позиций — из-за этого баланс
+  расходился с реальным, пока позиции были открыты (замечено на реальном
+  аккаунте).
 - **Aave v3** — ON-CHAIN, чистая стоимость позиции (обеспечение минус долг)
   через `Pool.getUserAccountData(address)`; сети — Ethereum/Arbitrum
   One/Base (адреса контрактов захардкожены в `AAVE_V3_POOL`, добавить сеть —
