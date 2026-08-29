@@ -35,7 +35,8 @@
     через view-функцию Pool.getUserAccountData(address).
 
 Rabby wallet (сканирование ERC-20/нативных балансов по всем EVM-сетям через
-Etherscan), Fluid и Spot Grid Bot на Bybit сознательно НЕ мониторятся:
+Etherscan), Fluid, Spot Grid Bot на Bybit и MEXC Loans сознательно НЕ
+мониторятся:
   - Rabby wallet — полный скан ~60 сетей на каждый вызов был слишком
     медленным (десятки секунд) и на реальном аккаунте ронял отправку в
     Telegram (см. send_telegram — сообщение либо не успевало уложиться в
@@ -58,8 +59,14 @@ Etherscan), Fluid и Spot Grid Bot на Bybit сознательно НЕ мон
     сессионной авторизацией), а не вопрос конкретной галочки в правах ключа.
     Раньше здесь была попытка автоматизации (см. git-историю) — убрана как
     бесперспективная, а не оставлена наполовину рабочей.
-
-Оценка стоимости в USD для не-стейблкоинов на споте берётся с бесплатного
+  - MEXC Loans (залоговое кредитование: BTC в залог, займ в USDT, с LTV и
+    ликвидацией — НЕ обычный `margin/loan` для маржинальной торговли, это
+    другой продукт) — публичного API не нашлось нигде: ни в официальной
+    документации MEXC, ни в `ccxt` (самая полная сторонняя библиотека,
+    знает только про margin/loan). Раз даже намёка на эндпоинт нет —
+    решили не гадать путь вслепую (тот же вывод, что и с Grid Bot на
+    Bybit выше, только там хотя бы эндпоинты угадывались, просто были
+    недоступны для сторонних ключей). для не-стейблкоинов на споте берётся с бесплатного
 публичного CoinGecko API (без ключа, с кэшем на 5 минут) — единственный
 источник цен в проекте без отдельного API-ключа под аккаунт пользователя,
 поэтому ошибки/лимиты этого API НЕ должны ронять остальную часть отчёта: при
@@ -876,8 +883,13 @@ _AAVE_CHAIN_NAMES = {1: "Ethereum", 42161: "Arbitrum One", 8453: "Base"}
 
 
 def build_balances_report(result: dict) -> str:
-    """Тот же result, что отдаёт /api/balances на веб-странице — здесь просто
-    коротко в текст для Telegram."""
+    """
+    Тот же result, что отдаёт /api/balances на веб-странице — здесь просто
+    коротко в текст для Telegram: одна строка на источник, без разбивки
+    Bybit по частям (unified/funding/earn/крипто-займы) — подробности с
+    диагностикой (⚠️/ℹ️ по каждой части) видны на веб-странице /balances,
+    в текстовый отчёт для Telegram решили не тащить.
+    """
     lines = ["💰 Сводный баланс"]
 
     lines.append("")
@@ -887,16 +899,6 @@ def build_balances_report(result: dict) -> str:
             lines.append(f"{label}: ❌ {v['error']}")
         else:
             lines.append(f"{label}: ${v['value']:,.2f}")
-
-        if key == "bybit" and v.get("parts"):
-            for part_name, p in v["parts"].items():
-                part_label = _BYBIT_PART_LABELS.get(part_name, part_name)
-                if p["error"]:
-                    lines.append(f"  · {part_label}: ${p['value']:,.2f} ⚠️ {p['error']}")
-                elif p.get("note"):
-                    lines.append(f"  · {part_label}: ${p['value']:,.2f} ℹ️ {p['note']}")
-                else:
-                    lines.append(f"  · {part_label}: ${p['value']:,.2f}")
 
     aave = result.get("aave")
     if aave is None:
