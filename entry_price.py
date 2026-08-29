@@ -12,8 +12,9 @@
 (ровно то поведение, которое и было явно согласовано).
 
 Точность времени открытия шорта различается по биржам:
-  - Bybit, MEXC — биржа отдаёт ТОЧНОЕ время открытия позиции (createdTime/
-    createTime), окно поиска спот-сделки узкое (см. WINDOW_MINUTES_EXACT).
+  - Bybit, MEXC, KuCoin — биржа отдаёт ТОЧНОЕ время открытия позиции
+    (createdTime/createTime/openingTimestamp), окно поиска спот-сделки
+    узкое (см. WINDOW_MINUTES_EXACT).
   - Aster, Gate, Lighter — точного времени открытия в API позиций нет,
     время оценивается по непрерывности начислений funding (тот же приём,
     что и в funding_report._trim_to_continuous_run для /positions) —
@@ -38,6 +39,7 @@ from funding_report import (
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
+    _kucoin_signed_get,
     _fetch_in_windows,
     _trim_to_continuous_run,
     _EXCHANGE_WINDOW_DAYS,
@@ -65,6 +67,22 @@ def _base_asset(exchange: str, symbol: str) -> str:
         return symbol.split("_")[0]
     if exchange == "lighter":
         return symbol  # у Lighter symbol уже "голый" базовый актив
+    if exchange == "kucoin":
+        # У KuCoin ДВА разных формата символа в зависимости от рынка: спот —
+        # через дефис ("BTC-USDT"), фьючерсы — слитно с суффиксом контракта
+        # "M" ("XBTUSDTM", "ETHUSDTM"), а BTC на фьючерсах называется XBT
+        # (историческое биржевое обозначение, как и на Bitmex) — без явного
+        # маппинга XBT->BTC базовый актив с фьючерсного шорта не совпал бы с
+        # базовым активом спот-покупки той же монеты.
+        if "-" in symbol:
+            base = symbol.split("-")[0]
+        else:
+            base = symbol[:-1] if symbol.endswith("M") else symbol
+            for suf in _QUOTE_SUFFIXES:
+                if base.endswith(suf) and len(base) > len(suf):
+                    base = base[: -len(suf)]
+                    break
+        return "BTC" if base == "XBT" else base
     for suf in _QUOTE_SUFFIXES:
         if symbol.endswith(suf) and len(symbol) > len(suf):
             return symbol[: -len(suf)]
@@ -268,12 +286,39 @@ def _lighter_position_entry(secrets: dict, symbol: str) -> dict | None:
     return None
 
 
+def _kucoin_position_entry(secrets: dict, symbol: str) -> dict | None:
+    """
+    GET /api/v1/positions — без фильтра отдаёт все открытые позиции сразу,
+    ищем нужный symbol в списке (в отличие от Bybit/Gate у KuCoin нет
+    отдельного "дай мне одну позицию по символу" эндпоинта). currentQty —
+    подписанный размер (ПОДТВЕРЖДЕНО: офиц. SDK ccxt, parse_position —
+    currentQty > 0 → long, < 0 → short; также подтверждено официальным
+    KuCoin Futures New User Guide). openingTimestamp — точное время
+    открытия в мс (см. fetch_kucoin_open_symbols в funding_report.py).
+    """
+    data = _kucoin_signed_get(
+        "https://api-futures.kucoin.com", "/api/v1/positions",
+        secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+    )
+    for p in data.get("data") or []:
+        qty = float(p.get("currentQty", 0) or 0)
+        if p.get("symbol") == symbol and p.get("isOpen") and qty != 0:
+            return {
+                "price": float(p["avgEntryPrice"]),
+                "qty": abs(qty),
+                "entry_time_ms": int(p["openingTimestamp"]) if p.get("openingTimestamp") else None,
+                "time_is_exact": True,
+            }
+    return None
+
+
 _POSITION_ENTRY_FETCHERS = {
     "aster": _aster_position_entry,
     "bybit": _bybit_position_entry,
     "mexc": _mexc_position_entry,
     "gate": _gate_position_entry,
     "lighter": _lighter_position_entry,
+    "kucoin": _kucoin_position_entry,
 }
 
 
@@ -409,6 +454,28 @@ def _fetch_gate_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: i
     return [
         {"price": float(t["price"]), "qty": float(t["amount"]), "side": t.get("side")}
         for t in (data if isinstance(data, list) else []) if t.get("side") == "buy"
+    ]
+
+
+def _fetch_kucoin_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+    """
+    GET /api/v1/fills — история исполненных сделок спота KuCoin. symbol —
+    спот-формат через дефис ("BTC-USDT", см. _SPOT_TRADE_FETCHERS ниже).
+    ПОДТВЕРЖДЕНО по офиц. SDK ccxt (ccxt/kucoin.py, fetch_my_spot_trades,
+    метод по умолчанию private_get_fills): поля price/size/side/createdAt,
+    startAt/endAt — миллисекунды. Офиц. документация отдельно предупреждает,
+    что startAt не отдаёт сделки старше недели ПОСЛЕ startAt — не проблема
+    для окон поиска в этом файле (максимум ±6 часов, см. WINDOW_MINUTES_APPROX).
+    """
+    data = _kucoin_signed_get(
+        "https://api.kucoin.com", "/api/v1/fills",
+        secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+        {"symbol": symbol, "startAt": start_ms, "endAt": end_ms},
+    )
+    items = (data.get("data") or {}).get("items") or []
+    return [
+        {"price": float(t["price"]), "qty": float(t["size"]), "side": t.get("side")}
+        for t in items if t.get("side") == "buy"
     ]
 
 
@@ -635,6 +702,7 @@ _SPOT_TRADE_FETCHERS = {
     "bybit": (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
     "mexc":  (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
     "gate":  (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
+    "kucoin": (lambda secrets, symbol, s, e: _fetch_kucoin_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}-{quote}"),
     # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
     # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
     # _search_spot_entry), а не через этот реестр из (fetch_fn, symbol_fn) на
@@ -645,6 +713,7 @@ _SPOT_EXCHANGE_SECRET_KEY = {
     "bybit": "bybit_api_key",
     "mexc": "mexc_api_key",
     "gate": "gate_api_key",
+    "kucoin": "kucoin_api_key",
 }
 
 
@@ -691,6 +760,7 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
             trade_count = sum(len(trades) for _, trades in matches)
             return {
                 "price": vwap,
+                "qty": total_qty,
                 "quote_asset": quote,
                 "exchanges": exchanges_used,
                 "trade_count": trade_count,

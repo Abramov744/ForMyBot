@@ -8,7 +8,11 @@
   4) фоново, ОПЦИОНАЛЬНО (только если заданы GOOGLE_SHEET_ID и
      GOOGLE_SERVICE_ACCOUNT_JSON) — периодическая запись funding по
      открытым позициям в столбец P Google Sheet взамен ручного ввода
-     (sheets_sync.py).
+     (sheets_sync.py);
+  5) фоново, та же опциональность — почасовое отслеживание НОВЫХ открытых
+     шорт-позиций по всем 6 биржам и автозапись новой строки (монета в B,
+     время открытия в D, биржа в O), когда на споте нашлась встречная
+     покупка того же объёма (short_position_tracker.py).
 
 Раньше (см. bot_worker.py) сервис на Railway был "worker" — процесс без
 входящего HTTP и без публичного адреса. Теперь нужен и публичный веб —
@@ -30,14 +34,17 @@ $PORT. bot_worker.py и bot_poll.py при этом не удалены и по-
   FUNDING_ALERT_THRESHOLD       — порог ставки (доля, не %) для алерта,
                                    по умолчанию 0.0 (алерт при любой ставке < 0)
 
-Опционально — синхронизация с Google Sheet (см. sheets_sync.py, поток #4
-выше). Если GOOGLE_SHEET_ID не задан, поток просто не запускается —
-остальная часть приложения (веб-калькулятор, бот, алерты) работает как
-обычно:
+Опционально — синхронизация с Google Sheet (см. sheets_sync.py и
+short_position_tracker.py, потоки #4-5 выше — ОБА запускаются от одной и
+той же пары переменных, но не связаны друг с другом иначе). Если
+GOOGLE_SHEET_ID не задан, оба потока просто не запускаются — остальная
+часть приложения (веб-калькулятор, бот, алерты) работает как обычно:
   GOOGLE_SHEET_ID               — id таблицы
   GOOGLE_SERVICE_ACCOUNT_JSON   — JSON-ключ сервисного аккаунта Google целиком
   GOOGLE_SHEET_TAB              — опционально, имя вкладки (по умолчанию —
                                    первая в файле)
+  SHORT_POSITION_CHECK_INTERVAL_MINUTES — период проверки новых шорт-позиций
+                                   (short_position_tracker.py), по умолчанию 60
   SHEET_SYNC_INTERVAL_MINUTES   — период синхронизации, по умолчанию 60
 
 Запуск локально для проверки: PORT=8080 python app.py
@@ -56,6 +63,7 @@ from bot_worker import poll_forever
 from funding_alerts import alert_loop
 from funding_report import load_secrets
 from sheets_sync import sheet_sync_loop
+from short_position_tracker import short_position_check_loop
 from sltp_alerts import sltp_alert_loop
 
 app = Flask(__name__)
@@ -719,9 +727,14 @@ def main():
     # остальное (веб-калькулятор/бот/алерты по-прежнему работают).
     if os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
         threading.Thread(target=sheet_sync_loop, args=(secrets,), daemon=True, name="sheet-sync").start()
+        # Отдельный поток — не переиспользует sheet_sync_loop, у него другая
+        # задача (создание НОВЫХ строк по новым шорт-позициям, а не
+        # обновление funding в P у уже существующих активных строк), см.
+        # докстринг short_position_tracker.py.
+        threading.Thread(target=short_position_check_loop, args=(secrets,), daemon=True, name="short-position-tracker").start()
     else:
         print("[app] GOOGLE_SHEET_ID/GOOGLE_SERVICE_ACCOUNT_JSON не заданы — "
-              "синхронизация с Google Sheet отключена.", flush=True)
+              "синхронизация с Google Sheet и отслеживание новых шорт-позиций отключены.", flush=True)
 
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, threaded=True)

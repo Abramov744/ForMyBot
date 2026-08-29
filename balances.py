@@ -80,7 +80,6 @@ Etherscan), Fluid, Spot Grid Bot на Bybit и MEXC Loans сознательно
 наугад (см. price_spot_balances_usd).
 """
 
-import base64
 import hashlib
 import hmac
 import json
@@ -99,6 +98,7 @@ from funding_report import (
     _get_gate_proxies,
     _get_mexc_proxies,
     _get_proxies,
+    _kucoin_signed_get,
     _mexc_sign,
 )
 
@@ -743,83 +743,6 @@ def fetch_gate_spot_balance(api_key: str, api_secret: str) -> dict:
         if amount > 0:
             out[a["currency"]] = amount
     return out
-
-
-def _get_kucoin_proxies() -> dict | None:
-    """Прокси для запросов к KuCoin — тот же паттерн, что и у остальных бирж
-    (funding_report._get_mexc_proxies/_get_gate_proxies): сначала KUCOIN_PROXY,
-    иначе общие HTTPS_PROXY/HTTP_PROXY."""
-    proxy = (
-        os.environ.get("KUCOIN_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("HTTP_PROXY")
-    )
-    if not proxy:
-        return None
-
-    if not proxy.startswith(("http://", "https://")):
-        parts = proxy.split(":")
-        if len(parts) == 4:
-            host, port, user, pwd = parts
-            proxy = f"http://{user}:{pwd}@{host}:{port}"
-        else:
-            proxy = f"http://{proxy}"
-
-    return {"http": proxy, "https": proxy}
-
-
-def _kucoin_signed_get(base_url: str, path: str, api_key: str, api_secret: str,
-                        api_passphrase: str, params: dict | None = None) -> dict:
-    """
-    Подпись приватных GET-запросов KuCoin — общая что для спота
-    (api.kucoin.com), что для фьючерсов (api-futures.kucoin.com), формула
-    одна и та же, разные только базовый URL и порт. ПОДТВЕРЖДЕНО по офиц.
-    SDK `ccxt` (`ccxt/kucoin.py`, метод `sign()`) и по официальному
-    "KuCoin API Key Upgrade Guideline" — версия ключа KC-API-KEY-VERSION=2
-    (текущая рекомендуемая KuCoin версия для всех ключей, созданных после
-    обновления):
-
-      endpoint  = path + ("?" + urlencode(params), если params не пусты)
-      timestamp = миллисекунды, строкой
-      payload   = timestamp + "GET" + endpoint  (тело у GET-запроса пустое)
-      KC-API-SIGN       = base64(HMAC-SHA256(secret, payload))
-      KC-API-PASSPHRASE = base64(HMAC-SHA256(secret, passphrase)) — в
-                          версии 2 пассфраза тоже подписывается тем же
-                          ключом, а не передаётся в заголовке как есть
-                          (это единственное отличие от более старых,
-                          созданных до версии 2, ключей — с ними этот
-                          заголовок будет неверным).
-
-    НЕ ПРОВЕРЕНО на реальном аккаунте (в отличие от схем подписи остальных
-    бирж в этом файле, переиспользующих уже боевые формулы из
-    funding_report.py) — перед тем как полагаться на число, сверьте с
-    балансом в приложении KuCoin хотя бы раз.
-    """
-    api_key, api_secret, api_passphrase = api_key.strip(), api_secret.strip(), api_passphrase.strip()
-    endpoint = path
-    if params:
-        endpoint += "?" + urllib.parse.urlencode(params)
-
-    timestamp = str(int(time.time() * 1000))
-    payload = timestamp + "GET" + endpoint
-    sig = base64.b64encode(hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).digest()).decode()
-    passphrase_sig = base64.b64encode(
-        hmac.new(api_secret.encode(), api_passphrase.encode(), hashlib.sha256).digest()
-    ).decode()
-
-    headers = {
-        "KC-API-KEY": api_key,
-        "KC-API-SIGN": sig,
-        "KC-API-TIMESTAMP": timestamp,
-        "KC-API-PASSPHRASE": passphrase_sig,
-        "KC-API-KEY-VERSION": "2",
-    }
-    resp = requests.get(f"{base_url}{endpoint}", headers=headers, timeout=30, proxies=_get_kucoin_proxies())
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code") != "200000":
-        raise RuntimeError(f"KuCoin {path} error {data.get('code')}: {data.get('msg')}")
-    return data
 
 
 def fetch_kucoin_ticker_prices() -> dict:
