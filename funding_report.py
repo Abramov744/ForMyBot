@@ -5,6 +5,7 @@ Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC + Gate → Telegram
 Запуск: ежедневно в 04:00 UTC (07:00 МСК).
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -691,6 +692,112 @@ def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt")
 
     items = data if isinstance(data, list) else []
     return {p["contract"] for p in items if float(p.get("size", 0)) != 0}
+
+
+# ── Получение данных с KuCoin ─────────────────────────────────────────────────
+#
+# В отличие от Aster/Bybit/Lighter/MEXC/Gate выше, KuCoin НЕ часть
+# funding-стратегии (не входит в дневной отчёт этого файла) — используется
+# только для сводного баланса (balances.py) и для отслеживания новых
+# открытых шорт-позиций (short_position_tracker.py). Хелперы здесь, а не в
+# balances.py/short_position_tracker.py, потому что переиспользуются ОБОИМИ
+# модулями — тот же принцип, что и у остальных бирж в этом файле.
+
+def _get_kucoin_proxies() -> dict | None:
+    """Прокси для запросов к KuCoin — тот же паттерн, что и у остальных бирж
+    (_get_mexc_proxies/_get_gate_proxies выше): сначала KUCOIN_PROXY, иначе
+    общие HTTPS_PROXY/HTTP_PROXY."""
+    proxy = (
+        os.environ.get("KUCOIN_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
+def _kucoin_signed_get(base_url: str, path: str, api_key: str, api_secret: str,
+                        api_passphrase: str, params: dict | None = None) -> dict:
+    """
+    Подпись приватных GET-запросов KuCoin — общая что для спота
+    (api.kucoin.com), что для фьючерсов (api-futures.kucoin.com), формула
+    одна и та же, разные только базовый URL и порт. ПОДТВЕРЖДЕНО по офиц.
+    SDK `ccxt` (`ccxt/kucoin.py`, метод `sign()`) и по официальному
+    "KuCoin API Key Upgrade Guideline" — версия ключа KC-API-KEY-VERSION=2
+    (текущая рекомендуемая KuCoin версия для всех ключей, созданных после
+    обновления):
+
+      endpoint  = path + ("?" + urlencode(params), если params не пусты)
+      timestamp = миллисекунды, строкой
+      payload   = timestamp + "GET" + endpoint  (тело у GET-запроса пустое)
+      KC-API-SIGN       = base64(HMAC-SHA256(secret, payload))
+      KC-API-PASSPHRASE = base64(HMAC-SHA256(secret, passphrase)) — в
+                          версии 2 пассфраза тоже подписывается тем же
+                          ключом, а не передаётся в заголовке как есть
+                          (это единственное отличие от более старых,
+                          созданных до версии 2, ключей — с ними этот
+                          заголовок будет неверным).
+
+    НЕ ПРОВЕРЕНО на реальном аккаунте (в отличие от схем подписи остальных
+    бирж в этом файле) — перед тем как полагаться на число, сверьте с
+    приложением KuCoin хотя бы раз.
+    """
+    api_key, api_secret, api_passphrase = api_key.strip(), api_secret.strip(), api_passphrase.strip()
+    endpoint = path
+    if params:
+        endpoint += "?" + urllib.parse.urlencode(params)
+
+    timestamp = str(int(time.time() * 1000))
+    payload = timestamp + "GET" + endpoint
+    sig = base64.b64encode(hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).digest()).decode()
+    passphrase_sig = base64.b64encode(
+        hmac.new(api_secret.encode(), api_passphrase.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    headers = {
+        "KC-API-KEY": api_key,
+        "KC-API-SIGN": sig,
+        "KC-API-TIMESTAMP": timestamp,
+        "KC-API-PASSPHRASE": passphrase_sig,
+        "KC-API-KEY-VERSION": "2",
+    }
+    resp = requests.get(f"{base_url}{endpoint}", headers=headers, timeout=30, proxies=_get_kucoin_proxies())
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"KuCoin {path} error {data.get('code')}: {data.get('msg')}")
+    return data
+
+
+def fetch_kucoin_open_symbols(api_key: str, api_secret: str, api_passphrase: str) -> dict:
+    """
+    GET /api/v1/positions — без параметров отдаёт СРАЗУ ВСЕ открытые позиции
+    аккаунта (аналог fetch_bybit_open_symbols/fetch_mexc_open_symbols выше).
+    Возвращает {symbol: opening_timestamp_ms} для ВСЕХ позиций (long и
+    short вперемешку, как и у остальных fetch_*_open_symbols — сторона
+    здесь не различается, это делает short_position_tracker.py отдельно
+    через ту же сырую позицию), символы вида "XBTUSDTM"/"ETHUSDTM".
+
+    ПОДТВЕРЖДЕНО по офиц. SDK ccxt (ccxt/kucoin.py, fetch_positions) и по
+    офиц. документации (Get Position List): поле openingTimestamp — точное
+    время открытия позиции в мс, как и createdTime/createTime у Bybit/MEXC.
+    """
+    data = _kucoin_signed_get("https://api-futures.kucoin.com", "/api/v1/positions", api_key, api_secret, api_passphrase)
+    items = data.get("data") or []
+    return {
+        p["symbol"]: int(p["openingTimestamp"])
+        for p in items if p.get("isOpen") and float(p.get("currentQty", 0) or 0) != 0
+    }
 
 
 # ── Опрос всех подключённых бирж за произвольный период ──────────────────────
