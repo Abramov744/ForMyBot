@@ -517,7 +517,7 @@ def _fetch_evm_chainlist(api_key: str) -> list:
     return chains
 
 
-def _fetch_uniswap_chain_transfers(chain_id: int, api_key: str, wallet: str) -> list:
+def _fetch_chain_token_transfers(chain_id: int, api_key: str, wallet: str) -> list:
     """До 1000 последних ERC-20-переводов кошелька на конкретной сети, без
     диапазона блоков — фильтруем по времени уже на своей стороне. Это на один
     запрос дешевле на КАЖДУЮ из ~50+ сетей, чем сначала переводить время в номер
@@ -525,7 +525,12 @@ def _fetch_uniswap_chain_transfers(chain_id: int, api_key: str, wallet: str) -> 
     запасом покрывают любое разумное окно поиска (если у кошелька на конкретной
     сети активность настолько высокая, что нужная сделка вышла за пределы
     последних 1000 переводов — она не найдётся, это осознанный компромисс ради
-    скорости при опросе полусотни сетей разом)."""
+    скорости при опросе полусотни сетей разом).
+
+    Название общее (не "uniswap"), потому что вызов ничего специфичного для
+    Uniswap не делает — это просто список ERC-20-переводов кошелька. Кроме
+    поиска цены входа (см. ниже) его переиспользует balances.py для авто-
+    обнаружения токенов на кошельке (Rabby wallet)."""
     data = _etherscan_get({
         "module": "account", "action": "tokentx", "chainid": chain_id,
         "address": wallet, "sort": "desc", "offset": "1000", "page": "1",
@@ -567,7 +572,7 @@ def _fetch_uniswap_spot_trades_all_quotes(secrets: dict, base_asset: str, start_
         if chain_id in _evm_blocked_chains:
             return []  # уже знаем, что сеть недоступна на текущем тарифе/лимите — не дёргаем зря
         try:
-            transfers = _fetch_uniswap_chain_transfers(chain_id, api_key, wallet)
+            transfers = _fetch_chain_token_transfers(chain_id, api_key, wallet)
         except Exception as e:
             msg = str(e).lower()
             if any(kw in msg for kw in _UNSUPPORTED_CHAIN_MSG_KEYWORDS):
