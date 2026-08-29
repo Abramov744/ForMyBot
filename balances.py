@@ -9,10 +9,13 @@
 часть капитала — лонг-хедж) и DeFi-позиции, не имеющие отношения к funding.
 
 Источники и как берётся баланс:
-  - Bybit  — Unified Trading Account (totalEquity) + отдельно Funding-кошелёк
-    (accountType=FUND) — это ДВА разных кошелька у Bybit, и депозиты часто
-    оседают именно в Funding, а не сразу в Unified (см. fetch_bybit_balance
-    про то, почему одного totalEquity оказалось недостаточно).
+  - Bybit  — Unified Trading Account (totalEquity) + Funding-кошелёк + Earn
+    (Flexible Savings/стейкинг) + Spot Grid Bot + крипто-займы (net) — у
+    Bybit деньги могут лежать в ПЯТИ разных местах одновременно, и каждое
+    требует своего запроса (см. докстринги fetch_bybit_*_balance — там же и
+    разница в степени уверенности: Unified/Funding проверены на практике,
+    Grid Bot и крипто-займы — экспериментально, документация Bybit не даёт
+    точных полей ответа).
   - MEXC   — отдельно фьючерсный (тот же API, что и funding_report.fetch_mexc)
     и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
   - Gate   — отдельно фьючерсный и спот-баланс, обе подписи запросов — тот же
@@ -54,6 +57,7 @@ Etherscan) и Fluid сознательно НЕ мониторятся:
 
 import hashlib
 import hmac
+import json
 import os
 import time
 import urllib.parse
@@ -222,36 +226,220 @@ def _bybit_signed_get(path: str, params_list: list, api_key: str, api_secret: st
     return data
 
 
+def _bybit_signed_post(path: str, body: dict, api_key: str, api_secret: str) -> dict:
+    """
+    POST-вариант _bybit_signed_get — нужен для Trading Bot API (список ботов
+    и детали конкретного бота отдаются только через POST). Формула подписи
+    та же самая (funding_report._bybit_sign): вместо query_string подписывается
+    JSON-тело запроса КАК ЕСТЬ (та же строка, что отправляется в body) —
+    поэтому важно сериализовать json.dumps один раз и переиспользовать
+    строку и для подписи, и для самого запроса.
+    """
+    base_url = "https://api.bybit.com"
+    recv_window = "5000"
+    api_key, api_secret = api_key.strip(), api_secret.strip()
+
+    timestamp = str(int(time.time() * 1000))
+    body_str = json.dumps(body)
+    sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, body_str)
+    headers = {
+        "X-BAPI-API-KEY": api_key, "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(f"{base_url}{path}", headers=headers, data=body_str, timeout=30, proxies=_get_proxies())
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode", 0) != 0:
+        raise RuntimeError(f"Bybit {path} error {data.get('retCode')}: {data.get('retMsg')}")
+    return data
+
+
+def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> float:
+    """
+    GET /v5/earn/position, отдельно category=FlexibleSaving и category=OnChain
+    (стейкинг) — category обязателен, одним запросом оба сразу не получить.
+    Поле amount — принципал позиции в единицах самой монеты (не в USD),
+    оцениваем через price_spot_balances_usd. Накопленные, но ещё не
+    зачисленные проценты (claimableYield и т.п.) сознательно не считаем —
+    это не деньги "на счету", а то, что можно ЗАБРАТЬ, разумно исключить,
+    чтобы не завышать баланс тем, чего ещё физически нет.
+    """
+    coins: dict = {}
+    for category in ("FlexibleSaving", "OnChain"):
+        try:
+            data = _bybit_signed_get("/v5/earn/position", [("category", category)], api_key, api_secret)
+        except Exception as e:
+            print(f"[balances/bybit/earn] Категория {category}: {e}")
+            continue
+        for pos in data.get("result", {}).get("list", []):
+            coin = pos.get("coin")
+            try:
+                amount = float(pos.get("amount", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if coin and amount > 0:
+                coins[coin] = coins.get(coin, 0.0) + amount
+    return price_spot_balances_usd(coins)
+
+
+def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> float:
+    """
+    Средства в запущенном Spot Grid Bot — ОТДЕЛЬНЫЙ от Unified/Funding пул:
+    при создании бота Bybit сам переводит нужную сумму ИЗ Funding-кошелька
+    под управление бота, поэтому без этого запроса такие деньги не видны
+    вообще нигде в остальном балансе (см. README).
+
+    ЭКСПЕРИМЕНТАЛЬНО, ниже уверенность, чем у остального кода в этом файле:
+    официальная документация Bybit не даёт готового примера ответа с суммой
+    инвестиций бота — только что она вообще где-то в структуре ответа
+    детального эндпоинта есть. Поэтому: 1) список запущенных ботов — через
+    POST /v5/botsummary/list-all-bots (status=0 — только запущенные), тип
+    BOT_TYPE_ENUM_GRID_SPOT — фьючерсные грид/мартингейл-боты НЕ считаем: их
+    маржа остаётся частью Unified Trading Account (totalEquity), в отличие
+    от спот-бота; 2) для каждого найденного бота — POST
+    /v5/grid/query-grid-detail с его gridId; 3) сумма инвестиций ищется
+    перебором нескольких вероятных имён поля (тот же приём, что и для
+    Lighter в fetch_lighter_balance) — если реальный ответ окажется другим,
+    просто вернётся 0 для этого бота, а не исключение.
+    """
+    try:
+        summary = _bybit_signed_post(
+            "/v5/botsummary/list-all-bots",
+            {"status": 0, "page": 0, "limit": 50, "type": "BOT_TYPE_ENUM_GRID_SPOT"},
+            api_key, api_secret,
+        )
+    except Exception as e:
+        print(f"[balances/bybit/grid] Список ботов: {e}")
+        return 0.0
+
+    total_usd = 0.0
+    for bot in summary.get("result", {}).get("bots", []):
+        grid = bot.get("grid", {}) or {}
+        grid_id = grid.get("grid_id") or grid.get("gridId")
+        if not grid_id:
+            continue
+        try:
+            detail = _bybit_signed_post(
+                "/v5/grid/query-grid-detail", {"gridId": grid_id}, api_key, api_secret,
+            )
+        except Exception as e:
+            print(f"[balances/bybit/grid] Детали бота {grid_id}: {e}")
+            continue
+
+        result = detail.get("result", {}) or {}
+        d = result.get("detail", result)
+        for key in ("totalInvestment", "investment", "totalInvestAmount", "investAmount", "quoteInvestment"):
+            if d.get(key) is not None:
+                try:
+                    total_usd += float(d[key])
+                    break
+                except (TypeError, ValueError):
+                    continue
+    return total_usd
+
+
+def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> float:
+    """
+    Крипто-займы (залоговое кредитование) — чистая стоимость (залог минус
+    долг), GET /v5/crypto-loan-common/position (текущий "общий" эндпоинт,
+    без параметров).
+
+    ЭКСПЕРИМЕНТАЛЬНО, как и fetch_bybit_grid_bot_balance выше: официальная
+    документация не даёт примера JSON-ответа с полями залога/долга, поэтому
+    имена полей перебираются по нескольким вероятным вариантам. Залог и долг
+    в ответе — предположительно по каждой монете отдельно (не сразу в USD),
+    оцениваются через price_spot_balances_usd.
+    """
+    try:
+        data = _bybit_signed_get("/v5/crypto-loan-common/position", [], api_key, api_secret)
+    except Exception as e:
+        print(f"[balances/bybit/crypto-loan] {e}")
+        return 0.0
+
+    result = data.get("result", {}) or {}
+    positions = result.get("list") if isinstance(result.get("list"), list) else [result]
+
+    collateral_coins: dict = {}
+    debt_coins: dict = {}
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        for key in ("collateralCoin", "collateralCurrency"):
+            coin = pos.get(key)
+            if coin:
+                for amt_key in ("collateralAmount", "collateralQty", "collateralBalance"):
+                    if pos.get(amt_key) is not None:
+                        try:
+                            collateral_coins[coin] = collateral_coins.get(coin, 0.0) + float(pos[amt_key])
+                        except (TypeError, ValueError):
+                            pass
+                        break
+                break
+        for key in ("loanCoin", "loanCurrency"):
+            coin = pos.get(key)
+            if coin:
+                for amt_key in ("totalDebt", "loanAmount", "debtAmount", "liability"):
+                    if pos.get(amt_key) is not None:
+                        try:
+                            debt_coins[coin] = debt_coins.get(coin, 0.0) + float(pos[amt_key])
+                        except (TypeError, ValueError):
+                            pass
+                        break
+                break
+
+    return price_spot_balances_usd(collateral_coins) - price_spot_balances_usd(debt_coins)
+
+
 def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
     """
-    Unified Trading Account (totalEquity, /v5/account/wallet-balance) —
-    объединяет спот и деривативы в один баланс — ПЛЮС отдельно Funding-
-    кошелёк (/v5/asset/transfer/query-account-coins-balance, accountType=FUND).
+    Unified Trading Account (totalEquity, /v5/account/wallet-balance) +
+    Funding-кошелёк + Earn (Flexible Savings/стейкинг) + Spot Grid Bot +
+    крипто-займы (net) — у Bybit это ПЯТЬ разных мест, где могут лежать
+    деньги, и каждое требует своего запроса (см. докстринги отдельных
+    fetch_bybit_*_balance выше — там же и разница в степени уверенности:
+    Unified/Funding проверены на практике, Earn документирован уверенно,
+    Grid Bot и крипто-займы — экспериментально).
 
-    Это два РАЗНЫХ кошелька у Bybit: депозиты по умолчанию оседают в Funding
-    и не видны в Unified, пока их явно не перевести — этим и объяснялась
-    жалоба "у Bybit не все суммы учтены" (было только totalEquity). Funding
-    отдаёт баланс по каждой монете отдельно (не сразу в USD, в отличие от
-    totalEquity) — оцениваем в USD через price_spot_balances_usd (стейблкоины
-    по номиналу, остальное — CoinGecko).
+    Ошибка в любой ОТДЕЛЬНОЙ части (кроме Unified — без него нет смысла
+    продолжать) не должна занижать баланс молча до нуля и не должна ронять
+    весь Bybit — считаем что смогли, про остальное печатаем в лог.
     """
     unified = _bybit_signed_get(
         "/v5/account/wallet-balance", [("accountType", "UNIFIED")], api_key, api_secret,
     )
     lst = unified.get("result", {}).get("list", [])
-    unified_usd = float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
+    total = float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
 
-    funding = _bybit_signed_get(
-        "/v5/asset/transfer/query-account-coins-balance", [("accountType", "FUND")], api_key, api_secret,
-    )
-    funding_coins = {
-        c["coin"]: float(c.get("walletBalance", 0) or 0)
-        for c in funding.get("result", {}).get("balance", [])
-        if float(c.get("walletBalance", 0) or 0) > 0
-    }
-    funding_usd = price_spot_balances_usd(funding_coins)
+    try:
+        funding = _bybit_signed_get(
+            "/v5/asset/transfer/query-account-coins-balance", [("accountType", "FUND")], api_key, api_secret,
+        )
+        funding_coins = {
+            c["coin"]: float(c.get("walletBalance", 0) or 0)
+            for c in funding.get("result", {}).get("balance", [])
+            if float(c.get("walletBalance", 0) or 0) > 0
+        }
+        total += price_spot_balances_usd(funding_coins)
+    except Exception as e:
+        print(f"[balances/bybit/funding] {e}")
 
-    return unified_usd + funding_usd
+    try:
+        total += fetch_bybit_earn_balance(api_key, api_secret)
+    except Exception as e:
+        print(f"[balances/bybit/earn] {e}")
+
+    try:
+        total += fetch_bybit_grid_bot_balance(api_key, api_secret)
+    except Exception as e:
+        print(f"[balances/bybit/grid] {e}")
+
+    try:
+        total += fetch_bybit_crypto_loan_balance(api_key, api_secret)
+    except Exception as e:
+        print(f"[balances/bybit/crypto-loan] {e}")
+
+    return total
 
 
 def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
