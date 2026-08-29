@@ -289,7 +289,7 @@ def fetch_bybit_earn_balance(api_key: str, api_secret: str) -> tuple[float, list
     return price_spot_balances_usd(coins), errors
 
 
-def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, str | None]:
+def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, str]:
     """
     Средства в запущенном Spot Grid Bot — ОТДЕЛЬНЫЙ от Unified/Funding пул:
     при создании бота Bybit сам переводит нужную сумму ИЗ Funding-кошелька
@@ -308,12 +308,13 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
     перебором нескольких вероятных имён поля (тот же приём, что и для
     Lighter в fetch_lighter_balance).
 
-    Возвращает (сумма, текст ошибки или None) — см. докстринг
-    fetch_bybit_earn_balance про то, зачем текст ошибки идёт наружу, а не
-    только в лог. Если запущенных ботов 0 (а не ошибка) — это НЕ ошибка,
-    сумма просто 0 и errors=None; если бот найден, но ни одно из вероятных
-    имён поля инвестиций не совпало — это тоже не считается ошибкой (сумма
-    для этого бота 0), потому что сама структура нам заранее неизвестна.
+    Возвращает (сумма, диагностическая заметка) — заметка заполняется
+    ВСЕГДА, не только при ошибке: для этой экспериментальной части "0 и всё
+    в порядке" ничем не отличается от "0 из-за того, что не совпало
+    угаданное имя поля" без явного объяснения, что именно было найдено —
+    именно это и не получилось различить в первый раз (см. историю PR:
+    "Spot Grid Bot: $0.00" без ошибки — а был ли бот вообще найден,
+    оставалось неизвестным).
     """
     try:
         summary = _bybit_signed_post(
@@ -322,15 +323,21 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
             api_key, api_secret,
         )
     except Exception as e:
-        return 0.0, f"список ботов: {e}"
+        return 0.0, f"не удалось получить список ботов: {e}"
 
     bots = summary.get("result", {}).get("bots", [])
+    if not bots:
+        return 0.0, "запущенных Spot Grid ботов не найдено (status=0 — если бот на паузе, а не полностью остановлен, он может не попасть в этот список)"
+
     total_usd = 0.0
+    matched_count = 0
+    unmatched_ids = []
     detail_errors = []
     for bot in bots:
         grid = bot.get("grid", {}) or {}
         grid_id = grid.get("grid_id") or grid.get("gridId")
         if not grid_id:
+            unmatched_ids.append("без grid_id в ответе списка")
             continue
         try:
             detail = _bybit_signed_post(
@@ -342,23 +349,72 @@ def fetch_bybit_grid_bot_balance(api_key: str, api_secret: str) -> tuple[float, 
 
         result = detail.get("result", {}) or {}
         d = result.get("detail", result)
+        matched = False
         for key in ("totalInvestment", "investment", "totalInvestAmount", "investAmount", "quoteInvestment"):
             if d.get(key) is not None:
                 try:
                     total_usd += float(d[key])
+                    matched_count += 1
+                    matched = True
                     break
                 except (TypeError, ValueError):
                     continue
+        if not matched:
+            unmatched_ids.append(str(grid_id))
 
-    error = f"боты найдены ({len(bots)}), но детали не получены: {'; '.join(detail_errors)}" if detail_errors else None
-    return total_usd, error
+    notes = [f"найдено ботов: {len(bots)}"]
+    if matched_count:
+        notes.append(f"сумма прочитана у {matched_count}")
+    if unmatched_ids:
+        notes.append(f"не удалось прочитать сумму у {len(unmatched_ids)} ({', '.join(unmatched_ids)}) — вероятно, неверное имя поля в query-grid-detail")
+    if detail_errors:
+        notes.append(f"ошибка деталей: {'; '.join(detail_errors)}")
+    return total_usd, "; ".join(notes)
 
 
-def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[float, str | None]:
+def _bybit_extract_loan_position(pos: dict, collateral_coins: dict, debt_coins: dict) -> bool:
+    """Разбирает одну позицию крипто-займа в collateral_coins/debt_coins
+    (мутирует их на месте). Возвращает True, если удалось распознать хотя бы
+    одно из двух (залог или долг) — используется вызывающим кодом только для
+    диагностики ("нашли позиции, но не смогли прочитать суммы")."""
+    matched = False
+    for key in ("collateralCoin", "collateralCurrency"):
+        coin = pos.get(key)
+        if coin:
+            for amt_key in ("collateralAmount", "collateralQty", "collateralBalance"):
+                if pos.get(amt_key) is not None:
+                    try:
+                        collateral_coins[coin] = collateral_coins.get(coin, 0.0) + float(pos[amt_key])
+                        matched = True
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            break
+    for key in ("loanCoin", "loanCurrency"):
+        coin = pos.get(key)
+        if coin:
+            for amt_key in ("totalDebt", "loanAmount", "debtAmount", "liability"):
+                if pos.get(amt_key) is not None:
+                    try:
+                        debt_coins[coin] = debt_coins.get(coin, 0.0) + float(pos[amt_key])
+                        matched = True
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            break
+    return matched
+
+
+def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[float, str]:
     """
     Крипто-займы (залоговое кредитование) — чистая стоимость (залог минус
-    долг), GET /v5/crypto-loan-common/position (текущий "общий" эндпоинт,
-    без параметров).
+    долг). У Bybit это ТРИ разных продукта с разными эндпоинтами (общий,
+    гибкий, фиксированный срок) — опрашиваются все три, у "общего" (common)
+    без параметров, у гибкого (flexible) — список активных займов по
+    монетам, у займа с фиксированным сроком (fixed) он один на orderId,
+    поэтому без списка активных orderId'ов его отдельно не опросить —
+    сознательно пропущен, если есть именно такой займ, чистая позиция будет
+    занижена (см. заметку в отчёте, если сумма расходится с реальной).
 
     ЭКСПЕРИМЕНТАЛЬНО, как и fetch_bybit_grid_bot_balance выше: официальная
     документация не даёт примера JSON-ответа с полями залога/долга, поэтому
@@ -366,46 +422,47 @@ def fetch_bybit_crypto_loan_balance(api_key: str, api_secret: str) -> tuple[floa
     в ответе — предположительно по каждой монете отдельно (не сразу в USD),
     оцениваются через price_spot_balances_usd.
 
-    Возвращает (сумма, текст ошибки или None).
+    Возвращает (сумма, диагностическая заметка) — см. докстринг
+    fetch_bybit_grid_bot_balance про то, почему заметка нужна даже когда
+    ошибки формально нет.
     """
-    try:
-        data = _bybit_signed_get("/v5/crypto-loan-common/position", [], api_key, api_secret)
-    except Exception as e:
-        return 0.0, str(e)
-
-    result = data.get("result", {}) or {}
-    positions = result.get("list") if isinstance(result.get("list"), list) else [result]
-
     collateral_coins: dict = {}
     debt_coins: dict = {}
-    for pos in positions:
-        if not isinstance(pos, dict):
-            continue
-        for key in ("collateralCoin", "collateralCurrency"):
-            coin = pos.get(key)
-            if coin:
-                for amt_key in ("collateralAmount", "collateralQty", "collateralBalance"):
-                    if pos.get(amt_key) is not None:
-                        try:
-                            collateral_coins[coin] = collateral_coins.get(coin, 0.0) + float(pos[amt_key])
-                        except (TypeError, ValueError):
-                            pass
-                        break
-                break
-        for key in ("loanCoin", "loanCurrency"):
-            coin = pos.get(key)
-            if coin:
-                for amt_key in ("totalDebt", "loanAmount", "debtAmount", "liability"):
-                    if pos.get(amt_key) is not None:
-                        try:
-                            debt_coins[coin] = debt_coins.get(coin, 0.0) + float(pos[amt_key])
-                        except (TypeError, ValueError):
-                            pass
-                        break
-                break
+    positions_found = 0
+    positions_matched = 0
+    endpoint_errors = []
+
+    def _pull(path: str, params_list: list):
+        nonlocal positions_found, positions_matched
+        try:
+            data = _bybit_signed_get(path, params_list, api_key, api_secret)
+        except Exception as e:
+            endpoint_errors.append(f"{path}: {e}")
+            return
+        result = data.get("result", {}) or {}
+        positions = result.get("list") if isinstance(result.get("list"), list) else ([result] if result else [])
+        for pos in positions:
+            if not isinstance(pos, dict) or not pos:
+                continue
+            positions_found += 1
+            if _bybit_extract_loan_position(pos, collateral_coins, debt_coins):
+                positions_matched += 1
+
+    _pull("/v5/crypto-loan-common/position", [])
+    _pull("/v5/crypto-loan-flexible/ongoing-coin", [])
 
     net = price_spot_balances_usd(collateral_coins) - price_spot_balances_usd(debt_coins)
-    return net, None
+
+    if not positions_found and not endpoint_errors:
+        note = "открытых займов не найдено (common + flexible; фиксированный срок — не опрашивается, см. докстринг)"
+    else:
+        notes = []
+        if positions_found:
+            notes.append(f"найдено позиций: {positions_found}, суммы прочитаны у {positions_matched}")
+        if endpoint_errors:
+            notes.append("; ".join(endpoint_errors))
+        note = "; ".join(notes)
+    return net, note
 
 
 def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
@@ -456,21 +513,28 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     except Exception as e:
         parts["earn"] = {"value": 0.0, "error": str(e)}
 
+    # Grid Bot и крипто-займы — экспериментальные части: диагностическая
+    # заметка (note) заполняется ВСЕГДА, а не только при ошибке (см.
+    # докстринги fetch_bybit_grid_bot_balance/fetch_bybit_crypto_loan_balance)
+    # — "error" тут используется только если сама функция неожиданно упала
+    # исключением мимо своего внутреннего try/except.
     try:
-        grid_usd, grid_error = fetch_bybit_grid_bot_balance(api_key, api_secret)
-        parts["grid_bot"] = {"value": grid_usd, "error": grid_error}
+        grid_usd, grid_note = fetch_bybit_grid_bot_balance(api_key, api_secret)
+        parts["grid_bot"] = {"value": grid_usd, "error": None, "note": grid_note}
     except Exception as e:
-        parts["grid_bot"] = {"value": 0.0, "error": str(e)}
+        parts["grid_bot"] = {"value": 0.0, "error": str(e), "note": None}
 
     try:
-        loan_usd, loan_error = fetch_bybit_crypto_loan_balance(api_key, api_secret)
-        parts["crypto_loan"] = {"value": loan_usd, "error": loan_error}
+        loan_usd, loan_note = fetch_bybit_crypto_loan_balance(api_key, api_secret)
+        parts["crypto_loan"] = {"value": loan_usd, "error": None, "note": loan_note}
     except Exception as e:
-        parts["crypto_loan"] = {"value": 0.0, "error": str(e)}
+        parts["crypto_loan"] = {"value": 0.0, "error": str(e), "note": None}
 
     for name, p in parts.items():
         if p["error"]:
             print(f"[balances/bybit/{name}] {p['error']}")
+        elif p.get("note"):
+            print(f"[balances/bybit/{name}] {p['note']}")
 
     total = sum(p["value"] for p in parts.values())
     return {"total": total, "parts": parts}
@@ -858,6 +922,8 @@ def build_balances_report(result: dict) -> str:
                 part_label = _BYBIT_PART_LABELS.get(part_name, part_name)
                 if p["error"]:
                     lines.append(f"  · {part_label}: ${p['value']:,.2f} ⚠️ {p['error']}")
+                elif p.get("note"):
+                    lines.append(f"  · {part_label}: ${p['value']:,.2f} ℹ️ {p['note']}")
                 else:
                     lines.append(f"  · {part_label}: ${p['value']:,.2f}")
 
