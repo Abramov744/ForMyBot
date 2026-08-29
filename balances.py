@@ -18,8 +18,10 @@
     мониторится — см. ниже.
   - MEXC   — отдельно фьючерсный (тот же API, что и funding_report.fetch_mexc)
     и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
-  - Gate   — отдельно фьючерсный и спот-баланс, обе подписи запросов — тот же
-    HMAC-SHA512-механизм, что уже используется в funding_report._gate_sign.
+  - Gate   — отдельно фьючерсный (кошелёк + нереализованный PnL открытых
+    позиций, поле unrealised_pnl — тот же случай, что и у Aster/Lighter
+    ниже) и спот-баланс, обе подписи запросов — тот же HMAC-SHA512-
+    механизм, что уже используется в funding_report._gate_sign.
   - Aster  — баланс кошелька + нереализованный PnL открытых позиций
     (positionRisk, поле unRealizedProfit — тот же эндпоинт и то же поле,
     что использует Binance Futures API, форком которого является Aster;
@@ -559,8 +561,18 @@ def fetch_mexc_spot_balance(api_key: str, api_secret: str) -> dict:
 
 
 def fetch_gate_futures_balance(api_key: str, api_secret: str, settle: str = "usdt") -> float:
-    """GET /api/v4/futures/{settle}/accounts → поле total. Та же подпись
-    (funding_report._gate_sign), что и остальные Gate-запросы."""
+    """
+    GET /api/v4/futures/{settle}/accounts → total + unrealised_pnl. Та же
+    подпись (funding_report._gate_sign), что и остальные Gate-запросы.
+
+    ПОДТВЕРЖДЕНО по официальной модели FuturesAccount (gateapi-go,
+    model_futures_account.go): total — это "balance after the user's
+    accumulated deposit, withdraw, profit and loss ... excluding unrealized
+    profit and loss" — то есть баланс кошелька БЕЗ учёта текущего результата
+    по открытым позициям, тот же случай, что уже был у Aster
+    (unRealizedProfit) и Lighter (unrealized_pnl) — без отдельного поля
+    unrealised_pnl баланс не совпадал с реальным при открытых позициях.
+    """
     base_url = "https://api.gateio.ws"
     url_path = f"/api/v4/futures/{settle}/accounts"
     api_key, api_secret = api_key.strip(), api_secret.strip()
@@ -573,7 +585,9 @@ def fetch_gate_futures_balance(api_key: str, api_secret: str, settle: str = "usd
     data = resp.json()
     if isinstance(data, dict) and data.get("label"):
         raise RuntimeError(f"Gate futures accounts error {data.get('label')}: {data.get('message')}")
-    return float(data.get("total", 0) or 0)
+    total = float(data.get("total", 0) or 0)
+    unrealised_pnl = float(data.get("unrealised_pnl", 0) or 0)
+    return total + unrealised_pnl
 
 
 def fetch_gate_spot_balance(api_key: str, api_secret: str) -> dict:
