@@ -49,6 +49,7 @@ import threading
 
 from flask import Flask, Response, jsonify, request
 
+import balances
 import calculator
 import entry_price
 from bot_worker import poll_forever
@@ -117,6 +118,11 @@ def healthz():
 @app.route("/")
 def index():
     return Response(CALCULATOR_HTML, mimetype="text/html")
+
+
+@app.route("/balances")
+def balances_page():
+    return Response(BALANCES_HTML, mimetype="text/html")
 
 
 # ── API ──────────────────────────────────────────────────────────────────────
@@ -205,6 +211,22 @@ def api_calculate():
     return jsonify(result)
 
 
+@app.route("/api/balances")
+def api_balances():
+    """
+    Сводный баланс по всем источникам (см. balances.fetch_all_balances) —
+    может занимать до ~30 секунд из-за полного скана EVM-сетей под Rabby
+    wallet (см. докстринг balances.fetch_wallet_balance), поэтому страница
+    /balances показывает состояние загрузки, а не блокирует интерфейс молча.
+    """
+    secrets = get_secrets()
+    try:
+        result = balances.fetch_all_balances(secrets)
+    except Exception as e:
+        return jsonify({"error": f"Ошибка при сборе балансов: {e}"}), 502
+    return jsonify(result)
+
+
 # ── HTML (без внешних зависимостей — CSS/JS инлайн) ───────────────────────────
 
 CALCULATOR_HTML = r"""<!doctype html>
@@ -263,7 +285,9 @@ CALCULATOR_HTML = r"""<!doctype html>
 <body>
 
 <h1>Калькулятор комиссий за funding</h1>
-<div class="sub">Шорт на фьючерсах + лонг на споте — доход считается только с фьючерсной ноги. Период — по UTC.</div>
+<div class="sub">Шорт на фьючерсах + лонг на споте — доход считается только с фьючерсной ноги. Период — по UTC.
+  &nbsp;·&nbsp;<a href="/balances" style="color:var(--accent);">Сводный баланс →</a>
+</div>
 
 <div class="layout">
   <div class="panel">
@@ -523,6 +547,179 @@ document.getElementById('calcBtn').addEventListener('click', calculate);
 
 setDefaultDates();
 loadExchanges();
+</script>
+</body>
+</html>
+"""
+
+
+BALANCES_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сводный баланс</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💰</text></svg>">
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161d2e; --border: #2a3348; --text: #e6ebf5;
+    --muted: #8b96ab; --accent: #4f8cff; --pos: #3ecf8e; --neg: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .sub a { color: var(--accent); }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .stat .value { font-size: 20px; font-weight: 700; }
+  .pos { color: var(--pos); } .neg { color: var(--neg); } .muted { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+  .err { color: var(--neg); }
+  .loading { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Сводный баланс</h1>
+<div class="sub">Биржи + Rabby wallet + Aave (on-chain), суммарно в USD. &nbsp;·&nbsp; <a href="/">← Калькулятор funding</a></div>
+
+<div id="loading" class="loading">⏳ Собираю данные (биржи + скан EVM-сетей кошелька — может занять до ~30 секунд)…</div>
+<div id="errorBox" class="err" style="display:none;"></div>
+<div id="content" style="display:none;">
+  <div class="stat-grid" id="statGrid"></div>
+
+  <div class="panel">
+    <h2>Биржи</h2>
+    <div id="exchangesTable"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Rabby wallet (on-chain)</h2>
+    <div id="walletTable"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Aave v3 (on-chain)</h2>
+    <div id="aaveTable"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Fluid</h2>
+    <div class="empty">Автоматический опрос баланса пока не подключён — см. комментарий у
+      <code>fetch_fluid_balance</code> в <code>balances.py</code>.</div>
+  </div>
+</div>
+
+<script>
+function fmt(n, digits) {
+  digits = digits === undefined ? 2 : digits;
+  return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', mexc: 'MEXC', gate: 'Gate' };
+
+function renderExchanges(exchanges) {
+  const rows = Object.entries(exchanges);
+  if (rows.length === 0) { return '<div class="empty">Нет подключённых бирж</div>'; }
+  let html = '<table><thead><tr><th>Биржа</th><th>Баланс, $</th></tr></thead><tbody>';
+  for (const [key, v] of rows) {
+    const label = EXCHANGE_LABELS[key] || key;
+    if (v.error) {
+      html += `<tr><td>${label}</td><td class="err">Ошибка: ${v.error}</td></tr>`;
+    } else {
+      html += `<tr><td>${label}</td><td>${fmt(v.value)}</td></tr>`;
+    }
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderWallet(wallet) {
+  if (!wallet) return '<div class="empty">Не настроено — задайте RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY.</div>';
+  if (wallet.error) return `<div class="err">Ошибка: ${wallet.error}</div>`;
+  const chainIds = Object.keys(wallet.chains || {});
+  if (chainIds.length === 0) return '<div class="empty">Ненулевых балансов не найдено ни на одной сети.</div>';
+
+  let html = '<table><thead><tr><th>Сеть</th><th>Актив</th><th>Кол-во</th><th>Оценка, $</th></tr></thead><tbody>';
+  for (const chainId of chainIds) {
+    const c = wallet.chains[chainId];
+    const rowsForChain = [c.native, ...c.tokens];
+    rowsForChain.forEach((r, i) => {
+      const chainCell = i === 0 ? c.chain_name : '';
+      const usd = r.price_usd == null ? '<span class="muted">нет цены</span>' : fmt(r.amount * r.price_usd);
+      html += `<tr><td>${chainCell}</td><td>${r.symbol}</td><td>${fmt(r.amount, 6)}</td><td>${usd}</td></tr>`;
+    });
+  }
+  html += '</tbody></table>';
+  if (wallet.unpriced && wallet.unpriced.length) {
+    html += `<div class="hint" style="margin-top:8px;color:var(--muted);font-size:12px;">Без оценки в USD: ${wallet.unpriced.join(', ')}</div>`;
+  }
+  return html;
+}
+
+function renderAave(aave) {
+  if (!aave) return '<div class="empty">Не настроено — нужны те же RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY.</div>';
+  if (aave.error) return `<div class="err">Ошибка: ${aave.error}</div>`;
+  const chainIds = Object.keys(aave);
+  if (chainIds.length === 0) return '<div class="empty">Открытых позиций на Aave v3 не найдено.</div>';
+
+  const CHAIN_NAMES = { '1': 'Ethereum', '42161': 'Arbitrum One', '8453': 'Base' };
+  let html = '<table><thead><tr><th>Сеть</th><th>Обеспечение, $</th><th>Долг, $</th><th>Чистая позиция, $</th></tr></thead><tbody>';
+  for (const chainId of chainIds) {
+    const p = aave[chainId];
+    const cls = p.net_usd >= 0 ? 'pos' : 'neg';
+    html += `<tr><td>${CHAIN_NAMES[chainId] || chainId}</td><td>${fmt(p.collateral_usd)}</td><td>${fmt(p.debt_usd)}</td><td class="${cls}">${fmt(p.net_usd)}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  return html;
+}
+
+async function load() {
+  try {
+    const resp = await fetch('/api/balances');
+    const data = await resp.json();
+    document.getElementById('loading').style.display = 'none';
+    if (!resp.ok) {
+      const errorBox = document.getElementById('errorBox');
+      errorBox.textContent = data.error || 'Ошибка загрузки';
+      errorBox.style.display = 'block';
+      return;
+    }
+
+    let aaveNet = 0;
+    if (data.aave && !data.aave.error) {
+      aaveNet = Object.values(data.aave).reduce((s, p) => s + p.net_usd, 0);
+    }
+    document.getElementById('statGrid').innerHTML = `
+      <div class="stat"><div class="label">Итого по всем источникам</div><div class="value pos">$${fmt(data.total_usd)}</div></div>
+      <div class="stat"><div class="label">Из них Aave (net)</div><div class="value">$${fmt(aaveNet)}</div></div>
+      <div class="stat"><div class="label">Из них Rabby wallet</div><div class="value">$${fmt(data.wallet && !data.wallet.error ? data.wallet.total_usd : 0)}</div></div>
+    `;
+
+    document.getElementById('exchangesTable').innerHTML = renderExchanges(data.exchanges || {});
+    document.getElementById('walletTable').innerHTML = renderWallet(data.wallet);
+    document.getElementById('aaveTable').innerHTML = renderAave(data.aave);
+    document.getElementById('content').style.display = 'block';
+  } catch (e) {
+    document.getElementById('loading').style.display = 'none';
+    const errorBox = document.getElementById('errorBox');
+    errorBox.textContent = 'Не удалось связаться с сервером: ' + e;
+    errorBox.style.display = 'block';
+  }
+}
+
+load();
 </script>
 </body>
 </html>

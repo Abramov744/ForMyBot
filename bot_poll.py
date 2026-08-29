@@ -24,6 +24,9 @@
   /rates                    — ПРОГНОЗНАЯ ставка funding по открытым сейчас
                              позициям на следующую выплату (см. funding_alerts.py
                              — та же логика, что и в фоновых алертах)
+  /balance                  — сводный баланс по всем биржам + Rabby wallet +
+                             Aave (см. balances.py); подробная разбивка по
+                             сетям/токенам — на веб-странице /balances
 """
 
 import calendar as calendar_mod
@@ -45,12 +48,14 @@ from funding_report import (
 )
 from funding_alerts import build_predicted_rates_report
 from funding_chart import build_positions_apr_chart
+from balances import fetch_all_balances, build_balances_report
 
 # /report, /report@ИмяБота, с необязательным аргументом-датой после пробела
 COMMAND_RE = re.compile(r"^/report(?:@\w+)?\s*(.*)$", re.IGNORECASE)
 CALENDAR_RE = re.compile(r"^/calendar(?:@\w+)?\s*$", re.IGNORECASE)
 POSITIONS_RE = re.compile(r"^/positions(?:@\w+)?\s*$", re.IGNORECASE)
 RATES_RE = re.compile(r"^/rates(?:@\w+)?\s*$", re.IGNORECASE)
+BALANCE_RE = re.compile(r"^/balance(?:@\w+)?\s*$", re.IGNORECASE)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 START_RE = re.compile(r"^/(start|menu)(?:@\w+)?\s*$", re.IGNORECASE)
 
@@ -60,6 +65,7 @@ BUTTON_REPORT = "📊 Отчёт за вчера"
 BUTTON_CALENDAR = "📅 Календарь"
 BUTTON_POSITIONS = "📈 Открытые позиции"
 BUTTON_RATES = "🔮 Ставка финансирования"
+BUTTON_BALANCE = "💰 Баланс"
 
 MONTH_NAMES_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
@@ -82,6 +88,7 @@ def build_main_menu_keyboard() -> dict:
             [{"text": BUTTON_CALENDAR}],
             [{"text": BUTTON_POSITIONS}],
             [{"text": BUTTON_RATES}],
+            [{"text": BUTTON_BALANCE}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
@@ -321,6 +328,27 @@ def send_predicted_rates_report(secrets: dict, chat_id: str) -> None:
             print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
 
 
+def send_balances_report(secrets: dict, chat_id: str) -> None:
+    """
+    Сводный баланс по всем биржам + Rabby wallet + Aave (balances.py) — может
+    занять до ~30 секунд из-за полного скана EVM-сетей кошелька, поэтому
+    сразу шлём "жду" сообщение (тот же приём, что и в /positions и /rates).
+    """
+    token = secrets["telegram_token"]
+    try:
+        send_telegram(token, chat_id, "⏳ Собираю балансы (биржи + скан сетей кошелька — может занять до ~30 секунд)…")
+        result = fetch_all_balances(secrets)
+        report = build_balances_report(result)
+        send_telegram(token, chat_id, report)
+        print("Отправлен отчёт по балансам.")
+    except Exception as e:
+        print(f"Ошибка при формировании отчёта по балансам: {e}")
+        try:
+            send_telegram(token, chat_id, f"❌ Не получилось собрать баланс: {e}")
+        except Exception as e2:
+            print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+
+
 # ── Обработка входящих сообщений и нажатий на кнопки ──────────────────────────
 
 def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
@@ -336,7 +364,7 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         send_message(
             token, chat_id,
             "Готов присылать отчёты по funding fee.\n"
-            "Кнопки внизу — под рукой, либо команды /report, /calendar, /positions, /rates текстом.",
+            "Кнопки внизу — под рукой, либо команды /report, /calendar, /positions, /rates, /balance текстом.",
             reply_markup=build_main_menu_keyboard(),
         )
         return
@@ -351,6 +379,8 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
         text = "/report"
     elif text == BUTTON_RATES:
         text = "/rates"
+    elif text == BUTTON_BALANCE:
+        text = "/balance"
 
     if CALENDAR_RE.match(text):
         now_msk = datetime.now(MSK)
@@ -366,6 +396,11 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
     if RATES_RE.match(text):
         print("Обрабатываю команду: '/rates'")
         send_predicted_rates_report(secrets, chat_id)
+        return
+
+    if BALANCE_RE.match(text):
+        print("Обрабатываю команду: '/balance'")
+        send_balances_report(secrets, chat_id)
         return
 
     m = COMMAND_RE.match(text)
