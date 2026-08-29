@@ -213,12 +213,7 @@ def api_calculate():
 
 @app.route("/api/balances")
 def api_balances():
-    """
-    Сводный баланс по всем источникам (см. balances.fetch_all_balances) —
-    может занимать до ~30 секунд из-за полного скана EVM-сетей под Rabby
-    wallet (см. докстринг balances.fetch_wallet_balance), поэтому страница
-    /balances показывает состояние загрузки, а не блокирует интерфейс молча.
-    """
+    """Сводный баланс по всем источникам (см. balances.fetch_all_balances)."""
     secrets = get_secrets()
     try:
         result = balances.fetch_all_balances(secrets)
@@ -592,9 +587,9 @@ BALANCES_HTML = r"""<!doctype html>
 <body>
 
 <h1>Сводный баланс</h1>
-<div class="sub">Биржи + Rabby wallet + Aave (on-chain), суммарно в USD. &nbsp;·&nbsp; <a href="/">← Калькулятор funding</a></div>
+<div class="sub">Биржи + Aave (on-chain), суммарно в USD. &nbsp;·&nbsp; <a href="/">← Калькулятор funding</a></div>
 
-<div id="loading" class="loading">⏳ Собираю данные (биржи + скан EVM-сетей кошелька — может занять до ~30 секунд)…</div>
+<div id="loading" class="loading">⏳ Собираю данные…</div>
 <div id="errorBox" class="err" style="display:none;"></div>
 <div id="content" style="display:none;">
   <div class="stat-grid" id="statGrid"></div>
@@ -602,11 +597,6 @@ BALANCES_HTML = r"""<!doctype html>
   <div class="panel">
     <h2>Биржи</h2>
     <div id="exchangesTable"></div>
-  </div>
-
-  <div class="panel">
-    <h2>Rabby wallet (on-chain)</h2>
-    <div id="walletTable"></div>
   </div>
 
   <div class="panel">
@@ -639,31 +629,8 @@ function renderExchanges(exchanges) {
   return html;
 }
 
-function renderWallet(wallet) {
-  if (!wallet) return '<div class="empty">Не настроено — задайте RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY.</div>';
-  if (wallet.error) return `<div class="err">Ошибка: ${wallet.error}</div>`;
-  const chainIds = Object.keys(wallet.chains || {});
-  if (chainIds.length === 0) return '<div class="empty">Ненулевых балансов не найдено ни на одной сети.</div>';
-
-  let html = '<table><thead><tr><th>Сеть</th><th>Актив</th><th>Кол-во</th><th>Оценка, $</th></tr></thead><tbody>';
-  for (const chainId of chainIds) {
-    const c = wallet.chains[chainId];
-    const rowsForChain = [c.native, ...c.tokens];
-    rowsForChain.forEach((r, i) => {
-      const chainCell = i === 0 ? c.chain_name : '';
-      const usd = r.price_usd == null ? '<span class="muted">нет цены</span>' : fmt(r.amount * r.price_usd);
-      html += `<tr><td>${chainCell}</td><td>${r.symbol}</td><td>${fmt(r.amount, 6)}</td><td>${usd}</td></tr>`;
-    });
-  }
-  html += '</tbody></table>';
-  if (wallet.unpriced && wallet.unpriced.length) {
-    html += `<div class="hint" style="margin-top:8px;color:var(--muted);font-size:12px;">Без оценки в USD: ${wallet.unpriced.join(', ')}</div>`;
-  }
-  return html;
-}
-
 function renderAave(aave) {
-  if (!aave) return '<div class="empty">Не настроено — нужны те же RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY.</div>';
+  if (!aave) return '<div class="empty">Не настроено — задайте RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY.</div>';
   if (aave.error) return `<div class="err">Ошибка: ${aave.error}</div>`;
   const chainIds = Object.keys(aave);
   if (chainIds.length === 0) return '<div class="empty">Открытых позиций на Aave v3 не найдено.</div>';
@@ -698,11 +665,9 @@ async function load() {
     document.getElementById('statGrid').innerHTML = `
       <div class="stat"><div class="label">Итого по всем источникам</div><div class="value pos">$${fmt(data.total_usd)}</div></div>
       <div class="stat"><div class="label">Из них Aave (net)</div><div class="value">$${fmt(aaveNet)}</div></div>
-      <div class="stat"><div class="label">Из них Rabby wallet</div><div class="value">$${fmt(data.wallet && !data.wallet.error ? data.wallet.total_usd : 0)}</div></div>
     `;
 
     document.getElementById('exchangesTable').innerHTML = renderExchanges(data.exchanges || {});
-    document.getElementById('walletTable').innerHTML = renderWallet(data.wallet);
     document.getElementById('aaveTable').innerHTML = renderAave(data.aave);
     document.getElementById('content').style.display = 'block';
   } catch (e) {

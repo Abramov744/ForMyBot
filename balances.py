@@ -9,50 +9,51 @@
 часть капитала — лонг-хедж) и DeFi-позиции, не имеющие отношения к funding.
 
 Источники и как берётся баланс:
-  - Bybit  — Unified Trading Account, totalEquity (споt и деривативы уже
-    объединены биржей в один баланс, в USD).
+  - Bybit  — Unified Trading Account (totalEquity) + отдельно Funding-кошелёк
+    (accountType=FUND) — это ДВА разных кошелька у Bybit, и депозиты часто
+    оседают именно в Funding, а не сразу в Unified (см. fetch_bybit_balance
+    про то, почему одного totalEquity оказалось недостаточно).
   - MEXC   — отдельно фьючерсный (тот же API, что и funding_report.fetch_mexc)
     и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
   - Gate   — отдельно фьючерсный и спот-баланс, обе подписи запросов — тот же
     HMAC-SHA512-механизм, что уже используется в funding_report._gate_sign.
   - Aster  — фьючерсный баланс (споta у Aster нет вовсе, см. README).
   - Lighter — баланс на счету (споta нет, только перпетуалы).
-  - Rabby wallet — ON-CHAIN, без API-ключа биржи: нативный газ-токен и
-    ERC-20-токены кошелька, авто-обнаруженные через историю переводов (тот
-    же Etherscan V2 API и тот же список сетей, что уже используется в
-    entry_price.py для поиска цены входа на Uniswap).
   - Aave v3 — ON-CHAIN, чистая стоимость позиции (обеспечение минус долг)
     через view-функцию Pool.getUserAccountData(address).
 
-Fluid сознательно не мониторится: у него нет простого REST API для чтения
-позиций, только on-chain resolver-контракты со сложным, не до конца
-документированным ABI (вложенные структуры) — разбирать их вслепую для
-финансового инструмента рискованно (см. историю обсуждения в PR), а платный
-DeBank Open API, который эту проблему снимал бы одним универсальным
-запросом, признан слишком дорогим.
+Rabby wallet (сканирование ERC-20/нативных балансов по всем EVM-сетям через
+Etherscan) и Fluid сознательно НЕ мониторятся:
+  - Rabby wallet — полный скан ~60 сетей на каждый вызов был слишком
+    медленным (десятки секунд) и на реальном аккаунте ронял отправку в
+    Telegram (см. send_telegram — сообщение либо не успевало уложиться в
+    таймаут, либо превышало лимит длины сообщения Telegram из-за списка
+    "без оценки" по мелкой пыли на редких сетях). Платный DeBank Open API
+    решал бы это одним быстрым запросом, но признан слишком дорогим — решили
+    вообще убрать сканирование кошелька из мониторинга, а не чинить
+    наполовину.
+  - Fluid — у него нет простого REST API для чтения позиций, только
+    on-chain resolver-контракты со сложным, не до конца документированным
+    ABI (вложенные структуры) — разбирать их вслепую для финансового
+    инструмента рискованно (см. историю обсуждения в PR).
 
-Оценка стоимости в USD для того, что не биржа (кошелёк) берётся с
-бесплатного публичного CoinGecko API (без ключа, с кэшем на 5 минут) —
-это единственный источник цен в проекте, у которого нет отдельного API-ключа
-для аккаунта пользователя, поэтому ошибки/лимиты этого API НЕ должны ронять
-остальную часть отчёта: при неудаче соответствующая позиция просто
-показывается "без оценки в USD", а не исключается молча и не пугает исключением.
+Оценка стоимости в USD для не-стейблкоинов на споте берётся с бесплатного
+публичного CoinGecko API (без ключа, с кэшем на 5 минут) — единственный
+источник цен в проекте без отдельного API-ключа под аккаунт пользователя,
+поэтому ошибки/лимиты этого API НЕ должны ронять остальную часть отчёта: при
+неудаче соответствующая монета просто не попадает в сумму, а не оценивается
+наугад (см. price_spot_balances_usd).
 """
 
 import hashlib
 import hmac
+import os
 import time
 import urllib.parse
 
 import requests
 
-from entry_price import (
-    _etherscan_get,
-    _evm_blocked_chains,
-    _fetch_chain_token_transfers,
-    _fetch_evm_chainlist,
-    _UNSUPPORTED_CHAIN_MSG_KEYWORDS,
-)
+from entry_price import _etherscan_get  # переиспользуется только для Aave (eth_call через Etherscan proxy)
 from funding_report import (
     LIGHTER_BASE_URL,
     _aster_sign,
@@ -75,10 +76,11 @@ COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 # бесплатного тарифа на заведомый результат.
 STABLECOIN_SYMBOLS = {"USDT", "USDC", "USDE", "FDUSD", "DAI", "TUSD", "BUSD", "USDD", "PYUSD", "USD1"}
 
-# Символ спот-баланса биржи → id монеты в CoinGecko. Только самые ходовые
-# монеты — то, что реально может лежать в споте у этого бота (долгосрочный
-# лонг-хедж под шорт на фьючерсах). Монета не из списка и не стейблкоин —
-# просто показывается в отчёте без оценки в USD, а не угадывается.
+# Символ → id монеты в CoinGecko. Курируемый список самых ходовых монет —
+# гарантированно верное соответствие тикер→id (у CoinGecko тикеры НЕ уникальны
+# — разных монет с одинаковым символом сотни, поэтому для топовых монет не
+# полагаемся на поиск по общему списку ниже, а фиксируем явно). Расширяется
+# полным списком монет CoinGecko при необходимости, см. _coingecko_symbol_to_id.
 SYMBOL_TO_COINGECKO_ID = {
     "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin",
     "XRP": "ripple", "DOGE": "dogecoin", "ADA": "cardano", "AVAX": "avalanche-2",
@@ -86,20 +88,6 @@ SYMBOL_TO_COINGECKO_ID = {
     "ARB": "arbitrum", "OP": "optimism", "SUI": "sui", "TON": "the-open-network",
     "NEAR": "near", "ATOM": "cosmos", "APT": "aptos", "FIL": "filecoin",
     "INJ": "injective-protocol", "WLD": "worldcoin-wld", "PEPE": "pepe", "SHIB": "shiba-inu",
-}
-
-# chain_id (Etherscan V2 chainid) → coingecko-id нативного газ-токена сети и
-# platform-слаг для запроса цен ERC-20-токенов (/simple/token_price/{platform}).
-# Только сети, в которых уверены (проверено на практике) — добавить новую
-# сеть можно одной строкой; для сети не из списка кошелёк всё равно
-# опрашивается (см. fetch_wallet_balance), просто ненулевой баланс на ней
-# покажется без оценки в USD, а не с угаданной ценой.
-CHAIN_PRICING = {
-    1:     {"native_id": "ethereum",    "platform": "ethereum"},            # Ethereum
-    42161: {"native_id": "ethereum",    "platform": "arbitrum-one"},        # Arbitrum One
-    8453:  {"native_id": "ethereum",    "platform": "base"},                # Base
-    10:    {"native_id": "ethereum",    "platform": "optimistic-ethereum"}, # OP Mainnet
-    56:    {"native_id": "binancecoin", "platform": "binance-smart-chain"}, # BNB Smart Chain
 }
 
 _coingecko_cache: dict = {}          # cache_key -> {id_or_addr_lower: price_usd}
@@ -137,57 +125,126 @@ def _coingecko_simple_prices(ids: set) -> dict:
     return _coingecko_cache.get(cache_key, {})
 
 
-def _coingecko_token_prices(platform: str, contract_addresses: list) -> dict:
-    """{contract_address_lower: price_usd} для одной сети — один запрос
-    покрывает сразу все переданные контракты (CoinGecko поддерживает список
-    через запятую в contract_addresses)."""
-    if not contract_addresses:
-        return {}
-    cache_key = f"token:{platform}:" + ",".join(sorted(a.lower() for a in contract_addresses))
-    now = time.time()
-    if cache_key in _coingecko_cache and now - _coingecko_cache_ts[cache_key] < COINGECKO_CACHE_TTL_S:
-        return _coingecko_cache[cache_key]
+_coingecko_coin_list_cache: list | None = None
+_coingecko_coin_list_ts = 0.0
+COINGECKO_COIN_LIST_TTL_S = 24 * 60 * 60  # полный список тикеров почти не меняется — кэш на сутки
 
-    data = _coingecko_get(
-        f"/simple/token_price/{platform}",
-        {"contract_addresses": ",".join(contract_addresses), "vs_currencies": "usd"},
-    )
-    prices = {addr.lower(): float(v["usd"]) for addr, v in (data or {}).items() if "usd" in v}
-    if prices:
-        _coingecko_cache[cache_key] = prices
-        _coingecko_cache_ts[cache_key] = now
-        return prices
-    return _coingecko_cache.get(cache_key, {})
+
+def _coingecko_symbol_to_id(symbol: str) -> str | None:
+    """
+    Тикер → coingecko-id. Раньше это был только SYMBOL_TO_COINGECKO_ID
+    (~24 самых ходовых монет) — любая монета не из этого списка молча
+    выпадала из суммы баланса (это и оказалось причиной, почему у MEXC
+    "не все суммы учтены": на споте держится что-то за пределами курируемого
+    списка). Теперь при промахе по курируемому списку дополнительно ищем по
+    ПОЛНОМУ списку монет CoinGecko (/coins/list, кэш на сутки — список тикеров
+    почти не меняется). У CoinGecko тикеры не уникальны (сотни монет с
+    одинаковым символом) — берём первое совпадение; для по-настоящему топовых
+    монет коллизии не страшны, они всегда есть в курируемом списке выше и до
+    полного списка дело не доходит.
+    """
+    symbol = symbol.upper()
+    if symbol in SYMBOL_TO_COINGECKO_ID:
+        return SYMBOL_TO_COINGECKO_ID[symbol]
+
+    global _coingecko_coin_list_cache, _coingecko_coin_list_ts
+    now = time.time()
+    if _coingecko_coin_list_cache is None or now - _coingecko_coin_list_ts > COINGECKO_COIN_LIST_TTL_S:
+        data = _coingecko_get("/coins/list", {})
+        if isinstance(data, list):
+            _coingecko_coin_list_cache = data
+            _coingecko_coin_list_ts = now
+        elif _coingecko_coin_list_cache is None:
+            return None  # не удалось скачать список, и кэша ещё нет — сдаёмся
+
+    for c in _coingecko_coin_list_cache:
+        if str(c.get("symbol", "")).upper() == symbol:
+            return c.get("id")
+    return None
+
+
+def price_spot_balances_usd(balances: dict) -> float:
+    """
+    {ASSET: amount} → суммарная оценка в USD. Стейблкоины — по номиналу без
+    обращения к CoinGecko (см. STABLECOIN_SYMBOLS), остальное — батч-запросом
+    через _coingecko_symbol_to_id/_coingecko_simple_prices. Монета, для
+    которой цена не нашлась вообще нигде — просто не попадает в сумму (не
+    оценивается наугад), но с полным списком тикеров CoinGecko такое должно
+    быть редкостью — используется MEXC/Gate-спотом (fetch_all_balances) и
+    Bybit Funding-кошельком.
+    """
+    total = 0.0
+    ids_by_symbol = {}
+    for sym, amt in balances.items():
+        if sym.upper() in STABLECOIN_SYMBOLS:
+            total += amt
+            continue
+        cid = _coingecko_symbol_to_id(sym)
+        if cid:
+            ids_by_symbol[sym] = cid
+
+    if ids_by_symbol:
+        prices = _coingecko_simple_prices(set(ids_by_symbol.values()))
+        for sym, cid in ids_by_symbol.items():
+            price = prices.get(cid)
+            if price is not None:
+                total += balances[sym] * price
+
+    return total
 
 
 # ── Биржи ──────────────────────────────────────────────────────────────────────
 
-def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
-    """GET /v5/account/wallet-balance, accountType=UNIFIED → totalEquity.
-    Unified Trading Account у Bybit уже объединяет спот и деривативы в один
-    баланс, поэтому это единственное число покрывает обе ноги сразу."""
+def _bybit_signed_get(path: str, params_list: list, api_key: str, api_secret: str) -> dict:
     base_url = "https://api.bybit.com"
     recv_window = "5000"
-    proxies = _get_proxies()
     api_key, api_secret = api_key.strip(), api_secret.strip()
 
     timestamp = str(int(time.time() * 1000))
-    query_string = urllib.parse.urlencode([("accountType", "UNIFIED")])
+    query_string = urllib.parse.urlencode(params_list)
     sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
     headers = {
         "X-BAPI-API-KEY": api_key, "X-BAPI-SIGN": sig,
         "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window,
     }
-    resp = requests.get(
-        f"{base_url}/v5/account/wallet-balance?{query_string}",
-        headers=headers, timeout=30, proxies=proxies,
-    )
+    resp = requests.get(f"{base_url}{path}?{query_string}", headers=headers, timeout=30, proxies=_get_proxies())
     resp.raise_for_status()
     data = resp.json()
     if data.get("retCode", 0) != 0:
-        raise RuntimeError(f"Bybit wallet-balance error {data.get('retCode')}: {data.get('retMsg')}")
-    lst = data.get("result", {}).get("list", [])
-    return float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
+        raise RuntimeError(f"Bybit {path} error {data.get('retCode')}: {data.get('retMsg')}")
+    return data
+
+
+def fetch_bybit_balance(api_key: str, api_secret: str) -> float:
+    """
+    Unified Trading Account (totalEquity, /v5/account/wallet-balance) —
+    объединяет спот и деривативы в один баланс — ПЛЮС отдельно Funding-
+    кошелёк (/v5/asset/transfer/query-account-coins-balance, accountType=FUND).
+
+    Это два РАЗНЫХ кошелька у Bybit: депозиты по умолчанию оседают в Funding
+    и не видны в Unified, пока их явно не перевести — этим и объяснялась
+    жалоба "у Bybit не все суммы учтены" (было только totalEquity). Funding
+    отдаёт баланс по каждой монете отдельно (не сразу в USD, в отличие от
+    totalEquity) — оцениваем в USD через price_spot_balances_usd (стейблкоины
+    по номиналу, остальное — CoinGecko).
+    """
+    unified = _bybit_signed_get(
+        "/v5/account/wallet-balance", [("accountType", "UNIFIED")], api_key, api_secret,
+    )
+    lst = unified.get("result", {}).get("list", [])
+    unified_usd = float(lst[0].get("totalEquity", 0) or 0) if lst else 0.0
+
+    funding = _bybit_signed_get(
+        "/v5/asset/transfer/query-account-coins-balance", [("accountType", "FUND")], api_key, api_secret,
+    )
+    funding_coins = {
+        c["coin"]: float(c.get("walletBalance", 0) or 0)
+        for c in funding.get("result", {}).get("balance", [])
+        if float(c.get("walletBalance", 0) or 0) > 0
+    }
+    funding_usd = price_spot_balances_usd(funding_coins)
+
+    return unified_usd + funding_usd
 
 
 def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
@@ -350,155 +407,6 @@ def fetch_lighter_balance(account_index: str) -> float:
     return 0.0
 
 
-# ── Rabby wallet (on-chain, Etherscan V2) ──────────────────────────────────────
-
-def fetch_wallet_balance(wallet: str, etherscan_api_key: str) -> dict:
-    """
-    Баланс обычного EVM-кошелька (Rabby и т.п.) по ВСЕМ сетям, которые прямо
-    сейчас поддерживает Etherscan V2 (тот же динамический список, что и в
-    entry_price.py для поиска цены входа на Uniswap) — без хардкода списка
-    сетей и без хардкода списка токенов:
-      - нативный газ-токен каждой сети — action=balance;
-      - ERC-20-токены — авто-обнаружение по истории последних 1000 переводов
-        (entry_price._fetch_chain_token_transfers), затем action=tokenbalance
-        по каждому найденному контракту. Это не гарантирует 100% полноту —
-        тот же компромисс, что и в entry_price.py (см. комментарий там).
-
-    Оценка в USD — через CoinGecko (см. CHAIN_PRICING/SYMBOL_TO_COINGECKO_ID
-    выше); чего не смогли оценить — возвращается с price_usd=None, а не
-    выбрасывается из отчёта и не оценивается наугад.
-
-    Может занять до ~30 секунд (как и поиск цены на Uniswap в entry_price.py)
-    — опрашиваются десятки сетей по очереди с троттлингом Etherscan.
-
-    Возвращает {"chains": {chain_id: {"chain_name":, "native": {...}, "tokens": [...]}},
-                 "total_usd": float, "unpriced": [...]}
-    """
-    try:
-        chains = _fetch_evm_chainlist(etherscan_api_key)
-    except Exception as e:
-        raise RuntimeError(f"Не удалось получить список EVM-сетей: {e}")
-
-    wallet_lower = wallet.lower()
-    result_chains = {}
-    total_usd = 0.0
-    unpriced = []
-
-    for chain_id, chain_name in chains:
-        if chain_id in _evm_blocked_chains:
-            continue
-        try:
-            chain_entry = _wallet_balance_on_chain(chain_id, chain_name, wallet_lower, etherscan_api_key)
-        except Exception as e:
-            msg = str(e).lower()
-            if any(kw in msg for kw in _UNSUPPORTED_CHAIN_MSG_KEYWORDS):
-                _evm_blocked_chains.add(chain_id)
-            else:
-                print(f"[balances/wallet/{chain_name}] Ошибка: {e}")
-            continue
-
-        if chain_entry is None:
-            continue  # пустая сеть (нулевой нативный баланс и нет токенов) — не засоряем отчёт
-        result_chains[chain_id] = chain_entry
-        if chain_entry["native"]["price_usd"] is None:
-            unpriced.append(f"{chain_entry['native']['symbol']} ({chain_name})")
-        else:
-            total_usd += chain_entry["native"]["amount"] * chain_entry["native"]["price_usd"]
-        for t in chain_entry["tokens"]:
-            if t["price_usd"] is None:
-                unpriced.append(f"{t['symbol']} ({chain_name})")
-            else:
-                total_usd += t["amount"] * t["price_usd"]
-
-    return {"chains": result_chains, "total_usd": total_usd, "unpriced": unpriced}
-
-
-def _wallet_balance_on_chain(chain_id: int, chain_name: str, wallet_lower: str, api_key: str) -> dict | None:
-    pricing = CHAIN_PRICING.get(chain_id)
-
-    native_raw = _etherscan_get(
-        {"module": "account", "action": "balance", "address": wallet_lower, "tag": "latest", "chainid": chain_id},
-        api_key,
-    )
-    if str(native_raw.get("status", "")) != "1":
-        raise RuntimeError(f"balance error: {native_raw}")
-    native_amount = int(native_raw.get("result", "0") or "0") / 1e18
-
-    tokens_meta = _discover_wallet_tokens(chain_id, api_key, wallet_lower)
-
-    token_amounts = {}
-    for contract, meta in tokens_meta.items():
-        try:
-            bal_raw = _etherscan_get(
-                {
-                    "module": "account", "action": "tokenbalance", "contractaddress": contract,
-                    "address": wallet_lower, "tag": "latest", "chainid": chain_id,
-                },
-                api_key,
-            )
-            if str(bal_raw.get("status", "")) != "1":
-                continue
-            amount = int(bal_raw.get("result", "0") or "0") / (10 ** meta["decimals"])
-        except Exception as e:
-            print(f"[balances/wallet/{chain_name}] Не удалось получить баланс токена {meta['symbol']}: {e}")
-            continue
-        if amount > 0:
-            token_amounts[contract] = amount
-
-    if native_amount == 0 and not token_amounts:
-        return None
-
-    # Цены: нативный токен — по coingecko-id сети (если известен), остальное —
-    # стейблкоины по номиналу, всё прочее — батчем по platform-слагу сети.
-    native_price = None
-    if pricing:
-        native_price = _coingecko_simple_prices({pricing["native_id"]}).get(pricing["native_id"])
-
-    non_stable_contracts = [
-        addr for addr in token_amounts
-        if tokens_meta[addr]["symbol"].upper() not in STABLECOIN_SYMBOLS
-    ]
-    token_prices = {}
-    if pricing and non_stable_contracts:
-        token_prices = _coingecko_token_prices(pricing["platform"], non_stable_contracts)
-
-    tokens_out = []
-    for addr, amount in token_amounts.items():
-        symbol = tokens_meta[addr]["symbol"]
-        if symbol.upper() in STABLECOIN_SYMBOLS:
-            price = 1.0
-        else:
-            price = token_prices.get(addr.lower())
-        tokens_out.append({"symbol": symbol, "amount": amount, "price_usd": price})
-
-    return {
-        "chain_name": chain_name,
-        "native": {
-            "symbol": "ETH" if pricing and pricing["native_id"] == "ethereum" else "?",
-            "amount": native_amount,
-            "price_usd": native_price,
-        },
-        "tokens": tokens_out,
-    }
-
-
-def _discover_wallet_tokens(chain_id: int, api_key: str, wallet: str) -> dict:
-    """{contract_address_lower: {"symbol":, "decimals":}} по истории
-    переводов кошелька — см. докстринг fetch_wallet_balance про неполноту."""
-    transfers = _fetch_chain_token_transfers(chain_id, api_key, wallet)
-    tokens = {}
-    for t in transfers:
-        addr = (t.get("contractAddress") or "").lower()
-        if not addr:
-            continue
-        try:
-            decimals = int(t.get("tokenDecimal", 18) or 18)
-        except (TypeError, ValueError):
-            decimals = 18
-        tokens[addr] = {"symbol": t.get("tokenSymbol") or "?", "decimals": decimals}
-    return tokens
-
-
 # ── Aave v3 (on-chain, Pool.getUserAccountData) ────────────────────────────────
 
 # Proxy-адрес контракта Pool (не Pool Implementation) — проверено по
@@ -571,12 +479,13 @@ def fetch_aave_balance(wallet: str, etherscan_api_key: str) -> dict:
 
 def load_wallet_secrets() -> dict:
     """
+    Адрес кошелька и Etherscan-ключ — сейчас нужны только для Aave (баланс
+    самого кошелька/Rabby wallet больше не сканируется, см. докстринг модуля).
     RABBY_WALLET_ADDRESS — если не задан, но задан UNISWAP_WALLET_ADDRESS
     (entry_price.py), используется он: по смыслу это обычно один и тот же
-    EVM-кошелёк (Rabby), которым пользователь торгует на Uniswap и держит
-    DeFi-позиции. ETHERSCAN_API_KEY — общий с entry_price.py.
+    EVM-кошелёк, которым пользователь торгует на Uniswap и держит Aave-позицию.
+    ETHERSCAN_API_KEY — общий с entry_price.py.
     """
-    import os
     wallet = os.environ.get("RABBY_WALLET_ADDRESS") or os.environ.get("UNISWAP_WALLET_ADDRESS")
     api_key = os.environ.get("ETHERSCAN_API_KEY")
     if wallet and api_key:
@@ -593,7 +502,7 @@ def fetch_all_balances(secrets: dict) -> dict:
     источник в результате отдельно помечен либо значением, либо ошибкой.
 
     Возвращает {"exchanges": {name: {"value": float|None, "error": str|None}},
-                 "wallet": {...}|None, "aave": {...}|None, "total_usd": float}
+                 "aave": {...}|None, "total_usd": float}
     """
     exchanges: dict = {}
     total = 0.0
@@ -620,40 +529,17 @@ def fetch_all_balances(secrets: dict) -> dict:
         def _mexc_total():
             futures = fetch_mexc_futures_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"])
             spot = fetch_mexc_spot_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            spot_usd = sum(
-                amt * (1.0 if sym.upper() in STABLECOIN_SYMBOLS else _coingecko_simple_prices(
-                    {SYMBOL_TO_COINGECKO_ID[sym.upper()]}
-                ).get(SYMBOL_TO_COINGECKO_ID.get(sym.upper()), 0.0))
-                for sym, amt in spot.items()
-                if sym.upper() in STABLECOIN_SYMBOLS or sym.upper() in SYMBOL_TO_COINGECKO_ID
-            )
-            return futures + spot_usd
+            return futures + price_spot_balances_usd(spot)
         _try("mexc", _mexc_total)
 
     if "gate_api_key" in secrets:
         def _gate_total():
             futures = fetch_gate_futures_balance(secrets["gate_api_key"], secrets["gate_api_secret"])
             spot = fetch_gate_spot_balance(secrets["gate_api_key"], secrets["gate_api_secret"])
-            spot_usd = sum(
-                amt * (1.0 if cur.upper() in STABLECOIN_SYMBOLS else _coingecko_simple_prices(
-                    {SYMBOL_TO_COINGECKO_ID[cur.upper()]}
-                ).get(SYMBOL_TO_COINGECKO_ID.get(cur.upper()), 0.0))
-                for cur, amt in spot.items()
-                if cur.upper() in STABLECOIN_SYMBOLS or cur.upper() in SYMBOL_TO_COINGECKO_ID
-            )
-            return futures + spot_usd
+            return futures + price_spot_balances_usd(spot)
         _try("gate", _gate_total)
 
     wallet_secrets = load_wallet_secrets()
-    wallet_result = None
-    if wallet_secrets:
-        try:
-            wallet_result = fetch_wallet_balance(wallet_secrets["wallet_address"], wallet_secrets["etherscan_api_key"])
-            total += wallet_result["total_usd"]
-        except Exception as e:
-            print(f"[balances/wallet] Ошибка: {e}")
-            wallet_result = {"error": str(e)}
-
     aave_result = None
     if wallet_secrets:
         try:
@@ -665,7 +551,6 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     return {
         "exchanges": exchanges,
-        "wallet": wallet_result,
         "aave": aave_result,
         "total_usd": total,
     }
@@ -682,8 +567,7 @@ _AAVE_CHAIN_NAMES = {1: "Ethereum", 42161: "Arbitrum One", 8453: "Base"}
 
 def build_balances_report(result: dict) -> str:
     """Тот же result, что отдаёт /api/balances на веб-странице — здесь просто
-    коротко в текст для Telegram (подробная разбивка по сетям/токенам кошелька
-    удобнее смотрится на странице /balances, чем длинным сообщением в чате)."""
+    коротко в текст для Telegram."""
     lines = ["💰 Сводный баланс"]
 
     lines.append("")
@@ -693,16 +577,6 @@ def build_balances_report(result: dict) -> str:
             lines.append(f"{label}: ❌ {v['error']}")
         else:
             lines.append(f"{label}: ${v['value']:,.2f}")
-
-    wallet = result.get("wallet")
-    if wallet is None:
-        lines.append("Rabby wallet: не настроено (RABBY_WALLET_ADDRESS/ETHERSCAN_API_KEY)")
-    elif "error" in wallet:
-        lines.append(f"Rabby wallet: ❌ {wallet['error']}")
-    else:
-        lines.append(f"Rabby wallet: ${wallet['total_usd']:,.2f}")
-        if wallet["unpriced"]:
-            lines.append(f"  без оценки: {', '.join(wallet['unpriced'])}")
 
     aave = result.get("aave")
     if aave is None:
