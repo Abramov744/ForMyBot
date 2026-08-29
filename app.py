@@ -635,8 +635,13 @@ function renderExchanges(exchanges) {
     if (key === 'bybit' && v.parts) {
       for (const [partKey, p] of Object.entries(v.parts)) {
         const partLabel = BYBIT_PART_LABELS[partKey] || partKey;
-        const errCell = p.error ? `<span class="err" title="${p.error}"> ⚠️ ${p.error}</span>` : '';
-        html += `<tr><td class="muted" style="padding-left:20px;">· ${partLabel}</td><td>${fmt(p.value)}${errCell}</td></tr>`;
+        let noteCell = '';
+        if (p.error) {
+          noteCell = `<span class="err" title="${p.error}"> ⚠️ ${p.error}</span>`;
+        } else if (p.note) {
+          noteCell = `<span class="muted" title="${p.note}"> ℹ️ ${p.note}</span>`;
+        }
+        html += `<tr><td class="muted" style="padding-left:20px;">· ${partLabel}</td><td>${fmt(p.value)}${noteCell}</td></tr>`;
       }
     }
   }
