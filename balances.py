@@ -949,9 +949,12 @@ def fetch_all_balances(secrets: dict) -> dict:
         просто совпадение тикера с другой монетой) — цена с самой биржи,
         где эта монета реально куплена, такой проблемы не имеет.
 
-        Заметка (note) — разбивка futures/spot и что именно нашлось на
-        споте (монета: количество), чтобы ошибку в составе (не в цене) было
-        видно сразу, а не только в логах.
+        Разбивка futures/spot/состав споты и список непрайснутых монет — это
+        отладочная информация, которая помогла найти реальный баг (коллизию
+        тикеров у CoinGecko, см. докстрин price_spot_balances_usd) и больше
+        не нужна в обычном режиме — печатается только в лог Railway
+        (print), а не в /balances/Telegram, чтобы не захламлять итоговый
+        отчёт (тот же принцип, что и для разбивки Bybit по частям).
         """
         nonlocal total
         try:
@@ -963,11 +966,11 @@ def fetch_all_balances(secrets: dict) -> dict:
             else:
                 spot_usd, unpriced = price_spot_balances_usd(spot)
             value = futures + spot_usd
-            spot_breakdown = ", ".join(f"{sym} {amt:g}" for sym, amt in spot.items()) or "пусто"
-            note = f"фьючерсы: ${futures:,.2f}, спот: ${spot_usd:,.2f} (найдено на споте: {spot_breakdown})"
             if unpriced:
-                note += f"; без оценки в USD: {', '.join(unpriced)}"
-            exchanges[name] = {"value": value, "error": None, "note": note}
+                spot_breakdown = ", ".join(f"{sym} {amt:g}" for sym, amt in spot.items())
+                print(f"[balances/{name}] фьючерсы: ${futures:,.2f}, спот: ${spot_usd:,.2f} "
+                      f"(найдено на споте: {spot_breakdown}); без оценки в USD: {', '.join(unpriced)}")
+            exchanges[name] = {"value": value, "error": None}
             total += value
         except Exception as e:
             print(f"[balances/{name}] Ошибка: {e}")
@@ -1054,11 +1057,6 @@ def build_balances_report(result: dict) -> str:
             lines.append(f"{label}: ❌ {v['error']}")
         else:
             lines.append(f"{label}: ${v['value']:,.2f}")
-        # note — не ошибка, а диагностика вроде "часть спот-баланса не
-        # удалось оценить в USD" (MEXC/Gate) — короткая, поэтому не
-        # прячем в веб-страницу, в отличие от разбивки Bybit по частям выше.
-        if v.get("note"):
-            lines.append(f"  ℹ️ {v['note']}")
 
     aave = result.get("aave")
     if aave is None:
