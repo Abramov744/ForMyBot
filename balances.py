@@ -842,11 +842,18 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     def _try_spot_futures(name, futures_fn, spot_fn):
         """
-        Для MEXC/Gate: futures + оценка спота в USD, С ЯВНОЙ заметкой, если
-        часть спот-баланса не удалось оценить в USD (см. price_spot_balances_usd).
-        На реальном аккаунте оказалось, что так пропадает заметная часть
-        баланса (~40% у MEXC) — раньше это было видно только по расхождению
-        с суммой в приложении биржи, без единой подсказки, где искать причину.
+        Для MEXC/Gate: futures + оценка спота в USD.
+
+        Заметка (note) показывает РАЗБИВКУ futures/spot и что именно
+        нашлось на споте (монета: количество) ВСЕГДА, не только если что-то
+        не оценилось в USD — на реальном аккаунте (MEXC) итог расходился с
+        суммой в приложении биржи (~$289 не хватало), при этом ни одна
+        монета не попадала в "без оценки" — то есть спот-эндпоинт (GET
+        /api/v3/account) в принципе не отдаёт часть баланса, а не просто не
+        может её оценить в USD (поле free/locked и сама подпись запроса уже
+        сверены с ccxt — совпадают один в один, дело не в них). Разбивка
+        нужна, чтобы увидеть, каких именно монет не хватает в самом ответе
+        API, а не гадать дальше.
         """
         nonlocal total
         try:
@@ -854,7 +861,10 @@ def fetch_all_balances(secrets: dict) -> dict:
             spot = spot_fn()
             spot_usd, unpriced = price_spot_balances_usd(spot)
             value = futures + spot_usd
-            note = f"без оценки в USD на споте: {', '.join(unpriced)}" if unpriced else None
+            spot_breakdown = ", ".join(f"{sym} {amt:g}" for sym, amt in spot.items()) or "пусто"
+            note = f"фьючерсы: ${futures:,.2f}, спот: ${spot_usd:,.2f} (найдено на споте: {spot_breakdown})"
+            if unpriced:
+                note += f"; без оценки в USD: {', '.join(unpriced)}"
             exchanges[name] = {"value": value, "error": None, "note": note}
             total += value
         except Exception as e:
