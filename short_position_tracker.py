@@ -326,12 +326,19 @@ def check_for_new_shorts(secrets: dict) -> None:
             print(f"[short_position_tracker/{exchange}] Не удалось получить открытые позиции: {e}", flush=True)
             continue
 
+        # Печатается ВСЕГДА, даже когда новых строк не появится — иначе по
+        # логу нельзя отличить "открытых шортов правда нет" от "получение
+        # списка позиций молча сломано" (в обоих случаях новых строк 0).
+        symbols_note = f" ({', '.join(s['symbol'] for s in shorts)})" if shorts else ""
+        print(f"[short_position_tracker/{exchange}] открытых шортов сейчас: {len(shorts)}{symbols_note}", flush=True)
+
         for short in shorts:
             symbol = short["symbol"]
             coin_base = _base_asset(exchange, symbol)
 
             if _already_logged(rows, exchange, coin_base):
-                continue  # уже записано на предыдущей проверке — не дублируем
+                print(f"[short_position_tracker/{exchange}] {symbol}: уже записано активной строкой в таблице, пропуск.", flush=True)
+                continue
 
             entry_time_ms = short["entry_time_ms"]
             time_is_exact = short["time_is_exact"]
