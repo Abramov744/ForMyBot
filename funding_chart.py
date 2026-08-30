@@ -46,11 +46,31 @@
 целиком (нет вообще ни одной серии) — build_positions_apr_chart() вернёт
 None, и вызывающий код (bot_poll.py) не станет прикладывать график к отчёту,
 но текстовая часть отчёта к этому моменту уже отправлена.
+
+── Второй набор графиков: прибыль за ПЕРИОД (кнопка "📅 Календарь" → неделя/
+месяц/год/произвольный диапазон, см. bot_poll.send_period_report) ──────────
+
+В отличие от графика APR выше (одна линия на каждую ОТКРЫТУЮ СЕЙЧАС
+позицию, ставка в % годовых), здесь — сколько денег реально заработано/
+потеряно по дням за произвольный ЗАВЕРШЁННЫЙ период, в USDT, БЕЗ разбивки
+по биржам (согласовано с пользователем явно — общая картина важнее, чем
+то, какая биржа сколько дала). Два PNG:
+  - build_period_profit_bar_chart — столбец на каждый календарный день
+    периода (зелёный/красный — тот же смысл, что и эмодзи 🟢/🔴 в
+    текстовых отчётах), включая дни с нулевым результатом (не пропускаются
+    — иначе разрывы в реальной активности выглядели бы как сжатая шкала
+    времени, а не как "в этот день ничего не было");
+  - build_period_profit_cumulative_chart — линия нарастающего итога.
+Данные берёт daily_totals_msk() из уже полученных для текстовой части
+отчёта records (funding_report.fetch_all_windowed) — повторных запросов к
+биржам не делает. Сложение разных "активов" в одну сумму (без конвертации)
+имеет смысл только потому, что на практике в этом боте всегда один
+расчётный актив — USDT (см. CLAUDE.md про стратегию).
 """
 
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -60,7 +80,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 
-from funding_report import _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
+from funding_report import MSK, _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
 from funding_alerts import (
     get_predicted_rate,
     annualize,
@@ -469,6 +489,160 @@ def build_positions_apr_chart(open_results: dict) -> str | None:
     fig.tight_layout()
 
     path = f"/tmp/positions_apr_chart_{int(time.time())}.png"
+    fig.savefig(path, facecolor=CHART_BG_COLOR)
+    plt.close(fig)
+    return path
+
+
+# ── Прибыль за период (неделя/месяц/год/диапазон) — bot_poll.send_period_report ─
+
+# Поля записи (сумма начисления, время начисления, единица времени) по
+# каждой бирже — те же самые поля, что уже используются в других местах
+# этого проекта: income_field — как в funding_report._section_lines,
+# time_field/time_unit — как в _collect_series/_bybit_series_from_records/
+# _lighter_series_from_records выше (там же и обоснование каждого поля).
+_PERIOD_INCOME_FIELDS = {
+    "aster":   ("income",  "time",             "ms"),
+    "bybit":   ("funding", "transactionTime",  "ms"),
+    "lighter": ("change",  "timestamp",        "s"),
+    "mexc":    ("funding", "settleTime",       "ms"),
+    "gate":    ("change",  "time",             "s"),
+}
+
+PROFIT_COLOR = "#39ff14"      # прибыльный день / рост накопительного итога — цвет "плюс", не привязан к конкретной бирже (просто переиспользован кислотный зелёный из EXCHANGE_COLORS)
+LOSS_COLOR = "#ff3d3d"        # убыточный день — цвет "минус" (переиспользован кислотный красный из EXCHANGE_COLORS)
+CUMULATIVE_COLOR = "#ffd24d"  # накопительный итог — отдельный акцентный цвет, намеренно НЕ из EXCHANGE_COLORS (это не биржа, а общий итог)
+
+
+def daily_totals_msk(results: dict, start_ms: int, end_ms: int) -> dict:
+    """
+    {date (МСК): суммарная прибыль за этот день по ВСЕМ биржам и активам
+    вместе} — БЕЗ разбивки по биржам (согласовано с пользователем явно).
+
+    results — тот же {"aster": (records, error), ...}, что уже получен
+    funding_report.fetch_all_windowed() для текстовой части отчёта
+    (send_period_report в bot_poll.py) — повторных запросов к биржам не
+    делает.
+
+    КАЖДЫЙ календарный день периода [start_ms, end_ms) присутствует в
+    результате, даже если начислений в этот день не было (0.0) — иначе на
+    графике реальные "пустые" промежутки (например, позиция была закрыта)
+    выглядели бы как сжатая шкала времени без каких-либо признаков разрыва,
+    а не как "в этот день дохода не было".
+    """
+    day_start = datetime.fromtimestamp(start_ms / 1000, tz=MSK).date()
+    day_end = datetime.fromtimestamp((end_ms - 1) / 1000, tz=MSK).date()
+    daily: dict = {}
+    d = day_start
+    while d <= day_end:
+        daily[d] = 0.0
+        d += timedelta(days=1)
+
+    for exchange, (income_field, time_field, time_unit) in _PERIOD_INCOME_FIELDS.items():
+        records, error = results.get(exchange, (None, None))
+        if error or not records:
+            continue
+        for r in records:
+            raw_t = r.get(time_field)
+            income = r.get(income_field)
+            if raw_t is None or income in (None, ""):
+                continue
+            try:
+                t_ms = int(float(raw_t)) * (1000 if time_unit == "s" else 1)
+                day = datetime.fromtimestamp(t_ms / 1000, tz=MSK).date()
+                daily[day] = daily.get(day, 0.0) + float(income)
+            except (TypeError, ValueError):
+                continue
+
+    return daily
+
+
+def _period_chart_xaxis(ax, days: list) -> None:
+    """Общая настройка оси X для обоих графиков прибыли за период —
+    дневная сетка на коротких периодах, автопрореживание на длинных (тот
+    же приём, что и MAX_TICKS_AT_FULL_RESOLUTION у графика APR)."""
+    if len(days) <= 31:
+        interval = max(1, len(days) // 15 or 1)
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=interval))
+    else:
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=15))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+
+
+def build_period_profit_bar_chart(daily_totals: dict) -> str | None:
+    """Столбец прибыли на каждый календарный день периода (зелёный/красный,
+    см. PROFIT_COLOR/LOSS_COLOR). None, если daily_totals пуст (нет ни
+    одного дня — вызывающий код тогда просто не прикладывает картинку)."""
+    if not daily_totals:
+        return None
+    days = sorted(daily_totals.keys())
+    values = [daily_totals[d] for d in days]
+    xs = [datetime(d.year, d.month, d.day) for d in days]
+    colors = [PROFIT_COLOR if v >= 0 else LOSS_COLOR for v in values]
+
+    fig, ax = plt.subplots(figsize=(11, 5), dpi=150)
+    fig.patch.set_facecolor(CHART_BG_COLOR)
+    ax.set_facecolor(CHART_BG_COLOR)
+
+    ax.bar(xs, values, color=colors, width=0.8)
+
+    ax.set_title("Прибыль по дням (все биржи вместе)", color=CHART_FG_COLOR)
+    ax.set_xlabel("Дата (МСК)", color=CHART_FG_COLOR)
+    ax.set_ylabel("USDT", color=CHART_FG_COLOR)
+    ax.axhline(0, color="#666666", linewidth=0.8)
+    ax.grid(True, color=CHART_GRID_COLOR, alpha=0.5, axis="y")
+    ax.tick_params(colors=CHART_FG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_color(CHART_GRID_COLOR)
+
+    _period_chart_xaxis(ax, days)
+    fig.autofmt_xdate(rotation=45)
+    fig.tight_layout()
+
+    path = f"/tmp/period_profit_bar_{int(time.time())}.png"
+    fig.savefig(path, facecolor=CHART_BG_COLOR)
+    plt.close(fig)
+    return path
+
+
+def build_period_profit_cumulative_chart(daily_totals: dict) -> str | None:
+    """Линия нарастающего итога прибыли за период (см. CUMULATIVE_COLOR).
+    None, если daily_totals пуст."""
+    if not daily_totals:
+        return None
+    days = sorted(daily_totals.keys())
+    xs = [datetime(d.year, d.month, d.day) for d in days]
+    cum: list[float] = []
+    running = 0.0
+    for d in days:
+        running += daily_totals[d]
+        cum.append(running)
+
+    fig, ax = plt.subplots(figsize=(11, 5), dpi=150)
+    fig.patch.set_facecolor(CHART_BG_COLOR)
+    ax.set_facecolor(CHART_BG_COLOR)
+
+    for lw, alpha in [(6, 0.10), (4, 0.18), (2.4, 0.35)]:
+        ax.plot(xs, cum, color=CUMULATIVE_COLOR, linewidth=lw, alpha=alpha, solid_capstyle="round")
+    ax.plot(
+        xs, cum, color=CUMULATIVE_COLOR, linewidth=1.6, marker="o", markersize=3,
+        path_effects=[pe.Stroke(linewidth=2.4, foreground=CUMULATIVE_COLOR, alpha=0.5), pe.Normal()],
+    )
+
+    ax.set_title("Накопительная прибыль за период (все биржи вместе)", color=CHART_FG_COLOR)
+    ax.set_xlabel("Дата (МСК)", color=CHART_FG_COLOR)
+    ax.set_ylabel("USDT, нарастающим итогом", color=CHART_FG_COLOR)
+    ax.axhline(0, color="#666666", linewidth=0.8, linestyle="--")
+    ax.grid(True, color=CHART_GRID_COLOR, alpha=0.5)
+    ax.tick_params(colors=CHART_FG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_color(CHART_GRID_COLOR)
+
+    _period_chart_xaxis(ax, days)
+    fig.autofmt_xdate(rotation=45)
+    fig.tight_layout()
+
+    path = f"/tmp/period_profit_cumulative_{int(time.time())}.png"
     fig.savefig(path, facecolor=CHART_BG_COLOR)
     plt.close(fig)
     return path
