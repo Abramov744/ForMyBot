@@ -18,7 +18,13 @@
   /report сегодня        — отчёт за сегодня (за уже прошедшую часть суток)
   /calendar               — прислать интерактивный календарь с кнопками:
                              стрелки « / » листают месяцы, нажатие на число
-                             сразу присылает отчёт за этот день
+                             сразу присылает отчёт за этот день; отдельными
+                             кнопками — отчёт за 7/30/365 последних дней или
+                             за произвольный диапазон (выбор начальной и
+                             конечной даты по тому же календарю) — к отчёту
+                             за период (в отличие от отчёта за один день)
+                             прикладываются два графика прибыли по дням
+                             (см. send_period_report/funding_chart.py)
   /positions               — суммарный НАЧИСЛЕННЫЙ funding по открытым сейчас
                              позициям (с момента открытия каждой)
   /rates                    — ПРОГНОЗНАЯ ставка funding по открытым сейчас
@@ -40,13 +46,19 @@ from funding_report import (
     MSK,
     load_secrets,
     fetch_all,
+    fetch_all_windowed,
     fetch_all_time_open_positions,
     build_report,
     build_open_positions_report,
     send_telegram,
 )
 from funding_alerts import build_predicted_rates_report
-from funding_chart import build_positions_apr_chart
+from funding_chart import (
+    build_positions_apr_chart,
+    daily_totals_msk,
+    build_period_profit_bar_chart,
+    build_period_profit_cumulative_chart,
+)
 from balances import fetch_all_balances, build_balances_report
 
 # /report, /report@ИмяБота, с необязательным аргументом-датой после пробела
@@ -128,27 +140,83 @@ def day_bounds_msk(date_arg: str) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
+def rolling_period_bounds_msk(days: int) -> tuple[int, int]:
+    """Последние `days` дней по МСК, заканчивая ТЕКУЩИМ моментом (не
+    полночью) — "сколько заработано за последние N дней", а не "за N
+    прошедших ЦЕЛЫХ календарных суток". Используется кнопками 7/30/365
+    дней в календаре (см. build_calendar_markup)."""
+    now_msk = datetime.now(MSK)
+    start = now_msk - timedelta(days=days)
+    return int(start.timestamp() * 1000), int(now_msk.timestamp() * 1000)
+
+
+def range_bounds_msk(start_date: str, end_date: str) -> tuple[int, int]:
+    """[start_date 00:00, end_date+1 день 00:00) по МСК — обе даты
+    включительно, обе в формате ГГГГ-ММ-ДД. Если пользователь в календаре
+    выбрал конечную дату раньше начальной — переставляются местами молча
+    (сравнение строк ISO-дат ГГГГ-ММ-ДД лексикографически совпадает с
+    хронологическим порядком, отдельный datetime.strptime для сравнения
+    не нужен)."""
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=MSK)
+    end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=MSK) + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
 # ── Построение inline-календаря ───────────────────────────────────────────────
 
-def _nav_callback_data(year: int, month: int, delta_months: int) -> str:
+# Ярлыки кнопок-периодов под сеткой дней (только в обычном режиме, mode="pick"
+# — см. build_calendar_markup) — дни, а не "неделя/месяц/год" буквально: и
+# "месяц" (30 дней), и "год" (365 дней) здесь — СКОЛЬЗЯЩЕЕ окно назад от
+# текущего момента, а не календарный месяц/год, явное число дней в подписи
+# не даёт пользователю ошибочно ожидать календарную семантику.
+_PERIOD_ROLLING_DAYS = {"week": 7, "month": 30, "year": 365}
+_PERIOD_LABELS_RU = {"week": "последние 7 дней", "month": "последние 30 дней", "year": "последние 365 дней"}
+_PERIOD_BUTTON_ROW = [
+    {"text": "🗓 7 дней", "callback_data": "cal:period:week"},
+    {"text": "🗓 30 дней", "callback_data": "cal:period:month"},
+    {"text": "🗓 365 дней", "callback_data": "cal:period:year"},
+]
+
+
+def _nav_callback_data(year: int, month: int, delta_months: int, mode: str = "pick", range_start: str | None = None) -> str:
     m, y = month + delta_months, year
     if m < 1:
         m, y = 12, y - 1
     elif m > 12:
         m, y = 1, y + 1
-    return f"cal:nav:{y:04d}-{m:02d}"
+    ym = f"{y:04d}-{m:02d}"
+    if mode == "rend":
+        return f"cal:nav:rend:{range_start}:{ym}"
+    return f"cal:nav:{mode}:{ym}"
 
 
-def build_calendar_markup(year: int, month: int) -> dict:
-    """Строит inline-клавиатуру Telegram с календарём на указанный месяц (по МСК)."""
+def build_calendar_markup(year: int, month: int, mode: str = "pick", range_start: str | None = None) -> dict:
+    """
+    Строит inline-клавиатуру Telegram с календарём на указанный месяц (по МСК).
+
+    mode:
+      "pick"   — обычный режим (по умолчанию): клик по дню сразу шлёт отчёт
+                 за этот день (cal:pick:ДАТА); под сеткой — кнопки
+                 быстрых периодов (7/30/365 дней) и кнопка "Диапазон".
+      "rstart" — выбор НАЧАЛЬНОЙ даты произвольного диапазона (клик по дню
+                 -> cal:rstart:ДАТА, не шлёт отчёт, а переключает календарь
+                 в режим rend); вместо кнопок периода — кнопка "Отмена".
+      "rend"   — выбор КОНЕЧНОЙ даты диапазона; range_start (уже выбранная
+                 начальная дата) обязателен и "путешествует" через
+                 callback_data кнопок навигации/дня, чтобы не хранить
+                 состояние на стороне бота (тот же принцип, что и везде в
+                 проекте — Telegram сам держит состояние диалога).
+    """
     today = datetime.now(MSK).date()
     weeks = calendar_mod.Calendar(firstweekday=0).monthdayscalendar(year, month)
 
     rows = [
         [
-            {"text": "«", "callback_data": _nav_callback_data(year, month, -1)},
+            {"text": "«", "callback_data": _nav_callback_data(year, month, -1, mode, range_start)},
             {"text": f"{MONTH_NAMES_RU[month]} {year}", "callback_data": "cal:noop"},
-            {"text": "»", "callback_data": _nav_callback_data(year, month, +1)},
+            {"text": "»", "callback_data": _nav_callback_data(year, month, +1, mode, range_start)},
         ],
         [{"text": d, "callback_data": "cal:noop"} for d in WEEKDAY_HEADERS_RU],
     ]
@@ -159,10 +227,23 @@ def build_calendar_markup(year: int, month: int) -> dict:
             if day == 0:
                 row.append({"text": " ", "callback_data": "cal:noop"})
             else:
+                date_str = f"{year:04d}-{month:02d}-{day:02d}"
                 is_today = datetime(year, month, day).date() == today
                 label = f"[{day}]" if is_today else str(day)
-                row.append({"text": label, "callback_data": f"cal:pick:{year:04d}-{month:02d}-{day:02d}"})
+                if mode == "rstart":
+                    callback_data = f"cal:rstart:{date_str}"
+                elif mode == "rend":
+                    callback_data = f"cal:rend:{range_start}:{date_str}"
+                else:
+                    callback_data = f"cal:pick:{date_str}"
+                row.append({"text": label, "callback_data": callback_data})
         rows.append(row)
+
+    if mode == "pick":
+        rows.append(list(_PERIOD_BUTTON_ROW))
+        rows.append([{"text": "📆 Диапазон (с даты по дату)", "callback_data": "cal:rangestart"}])
+    else:
+        rows.append([{"text": "❌ Отмена", "callback_data": "cal:cancelrange"}])
 
     return {"inline_keyboard": rows}
 
@@ -220,6 +301,19 @@ def edit_message_reply_markup(token: str, chat_id: str, message_id: int, reply_m
     resp.raise_for_status()
 
 
+def edit_message_text(token: str, chat_id: str, message_id: int, text: str, reply_markup: dict | None = None) -> None:
+    """Как edit_message_reply_markup, но меняет ещё и текст сообщения —
+    нужно при переключении режима календаря (обычный день / начало
+    диапазона / конец диапазона), где меняется сама подсказка пользователю,
+    не только кнопки под ней."""
+    url = f"https://api.telegram.org/bot{token}/editMessageText"
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    resp = requests.post(url, json=payload, timeout=30)
+    resp.raise_for_status()
+
+
 def answer_callback_query(token: str, callback_query_id: str, text: str | None = None) -> None:
     """
     Снимает «часики» с нажатой кнопки в Telegram. Из-за задержки опроса
@@ -262,6 +356,82 @@ def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: i
             send_telegram(token, chat_id, f"❌ Не получилось сформировать отчёт: {e}")
         except Exception as e2:
             print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+
+
+# Периоды длиннее этого предупреждают пользователя, что сбор данных может
+# занять время — у части бирж жёсткий лимит на диапазон ОДНОГО запроса
+# истории (7-90 дней, см. funding_report._EXCHANGE_WINDOW_DAYS), поэтому
+# fetch_all_windowed() внутри send_period_report дробит период на десятки
+# последовательных запросов, и это не мгновенно (в отличие от отчёта за
+# один день, который всегда укладывается в лимит одним запросом).
+PERIOD_WARNING_THRESHOLD_DAYS = 3
+
+
+def send_period_report(secrets: dict, chat_id: str, start_ms: int, end_ms: int, label: str) -> None:
+    """
+    Отчёт за произвольный ПЕРИОД (неделя/месяц/год/диапазон — см.
+    build_calendar_markup), в отличие от send_report_for_period (один
+    день, /report):
+      - использует fetch_all_windowed(), а не fetch_all() — период может
+        быть длиннее лимита одного запроса истории у биржи (см. докстринг
+        fetch_all_windowed в funding_report.py);
+      - к тексту отчёта дописываются предупреждения fetch_all_windowed
+        (сейчас единственное — про обрезку глубины истории у Gate), если
+        они есть;
+      - после текста дополнительно шлются два графика прибыли по дням
+        (funding_chart.build_period_profit_bar_chart/_cumulative_chart) —
+        БЕЗ разбивки по биржам, только общий итог (согласовано явно).
+    """
+    token = secrets["telegram_token"]
+    period_days = max(1, round((end_ms - start_ms) / (24 * 60 * 60 * 1000)))
+    try:
+        if period_days > PERIOD_WARNING_THRESHOLD_DAYS:
+            send_telegram(
+                token, chat_id,
+                f"⏳ Собираю отчёт за {label} — период длинный, у части бирж жёсткий "
+                f"лимит на диапазон одного запроса истории, это может занять несколько минут…",
+            )
+        results, warnings = fetch_all_windowed(secrets, start_ms, end_ms)
+        report = build_report(
+            start_ms, end_ms,
+            *results.get("aster",   (None, None)),
+            *results.get("bybit",   (None, None)),
+            *results.get("lighter", (None, None)),
+            *results.get("mexc",    (None, None)),
+            *results.get("gate",    (None, None)),
+        )
+        if warnings:
+            report += "\n\n" + "\n".join(warnings)
+        send_telegram(token, chat_id, report)
+        print(f"Отправлен отчёт за период ({label}).")
+    except Exception as e:
+        print(f"Ошибка при формировании/отправке отчёта за период: {e}")
+        try:
+            send_telegram(token, chat_id, f"❌ Не получилось сформировать отчёт: {e}")
+        except Exception as e2:
+            print(f"Не удалось даже отправить сообщение об ошибке: {e2}")
+        return
+
+    # Графики — отдельным шагом со своим try/except каждый: текстовый отчёт
+    # уже успешно ушёл, ошибка построения ОДНОГО из графиков не должна
+    # мешать ни второму, ни уже отправленному тексту (тот же принцип, что
+    # и в send_open_positions_report для графика APR).
+    daily = daily_totals_msk(results, start_ms, end_ms)
+    for build_chart, caption in (
+        (build_period_profit_bar_chart, f"Прибыль по дням — {label}"),
+        (build_period_profit_cumulative_chart, f"Накопительная прибыль — {label}"),
+    ):
+        chart_path = None
+        try:
+            chart_path = build_chart(daily)
+            if chart_path:
+                send_photo(token, chat_id, chart_path, caption=caption)
+                print(f"Отправлен график: {caption}.")
+        except Exception as e:
+            print(f"Ошибка при построении/отправке графика ({caption}): {e}")
+        finally:
+            if chart_path and os.path.exists(chart_path):
+                os.remove(chart_path)
 
 
 def send_open_positions_report(secrets: dict, chat_id: str) -> None:
@@ -432,10 +602,25 @@ def handle_callback_query(secrets: dict, cq: dict, allowed_chat_id: str) -> None
         return
 
     if data.startswith("cal:nav:"):
-        year, month = (int(x) for x in data[len("cal:nav:"):].split("-"))
+        # Формат: "cal:nav:<mode>:<YYYY-MM>" (mode pick/rstart) или
+        # "cal:nav:rend:<range_start>:<YYYY-MM>" (mode rend, три части
+        # после "cal:nav:") — см. build_calendar_markup/_nav_callback_data.
+        payload = data[len("cal:nav:"):]
+        parts = payload.split(":")
         answer_callback_query(token, callback_id)
         try:
-            edit_message_reply_markup(token, chat_id, message_id, build_calendar_markup(year, month))
+            if parts[0] == "rend" and len(parts) == 3:
+                mode, range_start, ym = parts
+            elif parts[0] in ("pick", "rstart") and len(parts) == 2:
+                mode, ym = parts
+                range_start = None
+            else:
+                raise ValueError(f"неожиданный формат {data!r}")
+            year, month = (int(x) for x in ym.split("-"))
+            edit_message_reply_markup(
+                token, chat_id, message_id,
+                build_calendar_markup(year, month, mode, range_start),
+            )
         except Exception as e:
             print(f"Не удалось обновить календарь: {e}")
         return
@@ -450,6 +635,75 @@ def handle_callback_query(secrets: dict, cq: dict, allowed_chat_id: str) -> None
             send_telegram(token, chat_id, f"⚠️ {e}")
             return
         send_report_for_period(secrets, chat_id, start_ms, end_ms)
+        return
+
+    if data.startswith("cal:period:"):
+        key = data[len("cal:period:"):]
+        days = _PERIOD_ROLLING_DAYS.get(key)
+        label = _PERIOD_LABELS_RU.get(key, key)
+        answer_callback_query(token, callback_id, text=f"Формирую отчёт за {label}…")
+        if days is None:
+            print(f"Неизвестный период в cal:period: {key!r}")
+            return
+        print(f"Выбран период в календаре: {label}")
+        start_ms, end_ms = rolling_period_bounds_msk(days)
+        send_period_report(secrets, chat_id, start_ms, end_ms, label)
+        return
+
+    if data == "cal:rangestart":
+        answer_callback_query(token, callback_id)
+        now_msk = datetime.now(MSK)
+        try:
+            edit_message_text(
+                token, chat_id, message_id,
+                "Выберите НАЧАЛЬНУЮ дату диапазона:",
+                build_calendar_markup(now_msk.year, now_msk.month, mode="rstart"),
+            )
+        except Exception as e:
+            print(f"Не удалось начать выбор диапазона: {e}")
+        return
+
+    if data.startswith("cal:rstart:"):
+        start_date = data[len("cal:rstart:"):]
+        answer_callback_query(token, callback_id)
+        try:
+            year, month, _ = (int(x) for x in start_date.split("-"))
+            edit_message_text(
+                token, chat_id, message_id,
+                f"Начало диапазона: {start_date}.\nВыберите КОНЕЧНУЮ дату диапазона:",
+                build_calendar_markup(year, month, mode="rend", range_start=start_date),
+            )
+        except Exception as e:
+            print(f"Не удалось продолжить выбор диапазона: {e}")
+        return
+
+    if data.startswith("cal:rend:"):
+        # "cal:rend:<start_date>:<end_date>" — дата в формате ГГГГ-ММ-ДД
+        # не содержит ":", поэтому rsplit по последнему ":" однозначно
+        # отделяет конечную дату от начальной.
+        payload = data[len("cal:rend:"):]
+        start_date, end_date = payload.rsplit(":", 1)
+        answer_callback_query(token, callback_id, text=f"Формирую отчёт за {start_date} — {end_date}…")
+        print(f"Выбран диапазон в календаре: {start_date} — {end_date}")
+        try:
+            start_ms, end_ms = range_bounds_msk(start_date, end_date)
+        except ValueError as e:
+            send_telegram(token, chat_id, f"⚠️ {e}")
+            return
+        send_period_report(secrets, chat_id, start_ms, end_ms, f"{start_date} — {end_date}")
+        return
+
+    if data == "cal:cancelrange":
+        answer_callback_query(token, callback_id)
+        now_msk = datetime.now(MSK)
+        try:
+            edit_message_text(
+                token, chat_id, message_id,
+                "Выберите дату отчёта:",
+                build_calendar_markup(now_msk.year, now_msk.month, mode="pick"),
+            )
+        except Exception as e:
+            print(f"Не удалось отменить выбор диапазона: {e}")
         return
 
     # Неизвестный callback_data — на всякий случай снимаем «часики» с кнопки

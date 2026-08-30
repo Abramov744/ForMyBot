@@ -929,6 +929,119 @@ def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) ->
     return all_records
 
 
+def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int) -> tuple[dict, list[str]]:
+    """
+    Как fetch_all(), но для периода, который может оказаться ДЛИННЕЕ
+    максимального диапазона одного запроса истории funding у конкретной
+    биржи (см. _EXCHANGE_WINDOW_DAYS выше — Aster/Bybit 7 дней, Lighter/Gate
+    30, MEXC 90) — используется отчётом за неделю/месяц/год/произвольный
+    диапазон в bot_poll.py (build_calendar_markup, send_period_report).
+    fetch_all() по-прежнему используется отчётом за ОДИН день (/report) —
+    там период всегда меньше любого из лимитов, чанкинг не нужен и не
+    делается, чтобы не усложнять самый частый путь без всякой пользы.
+
+    Формат основного результата — тот же, что и у fetch_all():
+    {"aster": (records, error), ...}. Вторым элементом возвращается список
+    ЧЕЛОВЕКОЧИТАЕМЫХ предупреждений (сейчас — только про обрезку Gate, см.
+    ниже), которые вызывающий код может показать пользователю прямо в
+    тексте отчёта — молча обрезанный диапазон в финансовом отчёте недопустим
+    (см. CLAUDE.md), пользователь должен явно видеть, что часть периода не
+    попала в данные.
+
+    Gate ДОПОЛНИТЕЛЬНО не даёт заглянуть в прошлое дальше
+    _EXCHANGE_MAX_LOOKBACK_DAYS["gate"] дней от ТЕКУЩЕГО момента (это
+    ограничение самой биржи, не диапазона одного запроса, а глубины вообще)
+    — если запрошенный start_ms старше этой границы, для Gate (и только
+    для Gate) начало окна подрезается до границы, а не проваливается с
+    ошибкой "180-day limit" на первом же чанке.
+    """
+    results: dict = {}
+    warnings: list[str] = []
+    now_ms = int(time.time() * 1000)
+
+    try:
+        records = _fetch_in_windows(
+            lambda s, e: fetch_aster(
+                user=secrets["user"], signer=secrets["signer"],
+                private_key=secrets["signer_private_key"], start_ms=s, end_ms=e,
+            ),
+            _EXCHANGE_WINDOW_DAYS["aster"], start_ms, end_ms,
+        )
+        results["aster"] = (records, None)
+    except Exception as e:
+        print(f"[Aster] Ошибка: {e}")
+        results["aster"] = (None, str(e))
+
+    if "bybit_api_key" in secrets:
+        try:
+            records = _fetch_in_windows(
+                lambda s, e: fetch_bybit(
+                    api_key=secrets["bybit_api_key"], api_secret=secrets["bybit_api_secret"],
+                    start_ms=s, end_ms=e,
+                ),
+                _EXCHANGE_WINDOW_DAYS["bybit"], start_ms, end_ms,
+            )
+            results["bybit"] = (records, None)
+        except Exception as e:
+            print(f"[Bybit] Ошибка: {e}")
+            results["bybit"] = (None, str(e))
+
+    if "lighter_account_index" in secrets:
+        try:
+            records = _fetch_in_windows(
+                lambda s, e: fetch_lighter(
+                    account_index=secrets["lighter_account_index"], auth_token=secrets["lighter_auth_token"],
+                    start_ms=s, end_ms=e,
+                ),
+                _EXCHANGE_WINDOW_DAYS["lighter"], start_ms, end_ms,
+            )
+            results["lighter"] = (records, None)
+        except Exception as e:
+            print(f"[Lighter] Ошибка: {e}")
+            results["lighter"] = (None, str(e))
+
+    if "mexc_api_key" in secrets:
+        try:
+            records = _fetch_in_windows(
+                lambda s, e: fetch_mexc(
+                    api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
+                    start_ms=s, end_ms=e,
+                ),
+                _EXCHANGE_WINDOW_DAYS["mexc"], start_ms, end_ms,
+            )
+            results["mexc"] = (records, None)
+        except Exception as e:
+            print(f"[MEXC] Ошибка: {e}")
+            results["mexc"] = (None, str(e))
+
+    if "gate_api_key" in secrets:
+        try:
+            gate_start_ms = start_ms
+            gate_max_days = _EXCHANGE_MAX_LOOKBACK_DAYS.get("gate")
+            if gate_max_days is not None:
+                earliest_allowed_ms = now_ms - gate_max_days * 24 * 60 * 60 * 1000
+                if gate_start_ms < earliest_allowed_ms:
+                    gate_start_ms = earliest_allowed_ms
+                    warnings.append(
+                        f"⚠️ Gate: биржа не отдаёт историю глубже {gate_max_days} дней назад — "
+                        f"часть запрошенного периода по Gate ({_fmt_ms(start_ms)} — "
+                        f"{_fmt_ms(earliest_allowed_ms)} UTC) в отчёт не попала."
+                    )
+            records = _fetch_in_windows(
+                lambda s, e: fetch_gate(
+                    api_key=secrets["gate_api_key"], api_secret=secrets["gate_api_secret"],
+                    start_ms=s, end_ms=e,
+                ),
+                _EXCHANGE_WINDOW_DAYS["gate"], gate_start_ms, end_ms,
+            )
+            results["gate"] = (records, None)
+        except Exception as e:
+            print(f"[Gate] Ошибка: {e}")
+            results["gate"] = (None, str(e))
+
+    return results, warnings
+
+
 # Funding у перпетуалов на всех крупных биржах идёт не реже раза в 8 часов
 # (стандартный интервал); чаще — бывает (1ч/4ч при повышенной волатильности),
 # реже — нет. Поэтому разрыв заметно больше 8 часов между двумя соседними
