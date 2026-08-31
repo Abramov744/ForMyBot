@@ -19,6 +19,16 @@
 любой из пяти бирж (сравнение списков открытых позиций работает одинаково
 надёжно везде — тут не нужно лезть в историю ордеров конкретной биржи).
 
+ВАЖНО: биржа, у которой запрос списка позиций в конкретном проходе
+завершился ошибкой (временный сбой сети/прокси/API), НЕ участвует в
+сравнении в этом проходе — это не то же самое, что "открытых позиций на
+ней нет" (см. get_open_positions в funding_alerts.py и докстринг
+check_closed_positions ниже). Раньше эти два случая не различались, из-за
+чего единичный сетевой сбой на одной бирже выглядел как одновременное
+закрытие ВСЕХ открытых на ней позиций — ложный алерт в Telegram и ложная
+запись даты закрытия в Google Sheet для всё ещё открытой связки (реальный
+случай на живом аккаунте: MEXC BTW_USDT).
+
 УТОЧНЕНИЕ ПРИЧИНЫ (SL/TP) — не одинаковое для всех пяти, и это осознанно:
   - Bybit — надёжно: GET /v5/execution/list отдаёт поле stopOrderType прямо
     в каждом исполнении ("StopLoss"/"TakeProfit"/"PartialStopLoss"/
@@ -182,16 +192,35 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
     уточнить не удалось (ошибка запроса или закрытие действительно было
     обычным/ручным), алерт всё равно уходит — просто без пометки причины.
     Возвращает новое состояние для следующей итерации.
+
+    ВАЖНО (реальный баг, найденный на живом аккаунте — ложный алерт "MEXC
+    BTW_USDT закрыта" и ложная запись даты закрытия в Google Sheet для
+    связки, которая на самом деле оставалась открытой): get_open_positions
+    возвращает ВТОРЫМ элементом failed_exchanges — биржи, у которых запрос
+    списка позиций в ЭТОМ проходе завершился ошибкой (временный сбой сети/
+    прокси/API). Раньше это никак не отличалось от "на бирже открытых
+    позиций сейчас нет" — current_open.get(exchange, []) в обоих случаях
+    давал пустой список, из-за чего единичный сетевой сбой на бирже
+    выглядел как одновременное закрытие ВСЕХ открытых на ней позиций.
+    Теперь для таких бирж сравнение в этом проходе просто пропускается —
+    прежнее состояние переносится в результат как есть, без диффа.
     """
     token = secrets["telegram_token"]
     chat_id = secrets["telegram_chat_id"]
 
-    current_open = get_open_positions(secrets)  # {exchange: [symbols]}
+    current_open, failed_exchanges = get_open_positions(secrets)  # {exchange: [symbols]}
+    if failed_exchanges:
+        print(f"[sltp] Запрос списка открытых позиций не удался: {sorted(failed_exchanges)} — "
+              f"эти биржи в этом проходе не сравниваются с прошлым состоянием (временный сбой "
+              f"API не должен приниматься за закрытие всех позиций на бирже).")
 
     # Проходим по объединению бирж из обоих состояний, а не только по
     # _CLOSE_REASON_FETCHERS — иначе MEXC/Gate/Lighter вообще выпали бы
     # из отслеживания закрытий.
     for exchange in set(prev_open) | set(current_open):
+        if exchange in failed_exchanges:
+            continue  # текущее состояние неизвестно — не диффим и не алертим (см. докстринг выше)
+
         prev_symbols = prev_open.get(exchange, set())
         current_symbols = set(current_open.get(exchange, []))
         closed_symbols = prev_symbols - current_symbols
@@ -223,7 +252,18 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
             except Exception as e:
                 print(f"[sltp/{exchange}/{symbol}] Не удалось записать дату закрытия в Google Sheet: {e}")
 
-    return {exchange: set(symbols) for exchange, symbols in current_open.items()}
+    # Для бирж с успешным запросом — новое состояние из current_open. Для
+    # бирж из failed_exchanges — состояние НЕ трогаем, переносим prev_open
+    # как есть (см. докстринг выше): иначе, если биржа отвалится на
+    # несколько проходов подряд, а затем восстановится, следующее сравнение
+    # пойдёт с пустого состояния и упустит реальные закрытия, случившиеся,
+    # пока биржа была недоступна, — то же самое, только менее заметное,
+    # проявление одной и той же ошибки "нет данных = позиций нет".
+    new_state = {exchange: set(symbols) for exchange, symbols in current_open.items()}
+    for exchange in failed_exchanges:
+        if exchange in prev_open:
+            new_state[exchange] = prev_open[exchange]
+    return new_state
 
 
 def sltp_alert_loop(secrets: dict | None = None) -> None:
@@ -241,7 +281,8 @@ def sltp_alert_loop(secrets: dict | None = None) -> None:
                 # На первом проходе только заполняем состояние — иначе все
                 # позиции, открытые ДО старта бота, покажутся "закрывшимися"
                 # прямо на первой итерации и породят ложные алерты.
-                prev_open = {ex: set(syms) for ex, syms in get_open_positions(secrets).items()}
+                initial_open, _ = get_open_positions(secrets)
+                prev_open = {ex: set(syms) for ex, syms in initial_open.items()}
                 first_run = False
             else:
                 prev_open = check_closed_positions(secrets, prev_open)

@@ -106,9 +106,29 @@ LIGHTER_FUNDING_INTERVAL_HOURS = 1.0
 
 # ── Список сейчас открытых позиций по всем подключённым биржам ───────────────
 
-def get_open_positions(secrets: dict) -> dict:
-    """{"aster": ["BTCUSDT", ...], "bybit": [...], ...} — только подключённые биржи."""
+def get_open_positions(secrets: dict) -> tuple[dict, set]:
+    """
+    ({"aster": ["BTCUSDT", ...], "bybit": [...], ...}, {биржи_с_ошибкой_запроса})
+    — только подключённые биржи.
+
+    ВТОРОЙ элемент — множество бирж, у которых запрос списка открытых
+    позиций В ЭТОМ ВЫЗОВЕ завершился ошибкой (транзиентный сбой сети/прокси/
+    временная ошибка API) — раньше это никак не отличалось от "открытых
+    позиций на бирже действительно нет" (биржа просто не попадала в
+    result). На практике это привело к реальному багу: sltp_alerts.py
+    сравнивает список открытых позиций с предыдущим проходом, чтобы
+    обнаружить закрытие — один разовый сетевой сбой на, скажем, MEXC
+    заставлял результат выглядеть как "на MEXC открытых позиций теперь 0",
+    что sltp_alerts.py читал как "ВСЕ открытые на MEXC позиции только что
+    закрылись" — ложный алерт о закрытии в Telegram И ложная запись даты
+    закрытия в Google Sheet для позиции, которая на самом деле всё ещё
+    открыта (см. историю бага — реальный случай с MEXC BTW_USDT). Теперь
+    вызывающий код (см. sltp_alerts.check_closed_positions) может явно
+    пропустить сравнение для биржи, чьё текущее состояние на самом деле
+    неизвестно, а не спутать это с "позиций нет".
+    """
     result: dict = {}
+    failed: set = set()
 
     if "user" in secrets:
         try:
@@ -118,6 +138,7 @@ def get_open_positions(secrets: dict) -> dict:
             result["aster"] = sorted(symbols)
         except Exception as e:
             print(f"[alerts/aster] Не удалось получить открытые позиции: {e}")
+            failed.add("aster")
 
     if "bybit_api_key" in secrets:
         try:
@@ -125,6 +146,7 @@ def get_open_positions(secrets: dict) -> dict:
             result["bybit"] = sorted(open_times.keys())
         except Exception as e:
             print(f"[alerts/bybit] Не удалось получить открытые позиции: {e}")
+            failed.add("bybit")
 
     if "lighter_account_index" in secrets:
         try:
@@ -132,6 +154,7 @@ def get_open_positions(secrets: dict) -> dict:
             result["lighter"] = sorted(symbols)
         except Exception as e:
             print(f"[alerts/lighter] Не удалось получить открытые позиции: {e}")
+            failed.add("lighter")
 
     if "mexc_api_key" in secrets:
         try:
@@ -139,6 +162,7 @@ def get_open_positions(secrets: dict) -> dict:
             result["mexc"] = sorted(open_times.keys())
         except Exception as e:
             print(f"[alerts/mexc] Не удалось получить открытые позиции: {e}")
+            failed.add("mexc")
 
     if "gate_api_key" in secrets:
         try:
@@ -146,8 +170,9 @@ def get_open_positions(secrets: dict) -> dict:
             result["gate"] = sorted(symbols)
         except Exception as e:
             print(f"[alerts/gate] Не удалось получить открытые позиции: {e}")
+            failed.add("gate")
 
-    return result
+    return result, failed
 
 
 # ── Прогнозная ставка на следующую выплату — публичные эндпоинты бирж ────────
@@ -355,7 +380,7 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
     token = secrets["telegram_token"]
     chat_id = secrets["telegram_chat_id"]
 
-    open_positions = get_open_positions(secrets)
+    open_positions, failed_exchanges = get_open_positions(secrets)
     seen_keys = set()
 
     for exchange, symbols in open_positions.items():
@@ -389,9 +414,15 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
 
     # Позиции, которые за это время закрылись, больше не отслеживаем —
     # иначе при повторном открытии той же пары состояние "уже алертили"
-    # может ложно сохраниться из прошлого раза.
+    # может ложно сохраниться из прошлого раза. НО: для бирж, чей запрос
+    # списка позиций в этом проходе завершился ошибкой (failed_exchanges),
+    # их символы просто отсутствуют в seen_keys — не потому что реально
+    # закрылись, а потому что мы не знаем их текущее состояние (см.
+    # докстринг get_open_positions про историю этого бага) — не удаляем их
+    # state, иначе временный сбой сбрасывает edge-trigger память и может
+    # породить лишний повторный алерт по уже известной отрицательной ставке.
     for key in list(state.keys()):
-        if key not in seen_keys:
+        if key not in seen_keys and key[0] not in failed_exchanges:
             del state[key]
 
 
@@ -425,11 +456,15 @@ def build_predicted_rates_report(secrets: dict) -> str:
     копия того же самого.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
-    open_positions = get_open_positions(secrets)
+    open_positions, failed_exchanges = get_open_positions(secrets)
+
+    if failed_exchanges:
+        labels = ", ".join(EXCHANGE_LABELS.get(ex, ex) for ex in sorted(failed_exchanges))
+        lines.append(f"⚠️ Не удалось получить список открытых позиций: {labels} — по ним данных в отчёте нет (это не значит, что там нет позиций).")
 
     if not any(open_positions.values()):
         lines.append("")
-        lines.append("Сейчас нет ни одной открытой позиции ни на одной подключённой бирже.")
+        lines.append("Сейчас нет ни одной открытой позиции ни на одной подключённой бирже (либо не удалось получить данные — см. предупреждение выше).")
         return "\n".join(lines)
 
     any_rate = False
