@@ -314,7 +314,25 @@ def check_for_new_shorts(secrets: dict) -> None:
 
     ws = _open_worksheet()
     rows = ws.get(f"B{_FIRST_DATA_ROW}:O")  # тот же открытый диапазон, что и в sheets_sync.sync_once
-    next_row = _FIRST_DATA_ROW + len(rows)
+
+    # next_row — НЕ _FIRST_DATA_ROW + len(rows) (было так до фикса, см.
+    # историю бага): открытый диапазон "B{FIRST}:O" тянет из Google Sheets
+    # ЗНАЧЕНИЯ, а не только "реально введённые пользователем данные" — если
+    # в столбце C (формула статуса) или любом другом столбце между B и O
+    # формула протянута заранее на много строк вперёд и возвращает "" для
+    # ещё не используемых строк, Sheets API всё равно отдаёт эту "" как
+    # значение этой строки, и len(rows) считает такие строки тоже —
+    # реальный случай: следующая строка уехала на #200 вместо места сразу
+    # после последней настоящей сделки (#107), потому что между ними
+    # формула в C была протянута на сотню строк вперёд. Вместо этого ищем
+    # ПОСЛЕДНЮЮ строку с непустой колонкой B (монета) — тот же признак
+    # "это настоящая строка", что уже используется везде в этом файле и в
+    # sheets_sync.py (_already_logged, sync_once, record_position_close).
+    last_used_offset = -1
+    for offset, row in enumerate(rows):
+        if len(row) > _COL_COIN and row[_COL_COIN].strip():
+            last_used_offset = offset
+    next_row = _FIRST_DATA_ROW + last_used_offset + 1
 
     updates = []
     for exchange, (fetch_fn, required_key) in _OPEN_SHORTS_FETCHERS.items():
