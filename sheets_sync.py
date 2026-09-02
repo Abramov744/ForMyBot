@@ -147,6 +147,41 @@ def _open_worksheet():
     return sh.worksheet(tab_name) if tab_name else sh.get_worksheet(0)
 
 
+# Google Sheets API изредка отдаёт транзиентные 5xx ("The service is
+# currently unavailable" и т.п. — не наша ошибка, инфраструктурный всплеск
+# на стороне Google) — ПОДТВЕРЖДЕНО реальным случаем: 503 ровно в момент
+# записи даты закрытия позиции в F (см. record_position_close) стоил
+# записи навсегда, потому что эта функция вызывается РОВНО ОДИН РАЗ, в
+# момент обнаружения закрытия позиции (sltp_alerts.py) — в отличие от
+# sync_once() (пересчитывает всё заново каждый час и сам себя чинит),
+# здесь второго шанса без ретрая нет вообще.
+_SHEETS_RETRY_ATTEMPTS = 3
+_SHEETS_RETRY_DELAY_S = 3.0
+
+
+def _with_sheets_retry(fn, *args, **kwargs):
+    """Вызывает fn(*args, **kwargs), повторяя до _SHEETS_RETRY_ATTEMPTS раз с
+    паузой _SHEETS_RETRY_DELAY_S секунд при любом исключении — короткого
+    всплеска обычно достаточно, чтобы транзиентная ошибка Google прошла
+    сама. Последняя попытка падает как есть (наружу), чтобы вызывающий код
+    (уже существующие try/except в sync_once/record_position_close/
+    sltp_alerts.py) увидел настоящую причину, если все попытки исчерпаны."""
+    last_error = None
+    for attempt in range(1, _SHEETS_RETRY_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < _SHEETS_RETRY_ATTEMPTS:
+                print(
+                    f"[sheets_sync] Попытка {attempt}/{_SHEETS_RETRY_ATTEMPTS} обращения к "
+                    f"Google Sheets не удалась ({e}), повтор через {_SHEETS_RETRY_DELAY_S:.0f}с…",
+                    flush=True,
+                )
+                time.sleep(_SHEETS_RETRY_DELAY_S)
+    raise last_error
+
+
 def build_open_symbol_index(secrets: dict) -> dict:
     """
     {exchange: {symbol: open_time_ms}} для Bybit/MEXC (точное время),
@@ -228,11 +263,11 @@ def compute_funding_total(secrets: dict, exchange: str, symbol: str, open_time_m
 
 
 def sync_once(secrets: dict) -> None:
-    ws = _open_worksheet()
+    ws = _with_sheets_retry(_open_worksheet)
 
     open_symbol_index = build_open_symbol_index(secrets)
 
-    rows = ws.get(f"B{_FIRST_DATA_ROW}:O")  # открытый диапазон — до конца листа
+    rows = _with_sheets_retry(ws.get, f"B{_FIRST_DATA_ROW}:O")  # открытый диапазон — до конца листа
 
     updates = []
     skipped = []
@@ -271,7 +306,7 @@ def sync_once(secrets: dict) -> None:
         updates.append({"range": f"P{row_number}", "values": [[round(value, 4)]]})
 
     if updates:
-        ws.batch_update(updates)  # raw=True по умолчанию — числа пишутся как есть, не как формулы
+        _with_sheets_retry(ws.batch_update, updates)  # raw=True по умолчанию — числа пишутся как есть, не как формулы
 
     print(f"[sheets_sync] Обновлено ячеек P: {len(updates)}.", flush=True)
     for row_number, coin, exchange_raw, reason in skipped:
@@ -313,10 +348,10 @@ def record_position_close(exchange: str, symbol: str) -> bool:
     if not (os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")):
         return False  # Google Sheets не подключены — тихо ничего не делаем
 
-    ws = _open_worksheet()
+    ws = _with_sheets_retry(_open_worksheet)
     target_base = _base_asset(exchange, symbol)
 
-    rows = ws.get(f"B{_FIRST_DATA_ROW}:O")
+    rows = _with_sheets_retry(ws.get, f"B{_FIRST_DATA_ROW}:O")
     matches = []
     for offset, row in enumerate(rows):
         row_number = _FIRST_DATA_ROW + offset
@@ -338,12 +373,14 @@ def record_position_close(exchange: str, symbol: str) -> bool:
         return False
 
     row_number = matches[0]
-    close_time_value = ws.acell(_CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE").value
+    close_time_value = _with_sheets_retry(
+        ws.acell, _CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE",
+    ).value
     if close_time_value is None:
         print(f"[sheets_sync] Ячейка {_CLOSE_TIMESTAMP_CELL} пуста — нечего записать в F{row_number} для {exchange}/{symbol}.", flush=True)
         return False
 
-    ws.batch_update([{"range": f"F{row_number}", "values": [[close_time_value]]}])
+    _with_sheets_retry(ws.batch_update, [{"range": f"F{row_number}", "values": [[close_time_value]]}])
     print(f"[sheets_sync] Записана дата закрытия в F{row_number} для {exchange}/{symbol}.", flush=True)
     return True
 
