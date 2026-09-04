@@ -12,6 +12,23 @@
 повторной записи ОДНОЙ И ТОЙ ЖЕ сделки на следующей ежечасной проверке
 (см. _already_logged ниже) — решение согласовано с пользователем явно.
 
+В ТУ ЖЕ строку дополнительно пишутся (согласовано с пользователем явно):
+  - W — объём, купленный на споте (spot_result["qty"] из
+    entry_price._search_spot_entry — уже суммарный объём по всем найденным
+    спот-сделкам, если покупка была не одним ордером);
+  - X — средняя цена покупки на споте (spot_result["price"] — та же
+    функция уже считает VWAP по всем найденным спот-сделкам сразу,
+    отдельно взвешивать не нужно, см. её докстринг в entry_price.py);
+  - Y — средняя цена входа шорта на фьючерсе (поле "price" в словаре
+    позиции каждой _fetch_*_open_shorts — те же поля avgPrice/entryPrice/
+    entry_price/openAvgPrice/avgEntryPrice, что уже проверены и
+    используются в entry_price._*_position_entry для автоподбора цены в
+    калькуляторе, здесь просто ещё и извлекаются в список открытых
+    шортов, а не только при точечном запросе по одному символу).
+  Если цену определить не удалось (поле отсутствует в ответе биржи) —
+  соответствующая ячейка просто не пишется (остаётся пустой для ручного
+  заполнения), а не заполняется нулём/угадыванием.
+
 КАК ОПРЕДЕЛЯЕТСЯ "НОВЫЙ" ШОРТ: отдельное состояние между запусками НЕ
 хранится (Railway может перезапустить процесс на редеплое — любое
 in-memory состояние потерялось бы и либо пропустило бы реальную сделку,
@@ -140,6 +157,7 @@ def _fetch_bybit_open_shorts(secrets: dict) -> list:
             "symbol": p["symbol"], "qty": float(p["size"]),
             "entry_time_ms": int(p["createdTime"]) if p.get("createdTime") else None,
             "time_is_exact": True,
+            "price": float(p["avgPrice"]) if p.get("avgPrice") else None,
         }
         for p in data.get("result", {}).get("list", [])
         if p.get("side") == "Sell" and float(p.get("size", 0)) > 0
@@ -163,10 +181,12 @@ def _fetch_mexc_open_shorts(secrets: dict) -> list:
         if str(p.get("positionType")) == "1" or float(p.get("holdVol", 0)) <= 0:
             continue  # positionType 1 == long (см. докстринг модуля)
         contract_size = _fetch_mexc_contract_size(p["symbol"])  # holdVol — в контрактах, не в монетах
+        price = p.get("openAvgPrice") or p.get("holdAvgPrice")
         out.append({
             "symbol": p["symbol"], "qty": float(p["holdVol"]) * contract_size,
             "entry_time_ms": int(p["createTime"]) if p.get("createTime") else None,
             "time_is_exact": True,
+            "price": float(price) if price else None,
         })
     return out
 
@@ -188,7 +208,11 @@ def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
     for p in (data if isinstance(data, list) else []):
         size = float(p.get("size", 0) or 0)
         if size < 0:  # отрицательный size == шорт (см. докстринг модуля)
-            out.append({"symbol": p["contract"], "qty": abs(size), "entry_time_ms": None, "time_is_exact": False})
+            price = p.get("entry_price")
+            out.append({
+                "symbol": p["contract"], "qty": abs(size), "entry_time_ms": None, "time_is_exact": False,
+                "price": float(price) if price else None,
+            })
     return out
 
 
@@ -209,7 +233,11 @@ def _fetch_aster_open_shorts(secrets: dict) -> list:
     for p in data:
         amt = float(p.get("positionAmt", 0) or 0)
         if amt < 0:  # отрицательный positionAmt == шорт (конвенция Binance Futures, см. докстринг модуля)
-            out.append({"symbol": p["symbol"], "qty": abs(amt), "entry_time_ms": None, "time_is_exact": False})
+            price = p.get("entryPrice")
+            out.append({
+                "symbol": p["symbol"], "qty": abs(amt), "entry_time_ms": None, "time_is_exact": False,
+                "price": float(price) if price else None,
+            })
     return out
 
 
@@ -239,7 +267,15 @@ def _fetch_lighter_open_shorts(secrets: dict) -> list:
             # (см. докстринг модуля про непроверенность этого места).
             is_short = (int(sign) < 0) if sign is not None else (size < 0)
             if is_short:
-                out.append({"symbol": symbol, "qty": abs(size), "entry_time_ms": None, "time_is_exact": False})
+                price = None
+                for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
+                    if pos.get(key) not in (None, ""):
+                        price = float(pos[key])
+                        break
+                out.append({
+                    "symbol": symbol, "qty": abs(size), "entry_time_ms": None, "time_is_exact": False,
+                    "price": price,
+                })
     return out
 
 
@@ -252,10 +288,12 @@ def _fetch_kucoin_open_shorts(secrets: dict) -> list:
     for p in data.get("data") or []:
         qty = float(p.get("currentQty", 0) or 0)
         if p.get("isOpen") and qty < 0:  # отрицательный currentQty == шорт (см. докстринг модуля)
+            price = p.get("avgEntryPrice")
             out.append({
                 "symbol": p["symbol"], "qty": abs(qty),
                 "entry_time_ms": int(p["openingTimestamp"]) if p.get("openingTimestamp") else None,
                 "time_is_exact": True,
+                "price": float(price) if price else None,
             })
     return out
 
@@ -335,6 +373,7 @@ def check_for_new_shorts(secrets: dict) -> None:
     next_row = _FIRST_DATA_ROW + last_used_offset + 1
 
     updates = []
+    new_rows_count = 0
     for exchange, (fetch_fn, required_key) in _OPEN_SHORTS_FETCHERS.items():
         if required_key not in secrets:
             continue
@@ -393,15 +432,31 @@ def check_for_new_shorts(secrets: dict) -> None:
 
             row_number = next_row
             next_row += 1
+            new_rows_count += 1
             updates.append({"range": f"B{row_number}", "values": [[f"{coin_base}(spot/perp)"]]})
             updates.append({"range": f"D{row_number}", "values": [[_format_open_time_msk(entry_time_ms)]]})
             updates.append({"range": f"O{row_number}", "values": [[exchange]]})
+            updates.append({"range": f"W{row_number}", "values": [[round(spot_result["qty"], 8)]]})
+            updates.append({"range": f"X{row_number}", "values": [[round(spot_result["price"], 8)]]})
+
+            futures_price = short.get("price")
+            if futures_price is not None:
+                updates.append({"range": f"Y{row_number}", "values": [[round(futures_price, 8)]]})
+            else:
+                # Биржа не отдала цену входа в ожидаемом поле — оставляем Y
+                # пустой для ручного заполнения, а не пишем 0/угадываем
+                # (тот же принцип, что и везде в проекте с недостающими данными).
+                print(f"[short_position_tracker/{exchange}] {symbol}: не удалось определить среднюю цену "
+                      f"входа фьючерса — Y{row_number} оставлена пустой.", flush=True)
+
             print(f"[short_position_tracker] Новая строка {row_number}: {exchange}/{coin_base}, "
-                  f"объём шорта {short['qty']:g} ≈ спот {spot_result['qty']:g}{approx_note}.", flush=True)
+                  f"объём шорта {short['qty']:g} ≈ спот {spot_result['qty']:g}{approx_note}, "
+                  f"цена спота {spot_result['price']:g}, цена фьючерса {futures_price if futures_price is not None else '?'}.",
+                  flush=True)
 
     if updates:
         ws.batch_update(updates, value_input_option=gspread.utils.ValueInputOption.user_entered)
-    print(f"[short_position_tracker] Проверка завершена, новых строк: {len(updates) // 3}.", flush=True)
+    print(f"[short_position_tracker] Проверка завершена, новых строк: {new_rows_count}.", flush=True)
 
 
 SHORT_POSITION_CHECK_INTERVAL_MINUTES = float(os.environ.get("SHORT_POSITION_CHECK_INTERVAL_MINUTES", "60"))
