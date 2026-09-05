@@ -72,7 +72,7 @@ import requests
 from funding_report import (
     MSK,
     load_secrets,
-    send_telegram,
+    send_telegram_broadcast,
     fetch_aster_open_symbols,
     fetch_bybit_open_symbols,
     fetch_lighter_open_symbols,
@@ -378,7 +378,7 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
     при переходе ставки по (exchange, symbol) из неотрицательной в отрицательную.
     """
     token = secrets["telegram_token"]
-    chat_id = secrets["telegram_chat_id"]
+    chat_ids = secrets["telegram_chat_ids"]
 
     open_positions, failed_exchanges = get_open_positions(secrets)
     seen_keys = set()
@@ -404,11 +404,8 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
                     f"({_fmt_next_time(next_ms)})\n"
                     f"По вашей схеме (шорт на фьючерсах) эту выплату вы заплатите, а не получите."
                 )
-                try:
-                    send_telegram(token, chat_id, text)
-                    print(f"[alerts] Отправлен алерт: {exchange} {symbol} {rate:+.6f}")
-                except Exception as e:
-                    print(f"[alerts] Не удалось отправить алерт в Telegram: {e}")
+                send_telegram_broadcast(token, chat_ids, text)
+                print(f"[alerts] Отправлен алерт: {exchange} {symbol} {rate:+.6f}")
 
             state[key] = is_negative
 

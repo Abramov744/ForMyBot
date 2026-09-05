@@ -66,7 +66,7 @@ import urllib.parse
 
 import requests
 
-from funding_report import _get_proxies, _bybit_sign, _aster_sign, load_secrets, send_telegram
+from funding_report import _get_proxies, _bybit_sign, _aster_sign, load_secrets, send_telegram_broadcast
 from funding_alerts import get_open_positions, EXCHANGE_LABELS
 from sheets_sync import record_position_close
 
@@ -206,7 +206,7 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
     прежнее состояние переносится в результат как есть, без диффа.
     """
     token = secrets["telegram_token"]
-    chat_id = secrets["telegram_chat_id"]
+    chat_ids = secrets["telegram_chat_ids"]
 
     current_open, failed_exchanges = get_open_positions(secrets)  # {exchange: [symbols]}
     if failed_exchanges:
@@ -236,11 +236,8 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
                     reason = None  # не блокирует отправку алерта о самом факте закрытия
 
             text = _fmt_alert(exchange, symbol, reason)
-            try:
-                send_telegram(token, chat_id, text)
-                print(f"[sltp] Отправлен алерт: {exchange} {symbol} причина={reason}")
-            except Exception as e:
-                print(f"[sltp] Не удалось отправить алерт в Telegram: {e}")
+            send_telegram_broadcast(token, chat_ids, text)
+            print(f"[sltp] Отправлен алерт: {exchange} {symbol} причина={reason}")
 
             # Запись даты закрытия в Google Sheet — отдельным try/except:
             # если она упадёт (таблица не подключена, неоднозначное
