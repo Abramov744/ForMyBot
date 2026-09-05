@@ -36,7 +36,7 @@ LONG_POLL_TIMEOUT = 30  # секунд — Telegram будет держать с
 def poll_forever() -> None:
     secrets = load_secrets()
     token = secrets["telegram_token"]
-    allowed_chat_id = str(secrets["telegram_chat_id"])
+    allowed_chat_ids = set(secrets["telegram_chat_ids"])
 
     offset = None
     print("Бот запущен, жду сообщений...", flush=True)
@@ -55,11 +55,11 @@ def poll_forever() -> None:
             offset = upd["update_id"] + 1
             try:
                 if "callback_query" in upd:
-                    handle_callback_query(secrets, upd["callback_query"], allowed_chat_id)
+                    handle_callback_query(secrets, upd["callback_query"], allowed_chat_ids)
                     continue
                 message = upd.get("message") or upd.get("edited_message")
                 if message:
-                    handle_message(secrets, message, allowed_chat_id)
+                    handle_message(secrets, message, allowed_chat_ids)
             except Exception as e:
                 print(f"Ошибка при обработке апдейта {upd.get('update_id')}: {e}", flush=True)
 

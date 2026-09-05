@@ -38,12 +38,22 @@ def previous_day_msk_ms():
 
 def load_secrets() -> dict:
     """Читает секреты из переменных окружения (GitHub Secrets)."""
+    # TELEGRAM_CHAT_ID — один или несколько chat_id через запятую (второй и
+    # далее аккаунты добавляются БЕЗ второго деплоя/второго бота: те же
+    # биржевые ключи и та же Google-таблица, просто команды принимаются и
+    # фоновые алерты/отчёты рассылаются на все перечисленные chat_id сразу).
+    # Порядок сохраняется (по нему разбирают только там, где это важно —
+    # нигде в проекте это не так, но пусть будет предсказуемо).
+    telegram_chat_ids = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
+    if not telegram_chat_ids:
+        raise ValueError("TELEGRAM_CHAT_ID задан, но не содержит ни одного chat_id")
+
     result = {
         "user":               os.environ["ASTER_USER_ADDRESS"],
         "signer":             os.environ["ASTER_SIGNER_ADDRESS"],
         "signer_private_key": os.environ["ASTER_SIGNER_PRIVATE_KEY"],
         "telegram_token":     os.environ["TELEGRAM_BOT_TOKEN"],
-        "telegram_chat_id":   os.environ["TELEGRAM_CHAT_ID"],
+        "telegram_chat_ids":  telegram_chat_ids,
     }
     # Bybit — опционально
     bybit_api_key    = os.environ.get("BYBIT_API_KEY")
@@ -1531,6 +1541,29 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
     resp.raise_for_status()
 
 
+def send_telegram_broadcast(token: str, chat_ids: list, text: str) -> None:
+    """
+    Как send_telegram, но на ВСЕ chat_id из secrets["telegram_chat_ids"]
+    сразу — для фоновых алертов/отчётов (funding_alerts.py/sltp_alerts.py),
+    которые раньше слали ровно одному фиксированному chat_id, а с
+    поддержкой нескольких Telegram-аккаунтов должны долетать до каждого.
+
+    Команды, на которые бот ОТВЕЧАЕТ (bot_poll.py) сюда не относятся — там
+    chat_id уже известен из самого входящего сообщения (кто спросил, тому
+    и отвечаем), рассылать на все аккаунты незачем.
+
+    Ошибка отправки одному конкретному chat_id (например, тот аккаунт
+    заблокировал бота) не должна мешать доставке остальным — каждый
+    вызов send_telegram обёрнут в свой try/except, ошибка только
+    печатается в лог.
+    """
+    for chat_id in chat_ids:
+        try:
+            send_telegram(token, chat_id, text)
+        except Exception as e:
+            print(f"[telegram] Не удалось отправить сообщение chat_id={chat_id}: {e}")
+
+
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1548,7 +1581,7 @@ def main():
         *results.get("gate",    (None, None)),
     )
 
-    send_telegram(secrets["telegram_token"], secrets["telegram_chat_id"], message)
+    send_telegram_broadcast(secrets["telegram_token"], secrets["telegram_chat_ids"], message)
     print("Отправлено в Telegram:")
     print(message)
 

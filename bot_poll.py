@@ -516,12 +516,12 @@ def send_balances_report(secrets: dict, chat_id: str) -> None:
 
 # ── Обработка входящих сообщений и нажатий на кнопки ──────────────────────────
 
-def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
+def handle_message(secrets: dict, message: dict, allowed_chat_ids: set) -> None:
     token = secrets["telegram_token"]
     chat_id = str(message.get("chat", {}).get("id", ""))
     text = (message.get("text") or "").strip()
 
-    if chat_id != allowed_chat_id:
+    if chat_id not in allowed_chat_ids:
         print(f"Игнорирую сообщение из чужого чата {chat_id}")
         return
 
@@ -584,7 +584,7 @@ def handle_message(secrets: dict, message: dict, allowed_chat_id: str) -> None:
     send_report_for_period(secrets, chat_id, start_ms, end_ms)
 
 
-def handle_callback_query(secrets: dict, cq: dict, allowed_chat_id: str) -> None:
+def handle_callback_query(secrets: dict, cq: dict, allowed_chat_ids: set) -> None:
     token = secrets["telegram_token"]
     data = cq.get("data", "")
     message = cq.get("message", {})
@@ -592,7 +592,7 @@ def handle_callback_query(secrets: dict, cq: dict, allowed_chat_id: str) -> None
     message_id = message.get("message_id")
     callback_id = cq["id"]
 
-    if chat_id != allowed_chat_id:
+    if chat_id not in allowed_chat_ids:
         answer_callback_query(token, callback_id)
         print(f"Игнорирую callback из чужого чата {chat_id}")
         return
@@ -715,7 +715,7 @@ def handle_callback_query(secrets: dict, cq: dict, allowed_chat_id: str) -> None
 def main():
     secrets = load_secrets()
     token = secrets["telegram_token"]
-    allowed_chat_id = str(secrets["telegram_chat_id"])
+    allowed_chat_ids = set(secrets["telegram_chat_ids"])
 
     updates = get_updates(token)
     if not updates:
@@ -727,12 +727,12 @@ def main():
         max_update_id = upd["update_id"]
 
         if "callback_query" in upd:
-            handle_callback_query(secrets, upd["callback_query"], allowed_chat_id)
+            handle_callback_query(secrets, upd["callback_query"], allowed_chat_ids)
             continue
 
         message = upd.get("message") or upd.get("edited_message")
         if message:
-            handle_message(secrets, message, allowed_chat_id)
+            handle_message(secrets, message, allowed_chat_ids)
 
     # Подтверждаем офсет — иначе те же апдейты придут и на следующем запуске
     if max_update_id is not None:
