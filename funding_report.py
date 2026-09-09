@@ -569,7 +569,23 @@ def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
     sig = _mexc_sign(api_key, api_secret, timestamp, [])
     headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
 
-    resp = requests.get(f"{base_url}/api/v1/private/position/open_positions", headers=headers, timeout=30)
+    # Прокси нужен по той же причине, что и в fetch_mexc() — этот эндпоинт
+    # (в отличие от него) раньше запросов без прокси не делал вовсе, из-за
+    # чего IP-блокировка со стороны MEXC (403) не лечилась выставлением
+    # MEXC_PROXY, как для остальных функций.
+    proxies = _get_mexc_proxies()
+    if proxies:
+        print(f"[MEXC DEBUG] open_positions через прокси: {proxies['https'].split('@')[-1]}")
+
+    resp = requests.get(
+        f"{base_url}/api/v1/private/position/open_positions",
+        headers=headers, timeout=30, proxies=proxies,
+    )
+    # Тело парсим до raise_for_status() — при 4xx MEXC обычно кладёт в JSON
+    # более конкретную причину (например код блокировки/бана ключа), чем
+    # голый текст "403 Forbidden" из requests.
+    if not resp.ok:
+        print(f"[MEXC DEBUG] open_positions HTTP {resp.status_code}, тело ответа: {resp.text}")
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success", False):

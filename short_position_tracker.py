@@ -101,6 +101,7 @@ from funding_report import (
     _bybit_sign,
     _gate_sign,
     _get_gate_proxies,
+    _get_mexc_proxies,
     _get_proxies,
     _kucoin_signed_get,
     _mexc_sign,
@@ -171,7 +172,10 @@ def _fetch_mexc_open_shorts(secrets: dict) -> list:
     timestamp = str(int(time.time() * 1000))
     sig = _mexc_sign(api_key, api_secret, timestamp, [])
     headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-    resp = requests.get(f"{base_url}/api/v1/private/position/open_positions", headers=headers, timeout=30)
+    resp = requests.get(
+        f"{base_url}/api/v1/private/position/open_positions",
+        headers=headers, timeout=30, proxies=_get_mexc_proxies(),
+    )
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success", False):
