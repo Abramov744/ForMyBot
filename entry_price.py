@@ -198,7 +198,10 @@ def _mexc_position_entry(secrets: dict, symbol: str) -> dict | None:
     timestamp = str(int(time.time() * 1000))
     sig = _mexc_sign(api_key, api_secret, timestamp, [])
     headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-    resp = requests.get(f"{base_url}/api/v1/private/position/open_positions", headers=headers, timeout=30)
+    resp = requests.get(
+        f"{base_url}/api/v1/private/position/open_positions",
+        headers=headers, timeout=30, proxies=_get_mexc_proxies(),
+    )
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success", False):
