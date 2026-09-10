@@ -69,6 +69,7 @@ from datetime import datetime, timezone
 
 import requests
 
+import aster_interval_history
 from funding_report import (
     MSK,
     load_secrets,
@@ -388,10 +389,18 @@ def check_funding_alerts(secrets: dict, state: dict) -> None:
             key = (exchange, symbol)
             seen_keys.add(key)
             try:
-                rate, next_ms, _interval_hours = get_predicted_rate(exchange, symbol)
+                rate, next_ms, interval_hours = get_predicted_rate(exchange, symbol)
             except Exception as e:
                 print(f"[alerts/{exchange}/{symbol}] Ошибка получения прогнозной ставки: {e}")
                 continue
+
+            # Побочный эффект: копим историю ФАКТИЧЕСКИ действующего интервала
+            # funding по Aster (см. aster_interval_history.py про то, зачем) —
+            # этот цикл и так уже раз в ALERT_CHECK_INTERVAL_MINUTES получает
+            # актуальный interval_hours для каждого открытого символа, лишних
+            # запросов к бирже это не добавляет.
+            if exchange == "aster":
+                aster_interval_history.record_observation(symbol, interval_hours)
 
             was_negative = state.get(key, False)
             is_negative = rate < FUNDING_ALERT_THRESHOLD

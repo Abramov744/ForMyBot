@@ -80,11 +80,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 
+import aster_interval_history
 from funding_report import MSK, _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
 from funding_alerts import (
     get_predicted_rate,
     annualize,
-    _fetch_aster_funding_intervals,
     ASTER_DEFAULT_FUNDING_INTERVAL_HOURS,
     BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS,
     MEXC_DEFAULT_FUNDING_INTERVAL_HOURS,
@@ -339,6 +339,15 @@ def _collect_series(open_results: dict) -> dict:
                 t_ms = int(float(raw_t)) * (1000 if time_in_seconds else 1)
                 by_symbol_times[sym].append(t_ms)
 
+            # Для Aster интервал начисления по символу иногда временно
+            # сокращается биржей (см. aster_interval_history.py) — историю
+            # ФАКТИЧЕСКИ наблюдённых интервалов грузим один раз на всю
+            # биржу (не на каждый символ по отдельности), она нужна ниже
+            # для точки в точку, а не только "текущий" интервал разом на
+            # всю историю символа (так график не "плывёт" задним числом
+            # после того как интервал у биржи вернётся к дефолту).
+            aster_intervals_by_symbol = aster_interval_history.load_history() if exchange == "aster" else {}
+
             for symbol, times in by_symbol_times.items():
                 # max(), не min() — не запрашиваем историю раньше cutoff_ms,
                 # даже если позиция открыта раньше (см. MAX_CHART_LOOKBACK_DAYS)
@@ -346,10 +355,11 @@ def _collect_series(open_results: dict) -> dict:
                 try:
                     if exchange == "aster":
                         raw_points = _fetch_aster_rate_history(symbol, start_ms, now_ms)
-                        interval_hours = _fetch_aster_funding_intervals().get(
-                            symbol, ASTER_DEFAULT_FUNDING_INTERVAL_HOURS,
-                        )
-                        points = [(t, r, interval_hours) for t, r in raw_points]
+                        hist = aster_intervals_by_symbol.get(symbol, [])
+                        points = [
+                            (t, r, aster_interval_history.interval_at(hist, t, ASTER_DEFAULT_FUNDING_INTERVAL_HOURS))
+                            for t, r in raw_points
+                        ]
                     elif exchange == "mexc":
                         points = _fetch_mexc_rate_history(symbol, start_ms, now_ms)
                     else:  # gate
