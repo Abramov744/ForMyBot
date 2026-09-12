@@ -376,11 +376,36 @@ def record_position_close(exchange: str, symbol: str) -> bool:
     close_time_value = _with_sheets_retry(
         ws.acell, _CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE",
     ).value
-    if close_time_value is None:
-        print(f"[sheets_sync] Ячейка {_CLOSE_TIMESTAMP_CELL} пуста — нечего записать в F{row_number} для {exchange}/{symbol}.", flush=True)
+    # close_time_value должно быть непустым числом (серийная дата) — F6 у
+    # пользователя это =ТДАТА(), она никогда не бывает None. Но пустая
+    # СТРОКА "" (например, если F6 когда-нибудь станет условной формулой) —
+    # тоже "нечего писать", просто не ловится проверкой "is None": строка
+    # реального бага (12.09.2026) — API отчитался об успехе, а F осталась
+    # пустой на глаз у пользователя, причина так и не установлена железно,
+    # поэтому здесь и добавлена read-back проверка ниже, а не просто догадка.
+    if close_time_value is None or close_time_value == "":
+        print(f"[sheets_sync] Ячейка {_CLOSE_TIMESTAMP_CELL} пуста (значение: {close_time_value!r}) — "
+              f"нечего записать в F{row_number} для {exchange}/{symbol}.", flush=True)
         return False
 
+    print(f"[sheets_sync] Пишу в F{row_number} для {exchange}/{symbol} значение {close_time_value!r} "
+          f"(тип {type(close_time_value).__name__}) из {_CLOSE_TIMESTAMP_CELL}.", flush=True)
     _with_sheets_retry(ws.batch_update, [{"range": f"F{row_number}", "values": [[close_time_value]]}])
+
+    # Читаем обратно то, что реально оказалось в ячейке — Sheets API в
+    # редких случаях может отчитаться об успехе, ничего фактически не
+    # применив (защищённый диапазон, неожиданный формат ответа и т.п.), и
+    # тогда лучше честно сообщить об ошибке, чем один раз соврать про
+    # "записано" в финансовой таблице (см. CLAUDE.md).
+    written_value = _with_sheets_retry(
+        ws.acell, f"F{row_number}", value_render_option="UNFORMATTED_VALUE",
+    ).value
+    if written_value != close_time_value:
+        print(f"[sheets_sync] После записи в F{row_number} для {exchange}/{symbol} значение при чтении "
+              f"({written_value!r}) не совпадает с записанным ({close_time_value!r}) — считаю запись неудавшейся.",
+              flush=True)
+        return False
+
     print(f"[sheets_sync] Записана дата закрытия в F{row_number} для {exchange}/{symbol}.", flush=True)
     return True
 
