@@ -56,6 +56,22 @@ WINDOW_MINUTES_APPROX = 360    # Aster/Gate/Lighter — время оценен�
 # пропустится (см. _search_spot_entry) — это не ошибка, ищем в порядке приоритета.
 QUOTE_CANDIDATES = ["USDT", "USDC", "WETH"]
 
+# Один и тот же актив на разных биржах иногда торгуется под РАЗНЫМИ
+# тикерами (обычно из-за конфликта имени с уже занятым на этой конкретной
+# бирже тикером) — сопоставить их автоматически неоткуда, это не выводится
+# из API ни одной биржи. Реальный случай (подтверждено пользователем,
+# 14.09.2026): шорт на Lighter под тикером "AI", встречная спот-покупка
+# того же актива — на MEXC, но там он называется "AIINU", поэтому
+# _search_spot_entry искал на MEXC пару "AIUSDT" и ничего не находил
+# (short_position_tracker так и не создавал строку — покупка на споте
+# "не найдена", хотя по факту была). Ключ — (биржа, база_актива на других
+# биржах), значение — реальный тикер этого актива именно на этой бирже.
+# Пополняется по мере обнаружения новых случаев — не пытаться угадывать
+# заранее.
+BASE_ASSET_ALIASES = {
+    ("mexc", "AI"): "AIINU",
+}
+
 
 # ── Извлечение базового актива из формата символа конкретной биржи ───────────
 
@@ -740,7 +756,8 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
             key = _SPOT_EXCHANGE_SECRET_KEY.get(exchange)
             if not key or key not in secrets:
                 continue
-            spot_symbol = symbol_fn(base_asset, quote)
+            exchange_base_asset = BASE_ASSET_ALIASES.get((exchange, base_asset), base_asset)
+            spot_symbol = symbol_fn(exchange_base_asset, quote)
             try:
                 trades = fetch_fn(secrets, spot_symbol, start_ms, end_ms)
             except Exception as e:
