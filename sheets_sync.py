@@ -313,23 +313,40 @@ def sync_once(secrets: dict) -> None:
         print(f"[sheets_sync] Пропущена строка {row_number} ({coin!r}, биржа={exchange_raw!r}): {reason}", flush=True)
 
 
-def record_position_close(exchange: str, symbol: str) -> bool:
+_COL_SPOT_CLOSE_PRICE = "AD"     # AD — цена закрытия на споте
+_COL_FUTURES_CLOSE_PRICE = "AE"  # AE — цена закрытия фьючерса
+
+
+def record_position_close(
+    exchange: str, symbol: str,
+    spot_close_price: float | None = None,
+    futures_close_price: float | None = None,
+) -> bool:
     """
-    Записывает дату закрытия позиции в столбец F соответствующей строки —
-    вызывается из sltp_alerts.py сразу при обнаружении закрытия (независимо
-    от причины — SL/TP/вручную), а не по расписанию, как sync_once().
+    Записывает данные закрытия позиции в соответствующую строку — вызывается
+    из sltp_alerts.py сразу при обнаружении закрытия (независимо от причины
+    — SL/TP/вручную), а не по расписанию, как sync_once():
+      - столбец F — дата закрытия (всегда, если удалось прочитать F6);
+      - столбец AD — цена закрытия на споте (только если spot_close_price
+        передан — не удалось найти продажу на споте в окне поиска, ничего
+        не пишем, а не угадываем);
+      - столбец AE — цена закрытия фьючерса (аналогично, только если
+        futures_close_price передан).
+    Каждый столбец пишется независимо — отсутствие одной цены (например,
+    биржа не поддерживает поиск причины/цены закрытия фьючерса, см.
+    sltp_alerts._CLOSE_PRICE_FETCHERS) не должно блокировать запись
+    остальных.
 
-    ЧТО ИМЕННО ПИШЕТСЯ: не "текущее время выполнения скрипта", а значение
-    ячейки _CLOSE_TIMESTAMP_CELL (F6) на этот момент — по всей видимости
-    живая формула вроде =NOW(), которую пользователь при ручном закрытии
-    сделки в таблице копирует в F как статичный "снимок" времени, а не как
-    формулу/ссылку (иначе она продолжала бы пересчитываться и дальше).
-    Здесь делается ровно то же самое, только автоматически: читается
-    ТЕКУЩЕЕ вычисленное значение F6 и копируется в F{row} как значение.
+    ЧТО ИМЕННО ПИШЕТСЯ В F: не "текущее время выполнения скрипта", а
+    значение ячейки _CLOSE_TIMESTAMP_CELL (F6) на этот момент — по всей
+    видимости живая формула вроде =ТДАТА() (подтверждено пользователем),
+    которую он при ручном закрытии сделки в таблице копирует в F как
+    статичный "снимок" времени, а не как формулу/ссылку. Здесь делается
+    ровно то же самое, только автоматически.
 
-    Читается и пишется НЕФОРМАТИРОВАННОЕ (числовое, serial-date) значение,
-    а не отображаемая строка (value_render_option="UNFORMATTED_VALUE") —
-    так в F{row} попадает настоящее числовое представление даты/времени
+    Читается и пишется НЕФОРМАТИРОВАННОЕ (числовое, serial-date) значение
+    для F, а не отображаемая строка (value_render_option="UNFORMATTED_VALUE")
+    — так в F{row} попадает настоящее числовое представление даты/времени
     (в уже отформатированную как дата ячейку столбца F), а не текстовая
     строка, которую Google Sheets не распознает как дату и не учтёт в
     формулах вроде статуса в колонке C.
@@ -339,11 +356,10 @@ def record_position_close(exchange: str, symbol: str) -> bool:
     закрывшаяся позиция уже не входит в список открытых на бирже, поэтому
     ищем среди строк со статусом "active" в самой таблице напрямую.
 
-    Возвращает True, если запись удалась (нашлась ровно одна подходящая
-    активная строка), False — если не нашлось ни одной / нашлось
-    несколько, или Google Sheets не подключены вовсе (тогда ничего не
-    трогаем — как и в sync_once, лучше не тронуть, чем один раз угадать
-    неправильно в финансовой таблице).
+    Возвращает True, если хотя бы одна ячейка успешно записана и прошла
+    read-back проверку (см. ниже), False — если подходящая строка не
+    нашлась/неоднозначна, Google Sheets не подключены, или писать оказалось
+    нечего (все три значения пустые/не прошли проверку).
     """
     if not (os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")):
         return False  # Google Sheets не подключены — тихо ничего не делаем
@@ -369,13 +385,11 @@ def record_position_close(exchange: str, symbol: str) -> bool:
 
     if len(matches) != 1:
         reason = "нет подходящей активной строки" if not matches else f"неоднозначно — подошло несколько строк: {matches}"
-        print(f"[sheets_sync] Не удалось записать дату закрытия {exchange}/{symbol} в F: {reason}", flush=True)
+        print(f"[sheets_sync] Не удалось записать данные закрытия {exchange}/{symbol}: {reason}", flush=True)
         return False
 
     row_number = matches[0]
-    close_time_value = _with_sheets_retry(
-        ws.acell, _CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE",
-    ).value
+
     # close_time_value должно быть непустым числом (серийная дата) — F6 у
     # пользователя это =ТДАТА(), она никогда не бывает None. Но пустая
     # СТРОКА "" (например, если F6 когда-нибудь станет условной формулой) —
@@ -383,31 +397,50 @@ def record_position_close(exchange: str, symbol: str) -> bool:
     # реального бага (12.09.2026) — API отчитался об успехе, а F осталась
     # пустой на глаз у пользователя, причина так и не установлена железно,
     # поэтому здесь и добавлена read-back проверка ниже, а не просто догадка.
+    close_time_value = _with_sheets_retry(
+        ws.acell, _CLOSE_TIMESTAMP_CELL, value_render_option="UNFORMATTED_VALUE",
+    ).value
+
+    updates = []
     if close_time_value is None or close_time_value == "":
         print(f"[sheets_sync] Ячейка {_CLOSE_TIMESTAMP_CELL} пуста (значение: {close_time_value!r}) — "
-              f"нечего записать в F{row_number} для {exchange}/{symbol}.", flush=True)
+              f"F{row_number} для {exchange}/{symbol} не трогаю.", flush=True)
+    else:
+        updates.append({"range": f"F{row_number}", "values": [[close_time_value]]})
+    if spot_close_price is not None:
+        updates.append({"range": f"{_COL_SPOT_CLOSE_PRICE}{row_number}", "values": [[round(spot_close_price, 8)]]})
+    if futures_close_price is not None:
+        updates.append({"range": f"{_COL_FUTURES_CLOSE_PRICE}{row_number}", "values": [[round(futures_close_price, 8)]]})
+
+    if not updates:
+        print(f"[sheets_sync] Для {exchange}/{symbol} нечего записывать в строку {row_number} "
+              f"(нет ни даты закрытия, ни цен).", flush=True)
         return False
 
-    print(f"[sheets_sync] Пишу в F{row_number} для {exchange}/{symbol} значение {close_time_value!r} "
-          f"(тип {type(close_time_value).__name__}) из {_CLOSE_TIMESTAMP_CELL}.", flush=True)
-    _with_sheets_retry(ws.batch_update, [{"range": f"F{row_number}", "values": [[close_time_value]]}])
+    print(f"[sheets_sync] Пишу в строку {row_number} для {exchange}/{symbol}: "
+          f"{[(u['range'], u['values'][0][0]) for u in updates]}.", flush=True)
+    _with_sheets_retry(ws.batch_update, updates)
 
-    # Читаем обратно то, что реально оказалось в ячейке — Sheets API в
-    # редких случаях может отчитаться об успехе, ничего фактически не
+    # Читаем обратно то, что реально оказалось в каждой ячейке — Sheets API
+    # в редких случаях может отчитаться об успехе, ничего фактически не
     # применив (защищённый диапазон, неожиданный формат ответа и т.п.), и
     # тогда лучше честно сообщить об ошибке, чем один раз соврать про
-    # "записано" в финансовой таблице (см. CLAUDE.md).
-    written_value = _with_sheets_retry(
-        ws.acell, f"F{row_number}", value_render_option="UNFORMATTED_VALUE",
-    ).value
-    if written_value != close_time_value:
-        print(f"[sheets_sync] После записи в F{row_number} для {exchange}/{symbol} значение при чтении "
-              f"({written_value!r}) не совпадает с записанным ({close_time_value!r}) — считаю запись неудавшейся.",
-              flush=True)
-        return False
+    # "записано" в финансовой таблице (см. CLAUDE.md). Реальный случай
+    # именно с этим для F — 12.09.2026.
+    any_ok = False
+    for u in updates:
+        rng, expected = u["range"], u["values"][0][0]
+        written_value = _with_sheets_retry(ws.acell, rng, value_render_option="UNFORMATTED_VALUE").value
+        if written_value != expected:
+            print(f"[sheets_sync] После записи в {rng} для {exchange}/{symbol} значение при чтении "
+                  f"({written_value!r}) не совпадает с записанным ({expected!r}) — считаю эту запись неудавшейся.",
+                  flush=True)
+        else:
+            any_ok = True
 
-    print(f"[sheets_sync] Записана дата закрытия в F{row_number} для {exchange}/{symbol}.", flush=True)
-    return True
+    if any_ok:
+        print(f"[sheets_sync] Записаны данные закрытия в строку {row_number} для {exchange}/{symbol}.", flush=True)
+    return any_ok
 
 
 SHEET_SYNC_INTERVAL_MINUTES = float(os.environ.get("SHEET_SYNC_INTERVAL_MINUTES", "60"))
