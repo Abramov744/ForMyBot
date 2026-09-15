@@ -378,7 +378,7 @@ def _infer_open_time_via_funding(secrets: dict, exchange: str, symbol: str) -> i
 
 # ── Поиск цены покупки на споте в истории сделок ──────────────────────────────
 
-def _fetch_bybit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+def _fetch_bybit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
     base_url = "https://api.bybit.com"
     recv_window = "5000"
     proxies = _get_proxies()
@@ -401,9 +401,10 @@ def _fetch_bybit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
     if data.get("retCode", 0) != 0:
         raise RuntimeError(f"Bybit execution/list error {data.get('retCode')}: {data.get('retMsg')}")
     items = data.get("result", {}).get("list", [])
+    wanted_side = "Buy" if side == "buy" else "Sell"
     return [
         {"price": float(i["execPrice"]), "qty": float(i["execQty"]), "side": i.get("side")}
-        for i in items if i.get("side") == "Buy"
+        for i in items if i.get("side") == wanted_side
     ]
 
 
@@ -411,7 +412,7 @@ def _mexc_spot_sign(api_secret: str, query_string: str) -> str:
     return hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _fetch_mexc_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+def _fetch_mexc_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
     """
     Спот-API MEXC — отдельный от контрактного, со своей (Binance-совместимой)
     схемой подписи: HMAC-SHA256 от query-строки запроса секретным ключом,
@@ -448,11 +449,11 @@ def _fetch_mexc_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: i
     resp.raise_for_status()
     return [
         {"price": float(t["price"]), "qty": float(t["qty"]), "side": "Buy" if t.get("isBuyer") else "Sell"}
-        for t in data if t.get("isBuyer")
+        for t in data if bool(t.get("isBuyer")) == (side == "buy")
     ]
 
 
-def _fetch_gate_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+def _fetch_gate_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
     base_url = "https://api.gateio.ws"
     url_path = "/api/v4/spot/my_trades"
     proxies = _get_gate_proxies()
@@ -472,11 +473,11 @@ def _fetch_gate_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: i
         raise RuntimeError(f"Gate my_trades error {data.get('label')}: {data.get('message')}")
     return [
         {"price": float(t["price"]), "qty": float(t["amount"]), "side": t.get("side")}
-        for t in (data if isinstance(data, list) else []) if t.get("side") == "buy"
+        for t in (data if isinstance(data, list) else []) if t.get("side") == side
     ]
 
 
-def _fetch_kucoin_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int) -> list:
+def _fetch_kucoin_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
     """
     GET /api/v1/fills — история исполненных сделок спота KuCoin. symbol —
     спот-формат через дефис ("BTC-USDT", см. _SPOT_TRADE_FETCHERS ниже).
@@ -494,7 +495,7 @@ def _fetch_kucoin_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
     items = (data.get("data") or {}).get("items") or []
     return [
         {"price": float(t["price"]), "qty": float(t["size"]), "side": t.get("side")}
-        for t in items if t.get("side") == "buy"
+        for t in items if t.get("side") == side
     ]
 
 
@@ -718,14 +719,18 @@ def _fetch_uniswap_spot_trades_all_quotes(secrets: dict, base_asset: str, start_
 
 
 _SPOT_TRADE_FETCHERS = {
-    "bybit": (lambda secrets, symbol, s, e: _fetch_bybit_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "mexc":  (lambda secrets, symbol, s, e: _fetch_mexc_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}{quote}"),
-    "gate":  (lambda secrets, symbol, s, e: _fetch_gate_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}_{quote}"),
-    "kucoin": (lambda secrets, symbol, s, e: _fetch_kucoin_spot_trades(secrets, symbol, s, e), lambda base, quote: f"{base}-{quote}"),
+    "bybit": (lambda secrets, symbol, s, e, side: _fetch_bybit_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
+    "mexc":  (lambda secrets, symbol, s, e, side: _fetch_mexc_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
+    "gate":  (lambda secrets, symbol, s, e, side: _fetch_gate_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}_{quote}"),
+    "kucoin": (lambda secrets, symbol, s, e, side: _fetch_kucoin_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
     # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
     # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
-    # _search_spot_entry), а не через этот реестр из (fetch_fn, symbol_fn) на
-    # каждую котировку, как у CEX-бирж.
+    # _search_spot_trade), а не через этот реестр из (fetch_fn, symbol_fn) на
+    # каждую котировку, как у CEX-бирж. Кроме того, Uniswap-сканер умеет
+    # находить только ВХОДЯЩИЕ переводы актива на кошелёк (покупку) — для
+    # продажи (см. _search_spot_exit) понадобился бы отдельный сканер
+    # ИСХОДЯЩИХ переводов, которого нет, поэтому при side="sell" Uniswap
+    # просто не участвует в поиске (см. _search_spot_trade).
 }
 
 _SPOT_EXCHANGE_SECRET_KEY = {
@@ -736,15 +741,22 @@ _SPOT_EXCHANGE_SECRET_KEY = {
 }
 
 
-def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_minutes: int) -> dict | None:
+def _search_spot_trade(secrets: dict, base_asset: str, center_ms: int, window_minutes: int, side: str) -> dict | None:
+    """Общая реализация для _search_spot_entry (side="buy") и
+    _search_spot_exit (side="sell") — ищет сделки нужной стороны по всем
+    подключённым спот-биржам в окне ±window_minutes вокруг center_ms и
+    возвращает средневзвешенную (VWAP) цену/объём. Порядок котировок —
+    QUOTE_CANDIDATES (USDT/USDC/WETH), берём первую, по которой вообще
+    нашлись сделки хоть на одной бирже — не смешиваем котировки между собой."""
     start_ms = center_ms - window_minutes * 60 * 1000
     end_ms = center_ms + window_minutes * 60 * 1000
 
     # Uniswap сканируется ОДИН раз на все котировки сразу (а не по разу на
     # каждую котировку внутри цикла ниже, как CEX-биржи) — иначе на каждый
     # поиск цены заново прогоняются все ~60 EVM-сетей по три раза подряд.
+    # Только для покупок (see докстринг _SPOT_TRADE_FETCHERS выше).
     uniswap_by_quote: dict = {}
-    if "uniswap_wallet_address" in secrets:
+    if side == "buy" and "uniswap_wallet_address" in secrets:
         try:
             uniswap_by_quote = _fetch_uniswap_spot_trades_all_quotes(secrets, base_asset, start_ms, end_ms)
         except Exception as e:
@@ -759,7 +771,7 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
             exchange_base_asset = BASE_ASSET_ALIASES.get((exchange, base_asset), base_asset)
             spot_symbol = symbol_fn(exchange_base_asset, quote)
             try:
-                trades = fetch_fn(secrets, spot_symbol, start_ms, end_ms)
+                trades = fetch_fn(secrets, spot_symbol, start_ms, end_ms, side)
             except Exception as e:
                 print(f"[entry_price/{exchange}] Ошибка поиска спот-сделок {spot_symbol}: {e}")
                 continue
@@ -787,6 +799,17 @@ def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_mi
             }
 
     return None
+
+
+def _search_spot_entry(secrets: dict, base_asset: str, center_ms: int, window_minutes: int) -> dict | None:
+    return _search_spot_trade(secrets, base_asset, center_ms, window_minutes, side="buy")
+
+
+def _search_spot_exit(secrets: dict, base_asset: str, center_ms: int, window_minutes: int) -> dict | None:
+    """Как _search_spot_entry, но ищет ПРОДАЖУ (сделки side="sell") — для
+    столбца AD при закрытии позиции (см. sltp_alerts.py). Не включает
+    Uniswap (см. докстринг _SPOT_TRADE_FETCHERS)."""
+    return _search_spot_trade(secrets, base_asset, center_ms, window_minutes, side="sell")
 
 
 # ── Итоговая функция для калькулятора ─────────────────────────────────────────

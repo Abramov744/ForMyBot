@@ -5,9 +5,18 @@
 дополнительно, где это можно определить надёжно, уточняется сама причина
 (SL/TP). В отличие от funding_alerts.py — тот про ставку funding, этот про
 сам факт закрытия позиции. Дополнительно, при каждом обнаруженном закрытии,
-в Google Sheet (см. sheets_sync.record_position_close) записывается дата
-закрытия в столбец F соответствующей строки — тот же "снимок времени" из
-ячейки F6, что пользователь копирует туда вручную при закрытии сделки.
+в Google Sheet (см. sheets_sync.record_position_close) записывается:
+  - столбец F — дата закрытия, тот же "снимок времени" из ячейки F6, что
+    пользователь копирует туда вручную при закрытии сделки;
+  - столбец AE — цена закрытия ФЬЮЧЕРСА, последнее исполнение по символу в
+    окне SLTP_LOOKBACK_MINUTES (см. _CLOSE_PRICE_FETCHERS — не все 5 бирж
+    поддерживаются, см. её докстринг про Lighter);
+  - столбец AD — цена закрытия на СПОТЕ, продажа того же актива, найденная
+    в том же окне по всем подключённым спот-биржам сразу (симметрично
+    поиску покупки при открытии позиции, см. entry_price._search_spot_exit).
+Каждая из трёх записей — независимая попытка: отсутствие цены на одной
+бирже (не нашлась продажа/не удалось определить цену закрытия фьючерса) не
+блокирует запись остальных двух.
 
 КАК РАБОТАЕТ: каждые SLTP_CHECK_INTERVAL_MINUTES минут (по умолчанию 2 —
 заметно чаще, чем funding-алерты, т.к. тут речь о реальном закрытии
@@ -66,8 +75,13 @@ import urllib.parse
 
 import requests
 
-from funding_report import _get_proxies, _bybit_sign, _aster_sign, load_secrets, send_telegram_broadcast
+from funding_report import (
+    _get_proxies, _bybit_sign, _aster_sign, _mexc_sign, _gate_sign,
+    _get_mexc_proxies, _get_gate_proxies,
+    load_secrets, send_telegram_broadcast,
+)
 from funding_alerts import get_open_positions, EXCHANGE_LABELS
+from entry_price import _base_asset, _search_spot_exit
 from sheets_sync import record_position_close
 
 SLTP_CHECK_INTERVAL_MINUTES = float(os.environ.get("SLTP_CHECK_INTERVAL_MINUTES", "2"))
@@ -168,6 +182,166 @@ _CLOSE_REASON_FETCHERS = {
 }
 
 
+# ── Цена закрытия фьючерса (столбец AE в Google Sheet) ───────────────────────
+#
+# Отдельные функции от _*_close_reason выше, а не переиспользование уже
+# полученного там списка исполнений — тот же паттерн, что уже используется в
+# кодовой базе для "свой (но однострочный, не более) вызов того же
+# эндпоинта под конкретную задачу" (см. докстринг short_position_tracker.py
+# про entry_price._*_position_entry). Цена нужна ВСЕГДА при закрытии
+# (независимо от причины — SL/TP/вручную), а _*_close_reason возвращает
+# None целиком, если это не SL/TP — тогда бы цена терялась вместе с
+# причиной. Берём последнее (по времени) исполнение по символу в
+# SLTP_LOOKBACK_MINUTES — тот же принцип "самое новое совпадение", что и в
+# _*_close_reason, без различения стороны/типа исполнения: в узком окне
+# сразу после обнаруженного закрытия по этому символу практически всегда
+# ровно одно исполнение.
+
+def _bybit_close_price(secrets: dict, symbol: str) -> float | None:
+    proxies = _get_proxies()
+    api_key = secrets["bybit_api_key"].strip()
+    api_secret = secrets["bybit_api_secret"].strip()
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
+    recv_window = "5000"
+    timestamp = str(now_ms)
+    params_list = [
+        ("category", "linear"), ("symbol", symbol),
+        ("startTime", str(start_ms)), ("endTime", str(now_ms)), ("limit", "1"),
+    ]
+    query_string = urllib.parse.urlencode(params_list)
+    sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
+    headers = {
+        "X-BAPI-API-KEY": api_key, "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window,
+    }
+    resp = requests.get(
+        f"https://api.bybit.com/v5/execution/list?{query_string}",
+        headers=headers, timeout=15, proxies=proxies,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode", 0) != 0:
+        raise RuntimeError(f"Bybit execution/list error {data.get('retCode')}: {data.get('retMsg')}")
+    items = data.get("result", {}).get("list", [])  # Bybit отдаёт от новых к старым
+    if not items or not items[0].get("execPrice"):
+        return None
+    return float(items[0]["execPrice"])
+
+
+def _aster_close_price(secrets: dict, symbol: str) -> float | None:
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
+    nonce = int(time.time() * 1_000_000)
+    params = {
+        "symbol": symbol, "startTime": str(start_ms), "endTime": str(now_ms), "limit": "50",
+        "timestamp": str(now_ms), "nonce": str(nonce),
+        "user": secrets["user"], "signer": secrets["signer"],
+    }
+    param_str = urllib.parse.urlencode(params)
+    sig = _aster_sign(param_str, secrets["signer_private_key"])
+    resp = requests.get(
+        f"https://fapi.asterdex.com/fapi/v1/allOrders?{param_str}&signature={sig}",
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        raise RuntimeError(f"Aster allOrders error: {data}")
+    filled = [o for o in data if o.get("status") == "FILLED" and o.get("avgPrice")]
+    if not filled:
+        return None
+    latest = max(filled, key=lambda o: int(o.get("updateTime", 0)))
+    return float(latest["avgPrice"])
+
+
+def _mexc_close_price(secrets: dict, symbol: str) -> float | None:
+    """
+    GET /api/v1/private/order/list/order_deals/v3 — история исполненных
+    сделок (deals) по символу. Путь и поля ответа (price, timestamp)
+    ПОДТВЕРЖДЕНЫ по офиц. SDK ccxt (ccxt/mexc.py: fetchMyTrades для
+    контрактных рынков вызывает contractPrivateGetOrderListOrderDealsV3 —
+    этот же путь; parseTrade читает оттуда price/timestamp/side/vol и т.д.).
+    Сторону сделки (числовой код MEXC 1-4: открытие/закрытие лонга/шорта)
+    не различаем — однозначного маппинга кодов 2/4 в официальной
+    документации не нашлось, а различать не нужно: см. докстринг раздела
+    выше про "практически всегда ровно одно исполнение" в узком окне.
+    """
+    base_url = "https://api.mexc.com"
+    api_key = secrets["mexc_api_key"].strip()
+    api_secret = secrets["mexc_api_secret"].strip()
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
+    timestamp = str(now_ms)
+    params_list = [
+        ("symbol", symbol), ("page_num", "1"), ("page_size", "20"),
+        ("start_time", str(start_ms)), ("end_time", str(now_ms)),
+    ]
+    sig = _mexc_sign(api_key, api_secret, timestamp, params_list)
+    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
+    query_string = urllib.parse.urlencode(sorted(params_list, key=lambda kv: kv[0]))
+    resp = requests.get(
+        f"{base_url}/api/v1/private/order/list/order_deals/v3?{query_string}",
+        headers=headers, timeout=15, proxies=_get_mexc_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success", False):
+        raise RuntimeError(f"MEXC order_deals error {data.get('code')}: {data.get('message') or data}")
+    deals = [d for d in (data.get("data") or []) if d.get("price")]
+    if not deals:
+        return None
+    latest = max(deals, key=lambda d: int(d.get("timestamp", 0)))
+    return float(latest["price"])
+
+
+def _gate_close_price(secrets: dict, symbol: str, settle: str = "usdt") -> float | None:
+    """
+    GET /api/v4/futures/{settle}/my_trades — история исполненных сделок по
+    контракту. Путь/параметры и поля ответа (price, create_time_ms)
+    ПОДТВЕРЖДЕНЫ по офиц. SDK ccxt (ccxt/gate.py: приватный futures-
+    эндпоинт '{settle}/my_trades') и по WebSocket-схеме Gate для того же
+    потока сделок (та же модель полей — id/contract/create_time_ms/price/
+    size/role).
+    """
+    base_url = "https://api.gateio.ws"
+    url_path = f"/api/v4/futures/{settle}/my_trades"
+    proxies = _get_gate_proxies()
+    api_key = secrets["gate_api_key"].strip()
+    api_secret = secrets["gate_api_secret"].strip()
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
+    params_list = [
+        ("contract", symbol), ("from", str(start_ms // 1000)),
+        ("to", str(now_ms // 1000)), ("limit", "20"),
+    ]
+    query_string = urllib.parse.urlencode(params_list)
+    sig, timestamp = _gate_sign(api_secret, "GET", url_path, query_string)
+    headers = {"KEY": api_key, "Timestamp": timestamp, "SIGN": sig, "Accept": "application/json"}
+    resp = requests.get(f"{base_url}{url_path}?{query_string}", headers=headers, timeout=15, proxies=proxies)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("label"):
+        raise RuntimeError(f"Gate my_trades error {data.get('label')}: {data.get('message')}")
+    trades = [t for t in (data if isinstance(data, list) else []) if t.get("price")]
+    if not trades:
+        return None
+    latest = max(trades, key=lambda t: int(t.get("create_time_ms", 0)))
+    return float(latest["price"])
+
+
+# Lighter намеренно не включён — как и для _CLOSE_REASON_FETCHERS, публичного
+# документированного эндпоинта истории сделок/ордеров аккаунта не нашлось
+# (см. докстринг модуля). Если понадобится — присылайте реальный случай
+# (символ/время закрытия), тогда можно будет доработать прицельно.
+_CLOSE_PRICE_FETCHERS = {
+    "bybit": _bybit_close_price,
+    "aster": _aster_close_price,
+    "mexc": _mexc_close_price,
+    "gate": _gate_close_price,
+}
+
+
 def _fmt_alert(exchange: str, symbol: str, reason: tuple | None) -> str:
     label = EXCHANGE_LABELS.get(exchange, exchange)
     if reason is None:
@@ -207,6 +381,7 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
     """
     token = secrets["telegram_token"]
     chat_ids = secrets["telegram_chat_ids"]
+    now_ms = int(time.time() * 1000)  # центр окна поиска цены/продажи на споте при закрытии (см. ниже)
 
     current_open, failed_exchanges = get_open_positions(secrets)  # {exchange: [symbols]}
     if failed_exchanges:
@@ -239,15 +414,46 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
             send_telegram_broadcast(token, chat_ids, text)
             print(f"[sltp] Отправлен алерт: {exchange} {symbol} причина={reason}")
 
-            # Запись даты закрытия в Google Sheet — отдельным try/except:
-            # если она упадёт (таблица не подключена, неоднозначное
-            # совпадение строки и т.п.), это не должно повлиять на уже
-            # отправленный Telegram-алерт и не должно останавливать
-            # обработку остальных закрывшихся позиций в этом же проходе.
+            # Цена закрытия фьючерса (столбец AE) — только для бирж из
+            # _CLOSE_PRICE_FETCHERS (см. её докстринг про Lighter). Ошибка
+            # не блокирует ни алерт (уже отправлен), ни запись остального.
+            futures_close_price = None
+            price_fetcher = _CLOSE_PRICE_FETCHERS.get(exchange)
+            if price_fetcher:
+                try:
+                    futures_close_price = price_fetcher(secrets, symbol)
+                    if futures_close_price is None:
+                        print(f"[sltp/{exchange}/{symbol}] Цена закрытия фьючерса не найдена "
+                              f"в окне {SLTP_LOOKBACK_MINUTES:.0f} мин.")
+                except Exception as e:
+                    print(f"[sltp/{exchange}/{symbol}] Не удалось получить цену закрытия фьючерса: {e}")
+
+            # Цена закрытия на споте (столбец AD) — ищем ПРОДАЖУ того же
+            # актива в том же окне, по всем подключённым спот-биржам сразу
+            # (симметрично поиску покупки при открытии, см. entry_price.
+            # _search_spot_exit). Если не нашлась — не гадаем, оставляем
+            # пустой, как и для остальных полей в этой таблице.
+            spot_close_price = None
             try:
-                record_position_close(exchange, symbol)
+                base_asset = _base_asset(exchange, symbol)
+                spot_exit = _search_spot_exit(secrets, base_asset, now_ms, SLTP_LOOKBACK_MINUTES)
+                if spot_exit:
+                    spot_close_price = spot_exit["price"]
+                else:
+                    print(f"[sltp/{exchange}/{symbol}] Продажа на споте не найдена ни на одной бирже "
+                          f"в окне ±{SLTP_LOOKBACK_MINUTES:.0f} мин.")
             except Exception as e:
-                print(f"[sltp/{exchange}/{symbol}] Не удалось записать дату закрытия в Google Sheet: {e}")
+                print(f"[sltp/{exchange}/{symbol}] Ошибка поиска продажи на споте: {e}")
+
+            # Запись в Google Sheet — отдельным try/except: если она упадёт
+            # (таблица не подключена, неоднозначное совпадение строки и
+            # т.п.), это не должно повлиять на уже отправленный
+            # Telegram-алерт и не должно останавливать обработку остальных
+            # закрывшихся позиций в этом же проходе.
+            try:
+                record_position_close(exchange, symbol, spot_close_price, futures_close_price)
+            except Exception as e:
+                print(f"[sltp/{exchange}/{symbol}] Не удалось записать данные закрытия в Google Sheet: {e}")
 
     # Для бирж с успешным запросом — новое состояние из current_open. Для
     # бирж из failed_exchanges — состояние НЕ трогаем, переносим prev_open
