@@ -24,7 +24,11 @@
     entry_price/openAvgPrice/avgEntryPrice, что уже проверены и
     используются в entry_price._*_position_entry для автоподбора цены в
     калькуляторе, здесь просто ещё и извлекаются в список открытых
-    шортов, а не только при точечном запросе по одному символу).
+    шортов, а не только при точечном запросе по одному символу);
+  - M — название спот-биржи(-бирж), где нашлась встречная покупка, в
+    формате "Биржа spot" (например, "MEXC spot") — spot_result["exchanges"]
+    из entry_price._search_spot_entry уже содержит список всех бирж, чьи
+    сделки вошли в VWAP по X; если их несколько — через запятую.
   Если цену определить не удалось (поле отсутствует в ответе биржи) —
   соответствующая ячейка просто не пишется (остаётся пустой для ручного
   заполнения), а не заполняется нулём/угадыванием.
@@ -122,6 +126,16 @@ from sheets_sync import (
 # ордера и комиссии в монете на разных биржах, но достаточно жёстко, чтобы
 # не принять за одну сделку два случайных независимых ордера).
 QTY_TOLERANCE = 0.01
+
+# Отображаемые названия спот-бирж для столбца M — только те, что вообще
+# могут оказаться в spot_result["exchanges"] (см. entry_price._SPOT_TRADE_
+# FETCHERS + Uniswap отдельно), не общий EXCHANGE_LABELS из funding_alerts/
+# funding_chart — там нет kucoin/uniswap, потому что они не участвуют в
+# фандинг-отчётах/алертах, только в поиске спот-цены.
+_SPOT_EXCHANGE_LABELS = {
+    "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate",
+    "kucoin": "KuCoin", "uniswap": "Uniswap",
+}
 
 
 # ── Открытые ШОРТ-позиции по каждой бирже: [{"symbol", "qty", "entry_time_ms", "time_is_exact"}, ...] ──
@@ -442,6 +456,10 @@ def check_for_new_shorts(secrets: dict) -> None:
             updates.append({"range": f"O{row_number}", "values": [[exchange]]})
             updates.append({"range": f"W{row_number}", "values": [[round(spot_result["qty"], 8)]]})
             updates.append({"range": f"X{row_number}", "values": [[round(spot_result["price"], 8)]]})
+            spot_exchanges_label = ", ".join(
+                f"{_SPOT_EXCHANGE_LABELS.get(ex, ex)} spot" for ex in spot_result["exchanges"]
+            )
+            updates.append({"range": f"M{row_number}", "values": [[spot_exchanges_label]]})
 
             futures_price = short.get("price")
             if futures_price is not None:
@@ -455,7 +473,8 @@ def check_for_new_shorts(secrets: dict) -> None:
 
             print(f"[short_position_tracker] Новая строка {row_number}: {exchange}/{coin_base}, "
                   f"объём шорта {short['qty']:g} ≈ спот {spot_result['qty']:g}{approx_note}, "
-                  f"цена спота {spot_result['price']:g}, цена фьючерса {futures_price if futures_price is not None else '?'}.",
+                  f"цена спота {spot_result['price']:g} ({spot_exchanges_label}), "
+                  f"цена фьючерса {futures_price if futures_price is not None else '?'}.",
                   flush=True)
 
     if updates:
