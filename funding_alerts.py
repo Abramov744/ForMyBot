@@ -78,12 +78,14 @@ from liquidation_alerts import (
 )
 from funding_report import (
     MSK,
+    LIGHTER_BASE_URL,
     load_secrets,
     send_telegram_broadcast,
     fetch_aster_open_symbols,
     fetch_bybit_open_symbols,
     fetch_lighter_open_symbols,
     fetch_lighter_markets,
+    fetch_lighter_mark_prices,
     fetch_mexc_open_symbols,
     fetch_gate_open_symbols,
     _get_proxies,
@@ -456,14 +458,59 @@ def alert_loop(secrets: dict | None = None) -> None:
 
 # ── Отчёт по запросу: прогнозная ставка для команды /rates в Telegram ────────
 
-# Только биржи, для которых liquidation_alerts.py уже возвращает и цену
-# входа, и текущую (mark/fair) цену В ОДНОМ ответе — см. докстринг
-# build_predicted_rates_report про Lighter.
+def _lighter_price_positions(secrets: dict) -> list:
+    """
+    {"symbol", "entry_price", "mark_price"} по каждой открытой позиции на
+    Lighter — в отличие от liquidation_alerts._*_liquidation_positions, БЕЗ
+    цены ликвидации (там её и нет для Lighter, см. докстринг
+    liquidation_alerts.py). entry_price — GET /api/v1/account, тот же вызов
+    и тот же перебор возможных имён поля, что уже в short_position_tracker.
+    _fetch_lighter_open_shorts (свой, однострочный, под эту задачу — тот
+    же паттерн, что и везде в проекте). mark_price — funding_report.
+    fetch_lighter_mark_prices() (публичный GET /api/v1/orderBookDetails,
+    поле mark_price подтверждено по офиц. SDK lighter-python).
+    """
+    mark_prices = fetch_lighter_mark_prices()
+    markets = fetch_lighter_markets()
+    headers = {"authorization": secrets["lighter_auth_token"].strip()}
+    params = {"by": "index", "value": secrets["lighter_account_index"], "active_only": "true"}
+    resp = requests.get(f"{LIGHTER_BASE_URL}/api/v1/account", params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code", 200) != 200:
+        raise RuntimeError(f"Lighter account error: {data}")
+
+    accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    out = []
+    for acc in accounts:
+        for pos in acc.get("positions", []):
+            size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+            if size == 0:
+                continue
+            market_id = pos.get("market_id", pos.get("market_index"))
+            symbol = markets.get(market_id, f"MARKET_{market_id}")
+            entry = None
+            for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
+                if pos.get(key) not in (None, ""):
+                    entry = float(pos[key])
+                    break
+            mark = mark_prices.get(symbol)
+            if entry is None or mark is None:
+                continue
+            out.append({"symbol": symbol, "entry_price": entry, "mark_price": mark})
+    return out
+
+
+# Bybit/Aster/Gate/MEXC — те же position-фетчеры, что уже возвращают и цену
+# входа, и текущую (mark/fair) цену в liquidation_alerts.py (переиспользуются
+# через импорт); Lighter — своя функция выше (там нет цены ликвидации, но
+# есть mark_price/entry_price, см. её докстринг).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
     "gate": _gate_liquidation_positions,
     "mexc": _mexc_liquidation_positions,
+    "lighter": _lighter_price_positions,
 }
 
 
@@ -482,14 +529,14 @@ def build_predicted_rates_report(secrets: dict) -> str:
     в % от цены ВХОДА в позицию, знак — от лица P&L шорта, а не голого
     движения цены (согласовано с пользователем явно): цена ВЫШЕ входа —
     минус и 🔴 (это убыток по шорту), цена НИЖЕ входа — плюс и 🟢. Источник
-    — те же position-фетчеры, что уже написаны и проверены для
-    liquidation_alerts.py (entry_price/mark_price из ответа тех же
-    приватных эндпоинтов, что и цена ликвидации там) — переиспользуются
-    через импорт, не копируются заново. Поддержано для Bybit/Aster/Gate/MEXC
-    (см. _PRICE_FETCHERS ниже); для Lighter цену не показываем — как и с
-    ценой ликвидации в liquidation_alerts.py, надёжного источника текущей
-    цены под рукой нет, ставка по нему при этом всё равно показывается как
-    раньше, просто без цены.
+    — position-фетчеры (см. _PRICE_FETCHERS ниже): для Bybit/Aster/Gate/MEXC
+    те же, что уже написаны и проверены для liquidation_alerts.py
+    (entry_price/mark_price из ответа тех же приватных эндпоинтов, что и
+    цена ликвидации там) — переиспользуются через импорт, не копируются
+    заново; для Lighter — своя _lighter_price_positions (там нет цены
+    ликвидации, поэтому в liquidation_alerts.py эта биржа не участвует, но
+    mark_price/entry_price доступны отдельно, см. её докстринг). Работает
+    для всех пяти бирж.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)

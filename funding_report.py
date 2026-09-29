@@ -372,6 +372,32 @@ def fetch_lighter_markets() -> dict:
     }
 
 
+def fetch_lighter_mark_prices() -> dict:
+    """
+    symbol -> mark_price, ТОТ ЖЕ публичный GET /api/v1/orderBookDetails, что
+    и fetch_lighter_markets() (отдельный вызов, не переиспользует её —
+    та отдаёт только market_id/symbol, отбрасывая остальные поля ответа;
+    тот же паттерн "свой, но однострочный вызов под конкретную задачу", что
+    уже используется в проекте, см. докстринг short_position_tracker.py).
+    Поле mark_price подтверждено по офиц. SDK lighter-python (модель
+    PerpsOrderBookDetail — mark_price и index_price приходят прямо в
+    каждом элементе order_book_details, просто раньше не считывались)."""
+    resp = requests.get(
+        f"{LIGHTER_BASE_URL}/api/v1/orderBookDetails",
+        params={"filter": "perp"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code", 200) != 200:
+        raise RuntimeError(f"Lighter orderBookDetails error: {data}")
+    return {
+        m["symbol"]: float(m["mark_price"])
+        for m in data.get("order_book_details", [])
+        if m.get("mark_price") not in (None, "")
+    }
+
+
 def fetch_lighter(account_index: str, auth_token: str,
                   start_ms: int, end_ms: int) -> list:
     """GET /api/v1/positionFunding, с курсорной пагинацией."""
