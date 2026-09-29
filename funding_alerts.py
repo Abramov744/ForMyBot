@@ -70,6 +70,12 @@ from datetime import datetime, timezone
 import requests
 
 import aster_interval_history
+from liquidation_alerts import (
+    _bybit_liquidation_positions,
+    _aster_liquidation_positions,
+    _gate_liquidation_positions,
+    _mexc_liquidation_positions,
+)
 from funding_report import (
     MSK,
     load_secrets,
@@ -450,6 +456,17 @@ def alert_loop(secrets: dict | None = None) -> None:
 
 # ── Отчёт по запросу: прогнозная ставка для команды /rates в Telegram ────────
 
+# Только биржи, для которых liquidation_alerts.py уже возвращает и цену
+# входа, и текущую (mark/fair) цену В ОДНОМ ответе — см. докстринг
+# build_predicted_rates_report про Lighter.
+_PRICE_FETCHERS = {
+    "bybit": _bybit_liquidation_positions,
+    "aster": _aster_liquidation_positions,
+    "gate": _gate_liquidation_positions,
+    "mexc": _mexc_liquidation_positions,
+}
+
+
 def build_predicted_rates_report(secrets: dict) -> str:
     """
     В отличие от build_open_positions_report в funding_report.py (это уже
@@ -460,6 +477,16 @@ def build_predicted_rates_report(secrets: dict) -> str:
     источник для Lighter, см. докстринг модуля), эта команда останется
     согласована с алертами автоматически, а не разъедется как отдельная
     копия того же самого.
+
+    Дополнительно к ставке — ТЕКУЩАЯ (mark/fair) цена актива и её изменение
+    в % от цены ВХОДА в позицию. Источник — те же position-фетчеры, что уже
+    написаны и проверены для liquidation_alerts.py (entry_price/mark_price
+    из ответа тех же приватных эндпоинтов, что и цена ликвидации там) —
+    переиспользуются через импорт, не копируются заново. Поддержано для
+    Bybit/Aster/Gate/MEXC (см. _PRICE_FETCHERS ниже); для Lighter цену не
+    показываем — как и с ценой ликвидации в liquidation_alerts.py, надёжного
+    источника текущей цены под рукой нет, ставка по нему при этом всё равно
+    показывается как раньше, просто без цены.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)
@@ -481,6 +508,20 @@ def build_predicted_rates_report(secrets: dict) -> str:
         lines.append("")
         lines.append(f"── {label} ──")
 
+        # Цена входа/текущая — одним запросом на всю биржу (не по одному на
+        # символ), тот же список позиций, что уже пришлось бы получать
+        # отдельно; ошибка здесь не должна ронять сами ставки ниже — просто
+        # строки останутся без цены.
+        prices_by_symbol = {}
+        price_fetcher = _PRICE_FETCHERS.get(exchange)
+        if price_fetcher:
+            try:
+                prices_by_symbol = {
+                    p["symbol"]: (p["entry_price"], p["mark_price"]) for p in price_fetcher(secrets)
+                }
+            except Exception as e:
+                print(f"[rates/{exchange}] Не удалось получить цены входа/текущую: {e}")
+
         rows = []    # (rate, symbol, next_ms, interval_hours) — успешно полученные ставки
         errors = []  # (symbol, текст_ошибки)
         for symbol in symbols:
@@ -501,10 +542,17 @@ def build_predicted_rates_report(secrets: dict) -> str:
         for rate, symbol, next_ms, interval_hours in sorted(rows, key=lambda x: x[0]):
             emoji = "🟢" if rate >= 0 else "🔴"
             apr = annualize(rate, interval_hours)
+            price_part = ""
+            entry_mark = prices_by_symbol.get(symbol)
+            if entry_mark:
+                entry, mark = entry_mark
+                if entry:
+                    pct_change = (mark - entry) / entry * 100
+                    price_part = f"\n   Цена: {mark:g} ({pct_change:+.1f}% от входа {entry:g})"
             lines.append(
                 f"{emoji} {symbol}: {rate * 100:+.4f}% за выплату "
                 f"(годовых {apr:+.1f}%) — {_fmt_next_time(next_ms)}, "
-                f"funding раз в {interval_hours:g}ч"
+                f"funding раз в {interval_hours:g}ч{price_part}"
             )
 
         for symbol, err in errors:
