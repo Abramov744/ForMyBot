@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
 from collections import defaultdict
@@ -109,6 +110,62 @@ def load_secrets() -> dict:
     return result
 
 
+# ── Общий кэш "сырых" ответов бирж со списком позиций ─────────────────────────
+#
+# funding_report (символы для funding-отчётов/алертов), liquidation_alerts.py
+# (цена входа/ликвидации/текущая) и short_position_tracker.py (объём/
+# сторона/время открытия) — три независимых модуля, и раньше КАЖДЫЙ делал
+# свой отдельный HTTP-запрос к ОДНОМУ И ТОМУ ЖЕ приватному эндпоинту позиций
+# биржи с ОДИНАКОВЫМИ параметрами (например GET /v5/position/list?
+# category=linear&settleCoin=USDT у Bybit — три идентичных запроса в трёх
+# разных файлах), просто разбирая из ответа разные поля под свою задачу.
+# Заметнее всего дублирование в трёх случаях:
+#   - при старте процесса (app.main()) все фоновые циклы стартуют почти
+#     одновременно, и у каждого первая проверка выполняется сразу, без
+#     ожидания своего интервала — разовый всплеск из 2-3 идентичных запросов
+#     на биржу практически в одну и ту же секунду;
+#   - funding_alerts.alert_loop и short_position_tracker.short_position_
+#     check_loop оба стартуют сразу и оба по умолчанию раз в 60 мин (ALERT_
+#     CHECK_INTERVAL_MINUTES/SHORT_POSITION_CHECK_INTERVAL_MINUTES) — запущенные
+#     почти одновременно, так и остаются синхронизированы навсегда, раз в
+#     час дублируя запрос друг за другом;
+#   - funding_alerts.build_predicted_rates_report (команда /rates) сама
+#     вызывает сначала get_open_positions() (список символов), а затем — для
+#     той же биржи — liquidation_alerts._*_liquidation_positions (цена
+#     входа/текущая) — тот же эндпоинт дважды подряд в рамках ОДНОГО вызова
+#     команды.
+#
+# _cached_raw_positions(exchange_key, fetch_fn) — общий короткий (по
+# умолчанию 15 сек, POSITIONS_CACHE_TTL_S) TTL-кэш сырого ответа биржи per
+# exchange_key. TTL сознательно короткий: цель — погасить именно такие
+# "почти одновременные" повторы, а не экономить всегда — самый частый
+# фоновый цикл (sltp_alerts, по умолчанию раз в 2 мин = 120 сек) почти
+# всегда обращается уже мимо кэша, свежесть данных для обнаружения закрытия
+# позиции не страдает.
+_positions_cache_lock = threading.Lock()
+_positions_cache: dict[str, tuple] = {}
+POSITIONS_CACHE_TTL_S = float(os.environ.get("POSITIONS_CACHE_TTL_S", "15"))
+
+
+def _cached_raw_positions(exchange_key: str, fetch_fn):
+    """
+    Возвращает результат fetch_fn(), но не чаще чем раз в POSITIONS_CACHE_
+    TTL_S секунд на один exchange_key (см. докстринг блока выше). Ошибка из
+    fetch_fn НЕ кэшируется — просто пробрасывается дальше, ничего не
+    записывая в кэш, чтобы временный сбой API одной биржи не "залипал" на
+    весь TTL для всех потребителей сразу (та же логика, что и везде в
+    проекте: сбой API — это не то же самое, что "нет данных").
+    """
+    with _positions_cache_lock:
+        cached = _positions_cache.get(exchange_key)
+        if cached is not None and time.time() - cached[0] <= POSITIONS_CACHE_TTL_S:
+            return cached[1]
+    result = fetch_fn()
+    with _positions_cache_lock:
+        _positions_cache[exchange_key] = (time.time(), result)
+    return result
+
+
 # ── Aster EIP-712 подпись ─────────────────────────────────────────────────────
 
 _TYPED_DATA_TEMPLATE = {
@@ -175,8 +232,15 @@ def fetch_aster(user: str, signer: str, private_key: str,
     return all_records
 
 
-def fetch_aster_open_symbols(user: str, signer: str, private_key: str) -> set:
-    """GET /fapi/v3/positionRisk — возвращает набор символов с ненулевой позицией."""
+def _aster_positions_raw(user: str, signer: str, private_key: str) -> list:
+    """
+    Сырой (нефильтрованный) ответ GET /fapi/v3/positionRisk — общий источник
+    для fetch_aster_open_symbols ниже, liquidation_alerts.
+    _aster_liquidation_positions и short_position_tracker.
+    _fetch_aster_open_shorts, через _cached_raw_positions выше (см. её
+    докстринг про то, зачем — три модуля раньше независимо дёргали именно
+    этот эндпоинт с одинаковыми параметрами).
+    """
     nonce = int(time.time() * 1_000_000)
     params = {
         "timestamp": str(int(time.time() * 1000)),
@@ -192,6 +256,12 @@ def fetch_aster_open_symbols(user: str, signer: str, private_key: str) -> set:
     data = resp.json()
     if isinstance(data, dict):
         raise RuntimeError(f"Aster positionRisk error: {data}")
+    return data
+
+
+def fetch_aster_open_symbols(user: str, signer: str, private_key: str) -> set:
+    """Набор символов с ненулевой позицией — см. _aster_positions_raw про общий кэш."""
+    data = _cached_raw_positions("aster", lambda: _aster_positions_raw(user, signer, private_key))
     return {p["symbol"] for p in data if abs(float(p.get("positionAmt", 0))) > 0}
 
 
@@ -303,13 +373,12 @@ def fetch_bybit(api_key: str, api_secret: str,
     return all_records
 
 
-def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> dict:
+def _bybit_positions_raw(api_key: str, api_secret: str) -> list:
     """
-    GET /v5/position/list, category=linear, settleCoin=USDT.
-    Возвращает {symbol: created_time_ms} — Bybit отдаёт точное время
-    открытия позиции в поле createdTime, поэтому здесь (в отличие от
-    большинства других бирж) можно посчитать funding именно "с момента
-    открытия", а не приближённо через фиксированную глубину поиска.
+    Сырой result.list из GET /v5/position/list (category=linear,
+    settleCoin=USDT) — общий источник для fetch_bybit_open_symbols ниже,
+    liquidation_alerts._bybit_liquidation_positions и short_position_
+    tracker._fetch_bybit_open_shorts, через _cached_raw_positions выше.
     """
     base_url = "https://api.bybit.com"
     recv_window = "5000"
@@ -331,8 +400,18 @@ def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> dict:
     data = resp.json()
     if data.get("retCode", 0) != 0:
         raise RuntimeError(f"Bybit position/list error {data.get('retCode')}: {data.get('retMsg')}")
+    return data.get("result", {}).get("list", [])
 
-    items = data.get("result", {}).get("list", [])
+
+def fetch_bybit_open_symbols(api_key: str, api_secret: str) -> dict:
+    """
+    {symbol: created_time_ms} — Bybit отдаёт точное время открытия позиции
+    в поле createdTime, поэтому здесь (в отличие от большинства других
+    бирж) можно посчитать funding именно "с момента открытия", а не
+    приближённо через фиксированную глубину поиска. См. _bybit_positions_raw
+    про общий кэш.
+    """
+    items = _cached_raw_positions("bybit", lambda: _bybit_positions_raw(api_key, api_secret))
     return {
         p["symbol"]: int(p["createdTime"])
         for p in items if float(p.get("size", 0)) > 0
@@ -445,18 +524,23 @@ def fetch_lighter(account_index: str, auth_token: str,
     return all_records
 
 
-def fetch_lighter_open_symbols(account_index: str, auth_token: str) -> set:
+def _lighter_positions_raw(account_index: str, auth_token: str) -> list:
     """
-    GET /api/v1/account?by=index&value={account_index}&active_only=true
-    active_only=true просит сервер сразу отдать только рынки с реальной
-    открытой позицией (а не просто те, где выставлялось плечо когда-то).
-    Точные имена полей в ответе документированы не полностью, поэтому
-    разбор сделан с запасом — пробуем несколько вероятных вариантов ключей.
+    Сырой ПЛОСКИЙ список позиций Lighter — GET /api/v1/account?by=index&
+    value={account_index}&active_only=true (active_only=true просит сервер
+    сразу отдать только рынки с реальной открытой позицией, а не просто те,
+    где выставлялось плечо когда-то), позиции всех "accounts" в ответе
+    склеены в один список (на практике аккаунт всегда один, и ни один из
+    потребителей ниже не использует поля самого accounts[i], кроме
+    positions). Общий источник для fetch_lighter_open_symbols ниже,
+    funding_alerts._lighter_price_positions и short_position_tracker.
+    _fetch_lighter_open_shorts, через _cached_raw_positions выше. Точные
+    имена полей в ответе документированы не полностью, поэтому разбор в
+    каждом потребителе сделан с запасом — пробуются несколько вероятных
+    вариантов ключей.
     """
-    markets = fetch_lighter_markets()
     headers = {"authorization": auth_token.strip()}
     params = {"by": "index", "value": account_index, "active_only": "true"}
-
     resp = requests.get(
         f"{LIGHTER_BASE_URL}/api/v1/account",
         params=params, headers=headers, timeout=30,
@@ -467,14 +551,22 @@ def fetch_lighter_open_symbols(account_index: str, auth_token: str) -> set:
         raise RuntimeError(f"Lighter account error: {data}")
 
     accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
-    open_symbols = set()
+    positions = []
     for acc in accounts:
-        for pos in acc.get("positions", []):
-            size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
-            if size == 0:
-                continue
-            market_id = pos.get("market_id", pos.get("market_index"))
-            open_symbols.add(markets.get(market_id, f"MARKET_{market_id}"))
+        positions.extend(acc.get("positions", []))
+    return positions
+
+
+def fetch_lighter_open_symbols(account_index: str, auth_token: str) -> set:
+    markets = fetch_lighter_markets()
+    positions = _cached_raw_positions("lighter", lambda: _lighter_positions_raw(account_index, auth_token))
+    open_symbols = set()
+    for pos in positions:
+        size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+        if size == 0:
+            continue
+        market_id = pos.get("market_id", pos.get("market_index"))
+        open_symbols.add(markets.get(market_id, f"MARKET_{market_id}"))
     return open_symbols
 
 
@@ -581,12 +673,12 @@ def fetch_mexc(api_key: str, api_secret: str,
     return all_records
 
 
-def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
+def _mexc_positions_raw(api_key: str, api_secret: str) -> list:
     """
-    GET /api/v1/private/position/open_positions — уже отдаёт только открытые
-    позиции. Возвращает {symbol: create_time_ms} — MEXC, как и Bybit, хранит
-    точное время создания позиции (поле createTime), поэтому funding можно
-    посчитать именно с этого момента, а не приближённо.
+    Сырой data из GET /api/v1/private/position/open_positions (уже отдаёт
+    только открытые позиции) — общий источник для fetch_mexc_open_symbols
+    ниже, liquidation_alerts._mexc_liquidation_positions и short_position_
+    tracker._fetch_mexc_open_shorts, через _cached_raw_positions выше.
     """
     base_url = "https://api.mexc.com"
     api_key, api_secret = api_key.strip(), api_secret.strip()
@@ -616,8 +708,17 @@ def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
     data = resp.json()
     if not data.get("success", False):
         raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
+    return data.get("data") or []
 
-    items = data.get("data") or []
+
+def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
+    """
+    {symbol: create_time_ms} — MEXC, как и Bybit, хранит точное время
+    создания позиции (поле createTime), поэтому funding можно посчитать
+    именно с этого момента, а не приближённо. См. _mexc_positions_raw про
+    общий кэш.
+    """
+    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(api_key, api_secret))
     return {
         p["symbol"]: int(p["createTime"])
         for p in items if float(p.get("holdVol", 0)) > 0
@@ -726,8 +827,15 @@ def fetch_gate(api_key: str, api_secret: str,
     return all_records
 
 
-def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt") -> set:
-    """GET /api/v4/futures/{settle}/positions — набор контрактов с ненулевым размером."""
+def _gate_positions_raw(api_key: str, api_secret: str, settle: str = "usdt") -> list:
+    """
+    Сырой список позиций Gate — GET /api/v4/futures/{settle}/positions —
+    общий источник для fetch_gate_open_symbols ниже, liquidation_alerts.
+    _gate_liquidation_positions и short_position_tracker._fetch_gate_
+    open_shorts, через _cached_raw_positions выше (ключ кэша включает
+    settle — на практике всегда "usdt", но на случай, если это когда-нибудь
+    изменится, разные settle не должны путать друг друга).
+    """
     base_url = "https://api.gateio.ws"
     url_path = f"/api/v4/futures/{settle}/positions"
     proxies = _get_gate_proxies()
@@ -741,8 +849,14 @@ def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt")
     data = resp.json()
     if isinstance(data, dict) and data.get("label"):
         raise RuntimeError(f"Gate positions error {data.get('label')}: {data.get('message')}")
+    return data if isinstance(data, list) else []
 
-    items = data if isinstance(data, list) else []
+
+def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt") -> set:
+    """Набор контрактов с ненулевым размером — см. _gate_positions_raw про общий кэш."""
+    items = _cached_raw_positions(
+        f"gate:{settle}", lambda: _gate_positions_raw(api_key, api_secret, settle),
+    )
     return {p["contract"] for p in items if float(p.get("size", 0)) != 0}
 
 
@@ -831,21 +945,32 @@ def _kucoin_signed_get(base_url: str, path: str, api_key: str, api_secret: str,
     return data
 
 
+def _kucoin_positions_raw(api_key: str, api_secret: str, api_passphrase: str) -> list:
+    """
+    Сырой data из GET /api/v1/positions (без параметров — отдаёт СРАЗУ ВСЕ
+    открытые позиции аккаунта) — общий источник для fetch_kucoin_open_symbols
+    ниже, liquidation_alerts._kucoin_liquidation_positions и short_position_
+    tracker._fetch_kucoin_open_shorts, через _cached_raw_positions выше.
+    """
+    data = _kucoin_signed_get("https://api-futures.kucoin.com", "/api/v1/positions", api_key, api_secret, api_passphrase)
+    return data.get("data") or []
+
+
 def fetch_kucoin_open_symbols(api_key: str, api_secret: str, api_passphrase: str) -> dict:
     """
-    GET /api/v1/positions — без параметров отдаёт СРАЗУ ВСЕ открытые позиции
-    аккаунта (аналог fetch_bybit_open_symbols/fetch_mexc_open_symbols выше).
-    Возвращает {symbol: opening_timestamp_ms} для ВСЕХ позиций (long и
-    short вперемешку, как и у остальных fetch_*_open_symbols — сторона
-    здесь не различается, это делает short_position_tracker.py отдельно
-    через ту же сырую позицию), символы вида "XBTUSDTM"/"ETHUSDTM".
+    {symbol: opening_timestamp_ms} для ВСЕХ позиций (long и short
+    вперемешку, как и у остальных fetch_*_open_symbols — сторона здесь не
+    различается, это делает short_position_tracker.py отдельно через ту же
+    сырую позицию), символы вида "XBTUSDTM"/"ETHUSDTM".
 
     ПОДТВЕРЖДЕНО по офиц. SDK ccxt (ccxt/kucoin.py, fetch_positions) и по
     офиц. документации (Get Position List): поле openingTimestamp — точное
     время открытия позиции в мс, как и createdTime/createTime у Bybit/MEXC.
+    См. _kucoin_positions_raw про общий кэш.
     """
-    data = _kucoin_signed_get("https://api-futures.kucoin.com", "/api/v1/positions", api_key, api_secret, api_passphrase)
-    items = data.get("data") or []
+    items = _cached_raw_positions(
+        "kucoin", lambda: _kucoin_positions_raw(api_key, api_secret, api_passphrase),
+    )
     return {
         p["symbol"]: int(p["openingTimestamp"])
         for p in items if p.get("isOpen") and float(p.get("currentQty", 0) or 0) != 0
