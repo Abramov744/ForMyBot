@@ -6,6 +6,7 @@ Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC + Gate → Telegram
 """
 
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -1089,20 +1090,53 @@ _EXCHANGE_MAX_LOOKBACK_DAYS = {
 }
 
 
+
+# Сколько окон одной биржи опрашивать ОДНОВРЕМЕННО в _fetch_in_windows
+# (не все сразу — период "365 дней" при 7-дневном окне Aster/Bybit даёт
+# около полусотни окон, вся сотня параллельных запросов к одной бирже
+# почти наверняка упрётся в её rate-limit). Значение общее для всех бирж,
+# а не подобрано под каждую отдельно — консервативное число, ощутимо
+# ускоряющее сборку годового отчёта, но не агрессивное.
+WINDOW_FETCH_MAX_WORKERS = int(os.environ.get("WINDOW_FETCH_MAX_WORKERS", "4"))
+
+
 def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) -> list:
     """
     Вызывает fetch_fn(chunk_start_ms, chunk_end_ms) кусками не длиннее
-    window_days дней подряд и объединяет результаты в один список.
-    Нужно из-за ограничений бирж на максимальный диапазон дат в одном
-    запросе истории (см. _EXCHANGE_WINDOW_DAYS).
+    window_days дней и объединяет результаты в один список. Нужно из-за
+    ограничений бирж на максимальный диапазон дат в одном запросе истории
+    (см. _EXCHANGE_WINDOW_DAYS) — при длинном периоде (например "365 дней"
+    для отчёта за год, см. fetch_all_windowed) это десятки окон на одну
+    биржу.
+
+    Окна опрашиваются ПАРАЛЛЕЛЬНО (до WINDOW_FETCH_MAX_WORKERS одновременно),
+    а не строго по одному, как раньше — именно эта последовательность
+    (полсотни запросов подряд к Aster/Bybit при 7-дневном окне на годовой
+    период) была основным временем сборки отчёта за длинный период. Это
+    безопасно: куски — независимые запросы одного и того же приватного
+    эндпоинта истории с непересекающимися диапазонами дат, порядок записей
+    в результате ни на что не влияет (funding_chart/bot_poll группируют их
+    по дате, а не полагаются на порядок прихода). Первое исключение из
+    любого куска пробрасывается наружу как и раньше — единственный сбойный
+    чанк должен провалить весь запрос к этой бирже целиком, а не тихо
+    вернуть неполные данные (см. CLAUDE.md про финансовую точность).
     """
     window_ms = window_days * 24 * 60 * 60 * 1000
-    all_records: list = []
+    chunks = []
     cur_start = start_ms
     while cur_start < end_ms:
         cur_end = min(cur_start + window_ms, end_ms)
-        all_records.extend(fetch_fn(cur_start, cur_end))
+        chunks.append((cur_start, cur_end))
         cur_start = cur_end
+
+    if len(chunks) <= 1:
+        return fetch_fn(*chunks[0]) if chunks else []
+
+    all_records: list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WINDOW_FETCH_MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_fn, s, e) for s, e in chunks]
+        for future in futures:
+            all_records.extend(future.result())
     return all_records
 
 
