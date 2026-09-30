@@ -1037,12 +1037,70 @@ def fetch_kucoin(api_key: str, api_secret: str, api_passphrase: str,
 
 # ── Опрос всех подключённых бирж за произвольный период ──────────────────────
 
-def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
+def _fetch_kucoin_multi_symbol(secrets: dict, symbols, start_ms: int, end_ms: int) -> list:
+    """
+    funding-история по НЕСКОЛЬКИМ символам KuCoin сразу за период
+    [start_ms, end_ms) — общий хелпер для fetch_all()/fetch_all_windowed().
+    Нужен из-за того, что fetch_kucoin() принимает ровно ОДИН symbol за
+    запрос (см. её докстринг) — symbols здесь обычно приходит из реестра
+    kucoin_symbol_history.load_known_symbols() (все когда-либо виденные
+    открытыми символы, не только сейчас открытые), который собирает
+    вызывающий код (bot_poll.py) — funding_report.py сам сознательно не
+    знает про Google Sheets/этот реестр, чтобы не создавать цикл импортов
+    (kucoin_symbol_history.py импортирует sheets_sync.py, который
+    импортирует funding_report.py).
+
+    Один ОБЩИЙ плоский пул потоков на ВСЕ (символ, окно) чанки сразу — а не
+    вложенный пул на каждый символ через _fetch_in_windows — иначе при N
+    известных символах и периоде длиннее 90 дней суммарная параллельность
+    могла бы вырасти до WINDOW_FETCH_MAX_WORKERS² потоков одновременно
+    (см. докстринг _fetch_in_windows про то же рассуждение на уровне одной
+    биржи).
+    """
+    if not symbols:
+        return []
+    window_ms = _EXCHANGE_WINDOW_DAYS["kucoin"] * 24 * 60 * 60 * 1000
+    chunks = []
+    for symbol in sorted(symbols):
+        cur = start_ms
+        while cur < end_ms:
+            nxt = min(cur + window_ms, end_ms)
+            chunks.append((symbol, cur, nxt))
+            cur = nxt
+    if not chunks:
+        return []
+
+    def fetch_chunk(chunk):
+        symbol, s, e = chunk
+        return fetch_kucoin(
+            secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            symbol, s, e,
+        )
+
+    if len(chunks) == 1:
+        return fetch_chunk(chunks[0])
+
+    records: list = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WINDOW_FETCH_MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_chunk, c) for c in chunks]
+        for future in futures:
+            records.extend(future.result())
+    return records
+
+
+def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> dict:
     """
     Опрашивает все биржи за период [start_ms, end_ms).
     Aster опрашивается всегда, остальные — только если для них есть секреты.
     Возвращает dict: {"aster": (records, error), "bybit": (...), ...}
     Ошибки отдельных бирж не прерывают опрос остальных.
+
+    kucoin_symbols — реестр когда-либо виденных открытыми символов KuCoin
+    (см. _fetch_kucoin_multi_symbol выше и kucoin_symbol_history.py про то,
+    зачем он вообще нужен именно для этой биржи). Если не передан/пуст —
+    секция KuCoin в результате будет с ошибкой-заглушкой вместо тихого
+    нуля (см. ниже), чтобы не показать "выплат не было" вместо честного
+    "мы ещё не знаем, какие символы проверять".
     """
     results: dict = {}
 
@@ -1110,6 +1168,17 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
         except Exception as e:
             print(f"[Gate] Ошибка: {e}")
             results["gate"] = (None, str(e))
+
+    if "kucoin_api_key" in secrets:
+        if kucoin_symbols:
+            try:
+                results["kucoin"] = (_fetch_kucoin_multi_symbol(secrets, kucoin_symbols, start_ms, end_ms), None)
+            except Exception as e:
+                print(f"[KuCoin] Ошибка: {e}")
+                results["kucoin"] = (None, str(e))
+        else:
+            results["kucoin"] = (None, "реестр символов KuCoin ещё пуст (kucoin_symbol_history) — "
+                                        "подождите часового цикла синхронизации с Google Sheet")
 
     return results
 
@@ -1202,16 +1271,18 @@ def _fetch_in_windows(fetch_fn, window_days: int, start_ms: int, end_ms: int) ->
     return all_records
 
 
-def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int) -> tuple[dict, list[str]]:
+def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> tuple[dict, list[str]]:
     """
     Как fetch_all(), но для периода, который может оказаться ДЛИННЕЕ
     максимального диапазона одного запроса истории funding у конкретной
     биржи (см. _EXCHANGE_WINDOW_DAYS выше — Aster/Bybit 7 дней, Lighter/Gate
-    30, MEXC 90) — используется отчётом за неделю/месяц/год/произвольный
-    диапазон в bot_poll.py (build_calendar_markup, send_period_report).
-    fetch_all() по-прежнему используется отчётом за ОДИН день (/report) —
-    там период всегда меньше любого из лимитов, чанкинг не нужен и не
-    делается, чтобы не усложнять самый частый путь без всякой пользы.
+    30, MEXC 90, KuCoin тоже 90) — используется отчётом за неделю/месяц/год/
+    произвольный диапазон в bot_poll.py (build_calendar_markup,
+    send_period_report). fetch_all() по-прежнему используется отчётом за
+    ОДИН день (/report) — там период всегда меньше любого из лимитов,
+    чанкинг не нужен и не делается, чтобы не усложнять самый частый путь
+    без всякой пользы. kucoin_symbols — см. докстринг fetch_all() про то,
+    зачем он нужен именно для этой биржи.
 
     Формат основного результата — тот же, что и у fetch_all():
     {"aster": (records, error), ...}. Вторым элементом возвращается список
@@ -1311,6 +1382,17 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int) -> tuple[dict,
         except Exception as e:
             print(f"[Gate] Ошибка: {e}")
             results["gate"] = (None, str(e))
+
+    if "kucoin_api_key" in secrets:
+        if kucoin_symbols:
+            try:
+                results["kucoin"] = (_fetch_kucoin_multi_symbol(secrets, kucoin_symbols, start_ms, end_ms), None)
+            except Exception as e:
+                print(f"[KuCoin] Ошибка: {e}")
+                results["kucoin"] = (None, str(e))
+        else:
+            results["kucoin"] = (None, "реестр символов KuCoin ещё пуст (kucoin_symbol_history) — "
+                                        "подождите часового цикла синхронизации с Google Sheet")
 
     return results, warnings
 
@@ -1754,7 +1836,8 @@ def build_report(start_ms: int, end_ms: int,
                  bybit_records: list | None, bybit_error: str | None,
                  lighter_records: list | None = None, lighter_error: str | None = None,
                  mexc_records: list | None = None, mexc_error: str | None = None,
-                 gate_records: list | None = None, gate_error: str | None = None) -> str:
+                 gate_records: list | None = None, gate_error: str | None = None,
+                 kucoin_records: list | None = None, kucoin_error: str | None = None) -> str:
 
     header = [
         "📊 Отчёт по funding fee",
@@ -1809,13 +1892,23 @@ def build_report(start_ms: int, end_ms: int,
         )
         combined.extend(gate_lines)
 
+    # KuCoin — только если запрашивался
+    kucoin_totals: dict = {}
+    if kucoin_records is not None or kucoin_error is not None:
+        combined.append("")
+        kucoin_lines, kucoin_totals = _section_lines(
+            "KuCoin", kucoin_records, kucoin_error,
+            income_field="funding", symbol_field="symbol", asset_field="settleCurrency",
+        )
+        combined.extend(kucoin_lines)
+
     # Итог по всем биржам
-    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals:
+    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals or kucoin_totals:
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
         all_assets: set = (
             set(aster_totals) | set(bybit_totals) | set(lighter_totals)
-            | set(mexc_totals) | set(gate_totals)
+            | set(mexc_totals) | set(gate_totals) | set(kucoin_totals)
         )
         for asset in sorted(all_assets):
             total = (
@@ -1824,6 +1917,7 @@ def build_report(start_ms: int, end_ms: int,
                 + lighter_totals.get(asset, 0.0)
                 + mexc_totals.get(asset, 0.0)
                 + gate_totals.get(asset, 0.0)
+                + kucoin_totals.get(asset, 0.0)
             )
             emoji = "🟢" if total >= 0 else "🔴"
             combined.append(f"  {emoji} {asset}: {total:+.4f}")
@@ -1868,7 +1962,14 @@ def main():
     secrets  = load_secrets()
     start_ms, end_ms = previous_day_msk_ms()
 
-    results = fetch_all(secrets, start_ms, end_ms)
+    # Локальный import — не в начале файла: kucoin_symbol_history.py сам
+    # импортирует sheets_sync.py, который импортирует этот файл (funding_
+    # report.py), иначе получился бы цикл импортов. См. докстринг
+    # kucoin_symbol_history.py.
+    import kucoin_symbol_history
+    kucoin_symbols = kucoin_symbol_history.load_known_symbols() if "kucoin_api_key" in secrets else set()
+
+    results = fetch_all(secrets, start_ms, end_ms, kucoin_symbols=kucoin_symbols)
 
     message = build_report(
         start_ms, end_ms,
@@ -1877,6 +1978,7 @@ def main():
         *results.get("lighter", (None, None)),
         *results.get("mexc",    (None, None)),
         *results.get("gate",    (None, None)),
+        *results.get("kucoin",  (None, None)),
     )
 
     send_telegram_broadcast(secrets["telegram_token"], secrets["telegram_chat_ids"], message)
