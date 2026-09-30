@@ -35,11 +35,17 @@
 entry_price._base_asset — тем же кодом, что и автоподбор цен в
 калькуляторе, логика не дублируется заново.
 
-Автоматизация работает ТОЛЬКО для строк, где Биржа 2 — одна из 5,
-поддерживаемых ботом (Aster/Bybit/Lighter/MEXC/Gate). У остальных бирж,
-которые встречаются в старых строках таблицы (paradex, edgex, apex,
-kucoin, hyper и т.п.), бот не имеет API-доступа — такие строки скрипт
-просто пропускает, не трогая ячейку (как и было при ручном вводе).
+Автоматизация работает ТОЛЬКО для строк, где Биржа 2 — одна из 6,
+поддерживаемых ботом (Aster/Bybit/Lighter/MEXC/Gate/KuCoin). У остальных
+бирж, которые встречаются в старых строках таблицы (paradex, edgex, apex,
+hyper и т.п.), бот не имеет API-доступа — такие строки скрипт просто
+пропускает, не трогая ячейку (как и было при ручном вводе).
+
+KuCoin — не совсем "как остальные": её funding-история требует ОБЯЗАТЕЛЬНО
+указать символ на уровне запроса к бирже (см. funding_report.fetch_kucoin)
+— здесь это не проблема, символ уже известен из совпадения строки таблицы с
+открытой позицией, тем же способом, что и для Bybit/MEXC (точное время
+открытия, см. _EXACT_TIME_EXCHANGES).
 
 Если совпадение по (биржа, базовый актив) неоднозначно — сейчас на бирже
 нет ни одной открытой позиции с таким активом, или подошло больше одной —
@@ -47,9 +53,9 @@ kucoin, hyper и т.п.), бот не имеет API-доступа — таки
 для ручной проверки, чем один раз молча угадать неправильно в финансовой
 таблице.
 
-Переменные окружения (плюс обычные ASTER_*/BYBIT_*/LIGHTER_*/MEXC_*/GATE_*
-из funding_report.load_secrets() — они тоже нужны, скрипт дёргает те же
-fetch_*):
+Переменные окружения (плюс обычные ASTER_*/BYBIT_*/LIGHTER_*/MEXC_*/GATE_*/
+KUCOIN_* из funding_report.load_secrets() — они тоже нужны, скрипт дёргает
+те же fetch_*):
   GOOGLE_SHEET_ID              — id таблицы (из её URL, между /d/ и /edit)
   GOOGLE_SERVICE_ACCOUNT_JSON  — JSON-ключ сервисного аккаунта целиком,
                                   одной строкой (секрет со значением, не
@@ -100,14 +106,15 @@ from funding_report import (
     fetch_aster_open_symbols,
     fetch_bybit_open_symbols,
     fetch_gate_open_symbols,
+    fetch_kucoin_open_symbols,
     fetch_lighter_open_symbols,
     fetch_mexc_open_symbols,
     load_secrets,
 )
 
 # Биржи с точным временем открытия позиции (используется как старт периода
-# напрямую) — те же две, что и в calculator._trim_to_current_open_position.
-_EXACT_TIME_EXCHANGES = ("bybit", "mexc")
+# напрямую) — те же, что и в calculator._trim_to_current_open_position.
+_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin")
 # Биржи без точного времени — старт периода берётся по OPEN_POSITIONS_LOOKBACK_DAYS.
 _CONTINUOUS_EXCHANGES = ("aster", "lighter", "gate")
 SUPPORTED_EXCHANGES = _EXACT_TIME_EXCHANGES + _CONTINUOUS_EXCHANGES
@@ -226,6 +233,14 @@ def build_open_symbol_index(secrets: dict) -> dict:
             index["gate"] = {s: None for s in symbols}
         except Exception as e:
             print(f"[sheets_sync/gate] Не удалось получить открытые позиции: {e}", flush=True)
+
+    if "kucoin_api_key" in secrets:
+        try:
+            index["kucoin"] = fetch_kucoin_open_symbols(
+                secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            )
+        except Exception as e:
+            print(f"[sheets_sync/kucoin] Не удалось получить открытые позиции: {e}", flush=True)
 
     return index
 

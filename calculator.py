@@ -29,9 +29,9 @@ taker-ставки без VIP-скидок на момент написания)
 from collections import defaultdict
 
 from funding_report import (
-    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate,
+    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin,
     fetch_aster_open_symbols, fetch_bybit_open_symbols, fetch_lighter_open_symbols,
-    fetch_mexc_open_symbols, fetch_gate_open_symbols,
+    fetch_mexc_open_symbols, fetch_gate_open_symbols, fetch_kucoin_open_symbols,
     _fetch_in_windows, _EXCHANGE_WINDOW_DAYS, _trim_to_continuous_run,
 )
 
@@ -54,6 +54,7 @@ from funding_report import (
 _EXACT_OPEN_TIME_FIELDS = {
     "bybit": "transactionTime",
     "mexc": "settleTime",
+    "kucoin": "timePoint",
 }
 _CONTINUOUS_OPEN_TIME_FIELDS = {
     "aster": ("time", "ms"),
@@ -70,14 +71,21 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
     сделки, и её трогать не нужно)."""
     try:
         if exchange in _EXACT_OPEN_TIME_FIELDS:
-            fetch_open = {"bybit": fetch_bybit_open_symbols, "mexc": fetch_mexc_open_symbols}[exchange]
-            api_key_field, api_secret_field = {
-                "bybit": ("bybit_api_key", "bybit_api_secret"),
-                "mexc": ("mexc_api_key", "mexc_api_secret"),
-            }[exchange]
-            if api_key_field not in secrets:
+            # lambda-диспетчер (не просто {биржа: функция} + отдельная пара
+            # полей секретов, как раньше) — у KuCoin, в отличие от Bybit/MEXC,
+            # ТРИ значения ключа (ещё и passphrase), под один общий шаблон
+            # вызова уже не уложить.
+            fetch_open = {
+                "bybit": lambda: fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"]),
+                "mexc": lambda: fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
+                "kucoin": lambda: fetch_kucoin_open_symbols(
+                    secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+                ),
+            }.get(exchange)
+            required_key = {"bybit": "bybit_api_key", "mexc": "mexc_api_key", "kucoin": "kucoin_api_key"}[exchange]
+            if required_key not in secrets or fetch_open is None:
                 return records
-            open_times = fetch_open(secrets[api_key_field], secrets[api_secret_field])
+            open_times = fetch_open()
             open_time = open_times.get(symbol)
             if open_time is None:
                 return records  # сейчас не открыта — обрезка не применяется
@@ -113,18 +121,21 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
 }
 
 # income_field/symbol_field/asset_field — те же имена полей, что и в
 # funding_report._section_lines/build_report, специально не переименовывались,
-# чтобы не разъезжаться с остальным кодом бота.
+# чтобы не разъезжаться с остальным кодом бота. Для KuCoin (funding/symbol/
+# settleCurrency) — подтверждено офиц. документацией, см. fetch_kucoin в
+# funding_report.py.
 EXCHANGE_FIELDS = {
     "aster":   {"income": "income",  "symbol": "symbol", "asset": "asset"},
     "bybit":   {"income": "funding", "symbol": "symbol", "asset": "currency"},
     "lighter": {"income": "change",  "symbol": "symbol", "asset": "asset"},
     "mexc":    {"income": "funding", "symbol": "symbol", "asset": "asset"},
     "gate":    {"income": "change",  "symbol": "symbol", "asset": "asset"},
+    "kucoin":  {"income": "funding", "symbol": "symbol", "asset": "settleCurrency"},
 }
 
 # Стандартные (не-VIP, tier 0) taker-ставки в % — только дефолт для UI.
@@ -134,6 +145,8 @@ DEFAULT_FUTURES_TAKER_FEE_PCT = {
     "mexc": 0.02,
     "gate": 0.05,
     "lighter": 0.0,
+    # 0.06% — опубликованная ставка VIP 0/tier 0 (kucoin.com/vip/privilege/fee).
+    "kucoin": 0.06,
 }
 # Спот-нога может исполняться на другой бирже, чем фьючерс — единого
 # дефолта по бирже тут нет, берём типичную ставку большинства spot-бирж.
@@ -146,7 +159,15 @@ class CalculatorError(Exception):
 
 def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: int,
                            symbol: str | None = None) -> list:
-    """Сырые записи funding по бирже за период, опционально отфильтрованные по символу."""
+    """Сырые записи funding по бирже за период, опционально отфильтрованные по символу.
+
+    KuCoin — особый случай: в отличие от остальных бирж, её funding-history
+    принимает symbol как ОБЯЗАТЕЛЬНЫЙ параметр запроса (см. fetch_kucoin в
+    funding_report.py) — "все открытые позиции" (symbol не передан) для неё
+    физически невозможны, нет способа запросить funding сразу по всему
+    аккаунту. Поэтому здесь, в отличие от остальных бирж, ошибка не про
+    отсутствие секретов, а явно про то, что символ обязателен.
+    """
     window_days = _EXCHANGE_WINDOW_DAYS.get(exchange, 7)
 
     if exchange == "aster":
@@ -171,6 +192,18 @@ def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: i
         if "gate_api_key" not in secrets:
             raise CalculatorError("Gate не подключён (нет секретов)")
         fn = lambda s, e: fetch_gate(secrets["gate_api_key"], secrets["gate_api_secret"], s, e)
+    elif exchange == "kucoin":
+        if "kucoin_api_key" not in secrets:
+            raise CalculatorError("KuCoin не подключён (нет секретов)")
+        if not symbol:
+            raise CalculatorError(
+                "Для KuCoin нужно выбрать конкретный символ — эта биржа отдаёт funding-историю "
+                "только по одному символу за раз, «все открытые позиции» для неё не поддерживаются."
+            )
+        fn = lambda s, e: fetch_kucoin(
+            secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            symbol, s, e,
+        )
     else:
         raise CalculatorError(f"Неизвестная биржа: {exchange}")
 
@@ -205,7 +238,7 @@ def group_by_symbol(records: list, exchange: str) -> dict:
     return dict(sorted(totals.items(), key=lambda kv: -abs(kv[1])))
 
 
-def group_by_day(records: list, exchange: str, time_field_candidates=("time", "transactionTime", "settleTime", "timestamp")) -> dict:
+def group_by_day(records: list, exchange: str, time_field_candidates=("time", "transactionTime", "settleTime", "timestamp", "timePoint")) -> dict:
     """Дата (YYYY-MM-DD, UTC) -> сумма funding за день. Ищет поле времени по кандидатам,
     т.к. у разных бирж оно называется по-разному (см. funding_report.py)."""
     from datetime import datetime, timezone
@@ -273,6 +306,14 @@ def list_open_symbols(secrets: dict) -> dict:
         except Exception as e:
             print(f"[calculator] Gate open symbols error: {e}")
 
+    if "kucoin_api_key" in secrets:
+        try:
+            result["kucoin"] = sorted(fetch_kucoin_open_symbols(
+                secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            ).keys())
+        except Exception as e:
+            print(f"[calculator] KuCoin open symbols error: {e}")
+
     return result
 
 
@@ -288,6 +329,8 @@ def list_connected_exchanges(secrets: dict) -> list:
         keys.append("mexc")
     if "gate_api_key" in secrets:
         keys.append("gate")
+    if "kucoin_api_key" in secrets:
+        keys.append("kucoin")
     return keys
 
 

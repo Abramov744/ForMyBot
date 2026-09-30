@@ -978,6 +978,63 @@ def fetch_kucoin_open_symbols(api_key: str, api_secret: str, api_passphrase: str
     }
 
 
+def fetch_kucoin(api_key: str, api_secret: str, api_passphrase: str,
+                  symbol: str, start_ms: int, end_ms: int) -> list:
+    """
+    GET /api/v1/funding-history (KuCoin Futures) — история ФАКТИЧЕСКИ
+    начисленного funding по аккаунту. В отличие от fetch_aster/fetch_bybit/
+    fetch_lighter/fetch_mexc/fetch_gate выше, `symbol` здесь ОБЯЗАТЕЛЬНЫЙ
+    параметр — KuCoin не отдаёт funding сразу по всему аккаунту одним
+    запросом, только по одному контракту за раз. Подтверждено офиц.
+    документацией (kucoin.com/docs-new/rest/futures-trading/funding-fees/
+    get-private-funding-history) и офиц. SDK ccxt (kucoin.py,
+    fetch_funding_history -> futuresPrivateGetFundingHistory).
+
+    Из-за этого ограничения KuCoin НЕ участвует в fetch_all()/
+    fetch_all_windowed() (и, соответственно, в /report и /calendar) — там
+    нужно перечислить ВСЕ символы, по которым были начисления за
+    произвольный период, включая уже закрытые позиции, а у KuCoin для этого
+    нет способа получить список символов заранее, не зная его. Используется
+    только там, где символ уже известен: fetch_all_time_open_positions()
+    (сейчас открытые позиции) и calculator.py (пользователь выбирает
+    конкретный символ) — см. README.
+
+    Диапазон ОДНОГО запроса — не длиннее 3 месяцев (_EXCHANGE_WINDOW_DAYS
+    ["kucoin"] = 90, тот же лимит, что и у биржи), глубже 6 месяцев назад
+    биржа историю не хранит вообще.
+
+    Пагинация внутри одного окна — по maxCount (лимит биржи 1500 записей на
+    ответ, берём с запасом 1000) и сужением startAt до времени ПОСЛЕДНЕЙ
+    (по факту максимальной, а не последней по порядку в ответе — сортировка
+    ответа документацией не гарантирована, не полагаемся на неё) полученной
+    записи + 1мс — а не через offset, который документация прямо называет
+    ненадёжным ("may lead to inaccurate or duplicated data").
+
+    Поля ответа (data.dataList[]), подтверждено офиц. документацией:
+    symbol, timePoint (мс), fundingRate, markPrice, positionQty,
+    positionCost, funding (сумма выплаты за начисление — отрицательная,
+    если ЗАПЛАТили, положительная, если ПОЛУЧили), settleCurrency.
+    """
+    base_url = "https://api-futures.kucoin.com"
+    path = "/api/v1/funding-history"
+    max_count = 1000
+    all_records: list = []
+    cur_start = start_ms
+    while cur_start < end_ms:
+        data = _kucoin_signed_get(
+            base_url, path, api_key, api_secret, api_passphrase,
+            params={"symbol": symbol, "startAt": cur_start, "endAt": end_ms, "maxCount": max_count},
+        )
+        items = (data.get("data") or {}).get("dataList") or []
+        if not items:
+            break
+        all_records.extend(items)
+        if len(items) < max_count:
+            break
+        cur_start = max(int(item["timePoint"]) for item in items) + 1
+    return all_records
+
+
 # ── Опрос всех подключённых бирж за произвольный период ──────────────────────
 
 def fetch_all(secrets: dict, start_ms: int, end_ms: int) -> dict:
@@ -1075,6 +1132,11 @@ _EXCHANGE_WINDOW_DAYS = {
     "lighter": 30,
     "mexc": 90,
     "gate": 30,
+    # KuCoin — подтверждено офиц. документацией (kucoin.com/docs-new/rest/
+    # futures-trading/funding-fees/get-private-funding-history): "The
+    # startAt and endAt range cannot exceed 3 months" (история вообще не
+    # хранится глубже 6 месяцев назад — не наше ограничение). См. fetch_kucoin.
+    "kucoin": 90,
 }
 
 # Некоторые биржи (подтверждено для Gate реальной ошибкой 400 "from time
@@ -1558,6 +1620,40 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
             print(f"[Gate/positions] Ошибка: {e}")
             results["gate"] = (None, str(e))
 
+    if "kucoin_api_key" in secrets:
+        try:
+            open_times = fetch_kucoin_open_symbols(
+                secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            )
+            if open_times:
+                # KuCoin, в отличие от бирж выше, не отдаёт funding сразу по
+                # всему аккаунту одним запросом — только по одному символу за
+                # раз (см. докстринг fetch_kucoin). Поэтому здесь не "запросить
+                # один раз, потом отфильтровать по открытым символам", а
+                # отдельный запрос НА КАЖДЫЙ сейчас открытый символ (их обычно
+                # один-два), сразу с start = время открытия ИМЕННО этой позиции
+                # — без риска "залипшего" openingTimestamp от предыдущего
+                # открытия того же символа (в отличие от Bybit/MEXC выше, там
+                # это реальная, задокументированная проблема): KuCoin отвечает
+                # только записями внутри запрошенного окна, а не всей историей
+                # символа, так что подстраховка через _trim_open_position_records
+                # тут не нужна.
+                records: list = []
+                for symbol, open_time_ms in open_times.items():
+                    fetch_start_ms = max(open_time_ms, lookback_start_ms)
+                    symbol_records = _fetch_in_windows(
+                        lambda s, e, _sym=symbol: fetch_kucoin(
+                            secrets["kucoin_api_key"], secrets["kucoin_api_secret"],
+                            secrets["kucoin_api_passphrase"], _sym, s, e,
+                        ),
+                        _EXCHANGE_WINDOW_DAYS["kucoin"], fetch_start_ms, now_ms,
+                    )
+                    records.extend(symbol_records)
+                results["kucoin"] = (records, None)
+        except Exception as e:
+            print(f"[KuCoin/positions] Ошибка: {e}")
+            results["kucoin"] = (None, str(e))
+
     return results
 
 
@@ -1577,6 +1673,7 @@ def build_open_positions_report(results: dict) -> str:
         "lighter": ("Lighter", "change",  "symbol", "asset"),
         "mexc":    ("MEXC",    "funding", "symbol", "asset"),
         "gate":    ("Gate",    "change",  "symbol", "asset"),
+        "kucoin":  ("KuCoin",  "funding", "symbol", "settleCurrency"),
     }
 
     all_totals: dict = defaultdict(float)
