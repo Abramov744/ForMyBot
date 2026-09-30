@@ -84,11 +84,9 @@ value_input_option=USER_ENTERED — Google Sheets сам распознаёт т
 
 import os
 import time
-import urllib.parse
 from datetime import datetime
 
 import gspread
-import requests
 
 from entry_price import (
     WINDOW_MINUTES_EXACT,
@@ -99,16 +97,14 @@ from entry_price import (
     _search_spot_entry,
 )
 from funding_report import (
-    LIGHTER_BASE_URL,
     MSK,
-    _aster_sign,
-    _bybit_sign,
-    _gate_sign,
-    _get_gate_proxies,
-    _get_mexc_proxies,
-    _get_proxies,
-    _kucoin_signed_get,
-    _mexc_sign,
+    _cached_raw_positions,
+    _aster_positions_raw,
+    _bybit_positions_raw,
+    _gate_positions_raw,
+    _kucoin_positions_raw,
+    _lighter_positions_raw,
+    _mexc_positions_raw,
     fetch_lighter_markets,
     load_secrets,
 )
@@ -143,30 +139,20 @@ _SPOT_EXCHANGE_LABELS = {
 # Не переиспользует funding_report.fetch_*_open_symbols напрямую — те
 # возвращают ВСЕ позиции (long и short вперемешку, без объёма) в форме
 # {symbol: time_ms}, заточенной под расчёт funding, где сторона позиции не
-# важна. Здесь нужна именно сторона и объём, поэтому свой (но
-# однострочный, не более) вызов того же эндпоинта что и там — тот же
-# паттерн, что entry_price.py уже использует для _*_position_entry
-# (отдельные функции под конкретную задачу поверх одних и тех же API).
+# важна. Здесь нужна именно сторона и объём, поэтому свой разбор ответа —
+# тот же паттерн, что entry_price.py уже использует для _*_position_entry
+# (отдельные функции под конкретную задачу поверх одних и тех же API). Сам
+# HTTP-запрос при этом НЕ дублируется: каждая функция ниже берёт сырой
+# список позиций через funding_report._cached_raw_positions — тот же общий
+# короткоживущий кэш, что использует и fetch_*_open_symbols, и
+# liquidation_alerts.py (см. докстринг _cached_raw_positions в
+# funding_report.py про то, зачем — раньше три модуля независимо делали
+# один и тот же запрос).
 
 def _fetch_bybit_open_shorts(secrets: dict) -> list:
-    base_url = "https://api.bybit.com"
-    recv_window = "5000"
-    proxies = _get_proxies()
-    api_key = secrets["bybit_api_key"].strip()
-    api_secret = secrets["bybit_api_secret"].strip()
-    timestamp = str(int(time.time() * 1000))
-    params_list = [("category", "linear"), ("settleCoin", "USDT"), ("limit", "200")]
-    query_string = urllib.parse.urlencode(params_list)
-    sig = _bybit_sign(api_key, api_secret, timestamp, recv_window, query_string)
-    headers = {
-        "X-BAPI-API-KEY": api_key, "X-BAPI-SIGN": sig,
-        "X-BAPI-TIMESTAMP": timestamp, "X-BAPI-RECV-WINDOW": recv_window,
-    }
-    resp = requests.get(f"{base_url}/v5/position/list?{query_string}", headers=headers, timeout=30, proxies=proxies)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("retCode", 0) != 0:
-        raise RuntimeError(f"Bybit position/list error {data.get('retCode')}: {data.get('retMsg')}")
+    items = _cached_raw_positions("bybit", lambda: _bybit_positions_raw(
+        secrets["bybit_api_key"], secrets["bybit_api_secret"],
+    ))
     return [
         {
             "symbol": p["symbol"], "qty": float(p["size"]),
@@ -174,28 +160,17 @@ def _fetch_bybit_open_shorts(secrets: dict) -> list:
             "time_is_exact": True,
             "price": float(p["avgPrice"]) if p.get("avgPrice") else None,
         }
-        for p in data.get("result", {}).get("list", [])
+        for p in items
         if p.get("side") == "Sell" and float(p.get("size", 0)) > 0
     ]
 
 
 def _fetch_mexc_open_shorts(secrets: dict) -> list:
-    base_url = "https://api.mexc.com"
-    api_key = secrets["mexc_api_key"].strip()
-    api_secret = secrets["mexc_api_secret"].strip()
-    timestamp = str(int(time.time() * 1000))
-    sig = _mexc_sign(api_key, api_secret, timestamp, [])
-    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-    resp = requests.get(
-        f"{base_url}/api/v1/private/position/open_positions",
-        headers=headers, timeout=30, proxies=_get_mexc_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
+    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(
+        secrets["mexc_api_key"], secrets["mexc_api_secret"],
+    ))
     out = []
-    for p in data.get("data") or []:
+    for p in items:
         if str(p.get("positionType")) == "1" or float(p.get("holdVol", 0)) <= 0:
             continue  # positionType 1 == long (см. докстринг модуля)
         contract_size = _fetch_mexc_contract_size(p["symbol"])  # holdVol — в контрактах, не в монетах
@@ -210,20 +185,11 @@ def _fetch_mexc_open_shorts(secrets: dict) -> list:
 
 
 def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
-    base_url = "https://api.gateio.ws"
-    url_path = f"/api/v4/futures/{settle}/positions"
-    proxies = _get_gate_proxies()
-    api_key = secrets["gate_api_key"].strip()
-    api_secret = secrets["gate_api_secret"].strip()
-    sig, timestamp = _gate_sign(api_secret, "GET", url_path, "")
-    headers = {"KEY": api_key, "Timestamp": timestamp, "SIGN": sig, "Accept": "application/json"}
-    resp = requests.get(f"{base_url}{url_path}", headers=headers, timeout=30, proxies=proxies)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and data.get("label"):
-        raise RuntimeError(f"Gate positions error {data.get('label')}: {data.get('message')}")
+    items = _cached_raw_positions(f"gate:{settle}", lambda: _gate_positions_raw(
+        secrets["gate_api_key"], secrets["gate_api_secret"], settle,
+    ))
     out = []
-    for p in (data if isinstance(data, list) else []):
+    for p in items:
         size = float(p.get("size", 0) or 0)
         if size < 0:  # отрицательный size == шорт (см. докстринг модуля)
             price = p.get("entry_price")
@@ -235,20 +201,11 @@ def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
 
 
 def _fetch_aster_open_shorts(secrets: dict) -> list:
-    nonce = int(time.time() * 1_000_000)
-    params = {
-        "timestamp": str(int(time.time() * 1000)), "nonce": str(nonce),
-        "user": secrets["user"], "signer": secrets["signer"],
-    }
-    param_str = urllib.parse.urlencode(params)
-    sig = _aster_sign(param_str, secrets["signer_private_key"])
-    resp = requests.get(f"https://fapi.asterdex.com/fapi/v3/positionRisk?{param_str}&signature={sig}", timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict):
-        raise RuntimeError(f"Aster positionRisk error: {data}")
+    items = _cached_raw_positions("aster", lambda: _aster_positions_raw(
+        secrets["user"], secrets["signer"], secrets["signer_private_key"],
+    ))
     out = []
-    for p in data:
+    for p in items:
         amt = float(p.get("positionAmt", 0) or 0)
         if amt < 0:  # отрицательный positionAmt == шорт (конвенция Binance Futures, см. докстринг модуля)
             price = p.get("entryPrice")
@@ -261,49 +218,41 @@ def _fetch_aster_open_shorts(secrets: dict) -> list:
 
 def _fetch_lighter_open_shorts(secrets: dict) -> list:
     markets = fetch_lighter_markets()
-    headers = {"authorization": secrets["lighter_auth_token"].strip()}
-    params = {"by": "index", "value": secrets["lighter_account_index"], "active_only": "true"}
-    resp = requests.get(f"{LIGHTER_BASE_URL}/api/v1/account", params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code", 200) != 200:
-        raise RuntimeError(f"Lighter account error: {data}")
-
-    accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    positions = _cached_raw_positions("lighter", lambda: _lighter_positions_raw(
+        secrets["lighter_account_index"], secrets["lighter_auth_token"],
+    ))
     out = []
-    for acc in accounts:
-        for pos in acc.get("positions", []):
-            market_id = pos.get("market_id", pos.get("market_index"))
-            symbol = markets.get(market_id, f"MARKET_{market_id}")
-            size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
-            if size == 0:
-                continue
-            sign = pos.get("sign")
-            # "sign" не задокументирован официально — используется как знак
-            # (отрицательное = шорт) по аналогии с остальными биржами, если
-            # поле есть; иначе как fallback берётся знак самого "position"
-            # (см. докстринг модуля про непроверенность этого места).
-            is_short = (int(sign) < 0) if sign is not None else (size < 0)
-            if is_short:
-                price = None
-                for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
-                    if pos.get(key) not in (None, ""):
-                        price = float(pos[key])
-                        break
-                out.append({
-                    "symbol": symbol, "qty": abs(size), "entry_time_ms": None, "time_is_exact": False,
-                    "price": price,
-                })
+    for pos in positions:
+        market_id = pos.get("market_id", pos.get("market_index"))
+        symbol = markets.get(market_id, f"MARKET_{market_id}")
+        size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+        if size == 0:
+            continue
+        sign = pos.get("sign")
+        # "sign" не задокументирован официально — используется как знак
+        # (отрицательное = шорт) по аналогии с остальными биржами, если
+        # поле есть; иначе как fallback берётся знак самого "position"
+        # (см. докстринг модуля про непроверенность этого места).
+        is_short = (int(sign) < 0) if sign is not None else (size < 0)
+        if is_short:
+            price = None
+            for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
+                if pos.get(key) not in (None, ""):
+                    price = float(pos[key])
+                    break
+            out.append({
+                "symbol": symbol, "qty": abs(size), "entry_time_ms": None, "time_is_exact": False,
+                "price": price,
+            })
     return out
 
 
 def _fetch_kucoin_open_shorts(secrets: dict) -> list:
-    data = _kucoin_signed_get(
-        "https://api-futures.kucoin.com", "/api/v1/positions",
+    items = _cached_raw_positions("kucoin", lambda: _kucoin_positions_raw(
         secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
-    )
+    ))
     out = []
-    for p in data.get("data") or []:
+    for p in items:
         qty = float(p.get("currentQty", 0) or 0)
         if p.get("isOpen") and qty < 0:  # отрицательный currentQty == шорт (см. докстринг модуля)
             price = p.get("avgEntryPrice")

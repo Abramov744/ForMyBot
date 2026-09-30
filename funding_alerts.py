@@ -78,7 +78,6 @@ from liquidation_alerts import (
 )
 from funding_report import (
     MSK,
-    LIGHTER_BASE_URL,
     load_secrets,
     send_telegram_broadcast,
     fetch_aster_open_symbols,
@@ -88,6 +87,8 @@ from funding_report import (
     fetch_lighter_mark_prices,
     fetch_mexc_open_symbols,
     fetch_gate_open_symbols,
+    _cached_raw_positions,
+    _lighter_positions_raw,
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
@@ -463,41 +464,36 @@ def _lighter_price_positions(secrets: dict) -> list:
     {"symbol", "entry_price", "mark_price"} по каждой открытой позиции на
     Lighter — в отличие от liquidation_alerts._*_liquidation_positions, БЕЗ
     цены ликвидации (там её и нет для Lighter, см. докстринг
-    liquidation_alerts.py). entry_price — GET /api/v1/account, тот же вызов
-    и тот же перебор возможных имён поля, что уже в short_position_tracker.
-    _fetch_lighter_open_shorts (свой, однострочный, под эту задачу — тот
-    же паттерн, что и везде в проекте). mark_price — funding_report.
-    fetch_lighter_mark_prices() (публичный GET /api/v1/orderBookDetails,
-    поле mark_price подтверждено по офиц. SDK lighter-python).
+    liquidation_alerts.py). entry_price — тот же сырой список позиций
+    (GET /api/v1/account), что и в short_position_tracker.
+    _fetch_lighter_open_shorts, через funding_report._cached_raw_positions
+    (общий короткоживущий кэш — см. её докстринг про то, зачем: раньше
+    независимый HTTP-запрос делался в каждом из трёх мест). mark_price —
+    funding_report.fetch_lighter_mark_prices() (публичный GET
+    /api/v1/orderBookDetails, поле mark_price подтверждено по офиц. SDK
+    lighter-python).
     """
     mark_prices = fetch_lighter_mark_prices()
     markets = fetch_lighter_markets()
-    headers = {"authorization": secrets["lighter_auth_token"].strip()}
-    params = {"by": "index", "value": secrets["lighter_account_index"], "active_only": "true"}
-    resp = requests.get(f"{LIGHTER_BASE_URL}/api/v1/account", params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code", 200) != 200:
-        raise RuntimeError(f"Lighter account error: {data}")
-
-    accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    positions = _cached_raw_positions("lighter", lambda: _lighter_positions_raw(
+        secrets["lighter_account_index"], secrets["lighter_auth_token"],
+    ))
     out = []
-    for acc in accounts:
-        for pos in acc.get("positions", []):
-            size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
-            if size == 0:
-                continue
-            market_id = pos.get("market_id", pos.get("market_index"))
-            symbol = markets.get(market_id, f"MARKET_{market_id}")
-            entry = None
-            for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
-                if pos.get(key) not in (None, ""):
-                    entry = float(pos[key])
-                    break
-            mark = mark_prices.get(symbol)
-            if entry is None or mark is None:
-                continue
-            out.append({"symbol": symbol, "entry_price": entry, "mark_price": mark})
+    for pos in positions:
+        size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+        if size == 0:
+            continue
+        market_id = pos.get("market_id", pos.get("market_index"))
+        symbol = markets.get(market_id, f"MARKET_{market_id}")
+        entry = None
+        for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
+            if pos.get(key) not in (None, ""):
+                entry = float(pos[key])
+                break
+        mark = mark_prices.get(symbol)
+        if entry is None or mark is None:
+            continue
+        out.append({"symbol": symbol, "entry_price": entry, "mark_price": mark})
     return out
 
 
