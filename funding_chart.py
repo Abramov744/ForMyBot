@@ -517,6 +517,7 @@ _PERIOD_INCOME_FIELDS = {
     "lighter": ("change",  "timestamp",        "s"),
     "mexc":    ("funding", "settleTime",       "ms"),
     "gate":    ("change",  "time",             "s"),
+    "kucoin":  ("funding", "timePoint",        "ms"),
 }
 
 PROFIT_COLOR = "#39ff14"      # прибыльный день / рост накопительного итога — цвет "плюс", не привязан к конкретной бирже (просто переиспользован кислотный зелёный из EXCHANGE_COLORS)

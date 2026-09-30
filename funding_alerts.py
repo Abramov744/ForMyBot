@@ -75,6 +75,7 @@ from liquidation_alerts import (
     _aster_liquidation_positions,
     _gate_liquidation_positions,
     _mexc_liquidation_positions,
+    _kucoin_liquidation_positions,
 )
 from funding_report import (
     MSK,
@@ -87,11 +88,13 @@ from funding_report import (
     fetch_lighter_mark_prices,
     fetch_mexc_open_symbols,
     fetch_gate_open_symbols,
+    fetch_kucoin_open_symbols,
     _cached_raw_positions,
     _lighter_positions_raw,
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
+    _get_kucoin_proxies,
 )
 
 ALERT_CHECK_INTERVAL_MINUTES = float(os.environ.get("ALERT_CHECK_INTERVAL_MINUTES", "60"))
@@ -100,7 +103,7 @@ FUNDING_ALERT_THRESHOLD = float(os.environ.get("FUNDING_ALERT_THRESHOLD", "0.0")
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
 }
 
 # Дефолтный интервал выплат (часы), используется только если биржа не
@@ -109,6 +112,11 @@ ASTER_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 MEXC_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 GATE_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+# KuCoin отдаёт granularity (интервал) в каждом ответе — используется как
+# дефолт только если поле неожиданно отсутствует (не должно происходить по
+# документации, но остальные биржи в этом файле тоже на этот случай имеют
+# дефолт, см. остальные константы выше).
+KUCOIN_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 # У Lighter funding зафиксирован протоколом на "раз в час" для всех рынков
 # без исключений — не запрашивается через API, см. докстринг модуля.
 LIGHTER_FUNDING_INTERVAL_HOURS = 1.0
@@ -181,6 +189,16 @@ def get_open_positions(secrets: dict) -> tuple[dict, set]:
         except Exception as e:
             print(f"[alerts/gate] Не удалось получить открытые позиции: {e}")
             failed.add("gate")
+
+    if "kucoin_api_key" in secrets:
+        try:
+            open_times = fetch_kucoin_open_symbols(
+                secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
+            )
+            result["kucoin"] = sorted(open_times.keys())
+        except Exception as e:
+            print(f"[alerts/kucoin] Не удалось получить открытые позиции: {e}")
+            failed.add("kucoin")
 
     return result, failed
 
@@ -340,12 +358,38 @@ def _fetch_lighter_predicted_rate(symbol: str) -> tuple[float, int | None, float
     raise RuntimeError(f"Lighter: ставка по {symbol} не найдена в ответе funding-rates")
 
 
+def _fetch_kucoin_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
+    """
+    GET /api/v1/funding-rate/{symbol}/current — публичный (без ключей)
+    эндпоинт KuCoin Futures. Поля ответа (value/fundingTime/granularity)
+    подтверждены офиц. SDK ccxt (kucoin.py,
+    futuresPublicGetFundingRateSymbolCurrent). granularity — интервал в МС
+    (не фиксирован на 8ч, как у остальных бирж выше, КуCoin документирует
+    право менять его по символу — используется как есть, без округления к
+    ближайшему "стандартному" значению).
+    """
+    resp = requests.get(
+        f"https://api-futures.kucoin.com/api/v1/funding-rate/{symbol}/current",
+        timeout=15, proxies=_get_kucoin_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"KuCoin funding-rate/current error {data.get('code')}: {data.get('msg')}")
+    d = data.get("data") or {}
+    next_ms = int(d["fundingTime"]) if d.get("fundingTime") else None
+    granularity_ms = d.get("granularity")
+    interval_hours = float(granularity_ms) / 3_600_000.0 if granularity_ms else KUCOIN_DEFAULT_FUNDING_INTERVAL_HOURS
+    return float(d["value"]), next_ms, interval_hours
+
+
 _PREDICTED_RATE_FETCHERS = {
     "aster": _fetch_aster_predicted_rate,
     "bybit": _fetch_bybit_predicted_rate,
     "mexc": _fetch_mexc_predicted_rate,
     "gate": _fetch_gate_predicted_rate,
     "lighter": _fetch_lighter_predicted_rate,
+    "kucoin": _fetch_kucoin_predicted_rate,
 }
 
 
@@ -497,9 +541,10 @@ def _lighter_price_positions(secrets: dict) -> list:
     return out
 
 
-# Bybit/Aster/Gate/MEXC — те же position-фетчеры, что уже возвращают и цену
-# входа, и текущую (mark/fair) цену в liquidation_alerts.py (переиспользуются
-# через импорт); Lighter — своя функция выше (там нет цены ликвидации, но
+# Bybit/Aster/Gate/MEXC/KuCoin — те же position-фетчеры, что уже возвращают
+# и цену входа, и текущую (mark/fair) цену в liquidation_alerts.py
+# (переиспользуются через импорт, включая liq_price — здесь просто не
+# используется); Lighter — своя функция выше (там нет цены ликвидации, но
 # есть mark_price/entry_price, см. её докстринг).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
@@ -507,6 +552,7 @@ _PRICE_FETCHERS = {
     "gate": _gate_liquidation_positions,
     "mexc": _mexc_liquidation_positions,
     "lighter": _lighter_price_positions,
+    "kucoin": _kucoin_liquidation_positions,
 }
 
 
@@ -525,14 +571,14 @@ def build_predicted_rates_report(secrets: dict) -> str:
     в % от цены ВХОДА в позицию, знак — от лица P&L шорта, а не голого
     движения цены (согласовано с пользователем явно): цена ВЫШЕ входа —
     минус и 🔴 (это убыток по шорту), цена НИЖЕ входа — плюс и 🟢. Источник
-    — position-фетчеры (см. _PRICE_FETCHERS ниже): для Bybit/Aster/Gate/MEXC
-    те же, что уже написаны и проверены для liquidation_alerts.py
+    — position-фетчеры (см. _PRICE_FETCHERS ниже): для Bybit/Aster/Gate/
+    MEXC/KuCoin те же, что уже написаны и проверены для liquidation_alerts.py
     (entry_price/mark_price из ответа тех же приватных эндпоинтов, что и
     цена ликвидации там) — переиспользуются через импорт, не копируются
     заново; для Lighter — своя _lighter_price_positions (там нет цены
     ликвидации, поэтому в liquidation_alerts.py эта биржа не участвует, но
     mark_price/entry_price доступны отдельно, см. её докстринг). Работает
-    для всех пяти бирж.
+    для всех шести бирж.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)

@@ -236,9 +236,20 @@ def build_open_symbol_index(secrets: dict) -> dict:
 
     if "kucoin_api_key" in secrets:
         try:
-            index["kucoin"] = fetch_kucoin_open_symbols(
+            symbols = fetch_kucoin_open_symbols(
                 secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
             )
+            index["kucoin"] = symbols
+            # Побочным эффектом (без лишних запросов к бирже — symbols уже
+            # получены выше) копим реестр всех когда-либо виденных открытыми
+            # символов KuCoin — он нужен funding_report.fetch_all_windowed()
+            # для /report и /calendar, см. докстринг kucoin_symbol_history.py
+            # про то, зачем. Локальный import (не в начале файла) — иначе
+            # цикл импортов: kucoin_symbol_history.py сам импортирует
+            # _with_sheets_retry из этого файла.
+            import kucoin_symbol_history
+            for symbol in symbols:
+                kucoin_symbol_history.record_observation(symbol)
         except Exception as e:
             print(f"[sheets_sync/kucoin] Не удалось получить открытые позиции: {e}", flush=True)
 

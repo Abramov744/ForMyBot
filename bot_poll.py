@@ -52,6 +52,7 @@ from funding_report import (
     build_open_positions_report,
     send_telegram,
 )
+import kucoin_symbol_history
 from funding_alerts import build_predicted_rates_report
 from funding_chart import (
     build_positions_apr_chart,
@@ -338,7 +339,8 @@ def answer_callback_query(token: str, callback_query_id: str, text: str | None =
 def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: int) -> None:
     token = secrets["telegram_token"]
     try:
-        results = fetch_all(secrets, start_ms, end_ms)
+        kucoin_symbols = kucoin_symbol_history.load_known_symbols() if "kucoin_api_key" in secrets else set()
+        results = fetch_all(secrets, start_ms, end_ms, kucoin_symbols=kucoin_symbols)
         report = build_report(
             start_ms, end_ms,
             *results.get("aster",   (None, None)),
@@ -346,6 +348,7 @@ def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: i
             *results.get("lighter", (None, None)),
             *results.get("mexc",    (None, None)),
             *results.get("gate",    (None, None)),
+            *results.get("kucoin",  (None, None)),
         )
         send_telegram(token, chat_id, report)
         print("Отправлен отчёт.")
@@ -391,7 +394,8 @@ def send_period_report(secrets: dict, chat_id: str, start_ms: int, end_ms: int, 
                 f"⏳ Собираю отчёт за {label} — период длинный, у части бирж жёсткий "
                 f"лимит на диапазон одного запроса истории, это может занять несколько минут…",
             )
-        results, warnings = fetch_all_windowed(secrets, start_ms, end_ms)
+        kucoin_symbols = kucoin_symbol_history.load_known_symbols() if "kucoin_api_key" in secrets else set()
+        results, warnings = fetch_all_windowed(secrets, start_ms, end_ms, kucoin_symbols=kucoin_symbols)
         report = build_report(
             start_ms, end_ms,
             *results.get("aster",   (None, None)),
@@ -399,6 +403,7 @@ def send_period_report(secrets: dict, chat_id: str, start_ms: int, end_ms: int, 
             *results.get("lighter", (None, None)),
             *results.get("mexc",    (None, None)),
             *results.get("gate",    (None, None)),
+            *results.get("kucoin",  (None, None)),
         )
         if warnings:
             report += "\n\n" + "\n".join(warnings)
