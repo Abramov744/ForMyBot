@@ -80,6 +80,11 @@ def _mexc_margin_snapshot(secrets: dict) -> list:
     через state.
     """
     raw = _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
+    # ВРЕМЕННО: предыдущие две версии формулы margin_base не совпали с тем,
+    # что реально видит пользователь на счёте (168.655 вместо 395) — вместо
+    # третьего предположения печатаем ВСЕ сырые поля ответа в лог Railway,
+    # чтобы один раз сверить с реальным экраном MEXC и убрать после этого.
+    print(f"[margin/mexc DEBUG] сырые данные account/assets: {raw}")
     out = []
     for a in raw:
         cash_balance = float(a.get("cashBalance", 0) or 0)
