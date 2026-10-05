@@ -700,18 +700,20 @@ def fetch_mexc_spot_balance(api_key: str, api_secret: str) -> dict:
     return out
 
 
-def fetch_gate_futures_balance(api_key: str, api_secret: str, settle: str = "usdt") -> float:
+def _gate_futures_account_raw(api_key: str, api_secret: str, settle: str = "usdt") -> dict:
     """
-    GET /api/v4/futures/{settle}/accounts → total + unrealised_pnl. Та же
-    подпись (funding_report._gate_sign), что и остальные Gate-запросы.
+    Сырой ответ GET /api/v4/futures/{settle}/accounts — общий источник для
+    fetch_gate_futures_balance ниже и margin_alerts.py (там нужны total и
+    unrealised_pnl по отдельности, не только их сумма). Та же подпись
+    (funding_report._gate_sign), что и остальные Gate-запросы.
 
-    ПОДТВЕРЖДЕНО по официальной модели FuturesAccount (gateapi-go,
-    model_futures_account.go): total — это "balance after the user's
-    accumulated deposit, withdraw, profit and loss ... excluding unrealized
-    profit and loss" — то есть баланс кошелька БЕЗ учёта текущего результата
-    по открытым позициям, тот же случай, что уже был у Aster
-    (unRealizedProfit) и Lighter (unrealized_pnl) — без отдельного поля
-    unrealised_pnl баланс не совпадал с реальным при открытых позициях.
+    ПОДТВЕРЖДЕНО по официальной документации Gate API v4 (апи-референс
+    futures accounts): total = position_margin + order_margin + available
+    — то есть это ВЕСЬ капитал счёта (свободные деньги + маржа под
+    позицией + маржа под неисполненными ордерами), БЕЗ учёта текущего
+    floating PnL (тот же случай, что уже был у Aster/Lighter — без
+    отдельного поля unrealised_pnl баланс не совпадал с реальным при
+    открытых позициях).
     """
     base_url = "https://api.gateio.ws"
     url_path = f"/api/v4/futures/{settle}/accounts"
@@ -725,6 +727,12 @@ def fetch_gate_futures_balance(api_key: str, api_secret: str, settle: str = "usd
     data = resp.json()
     if isinstance(data, dict) and data.get("label"):
         raise RuntimeError(f"Gate futures accounts error {data.get('label')}: {data.get('message')}")
+    return data
+
+
+def fetch_gate_futures_balance(api_key: str, api_secret: str, settle: str = "usdt") -> float:
+    """total + unrealised_pnl — см. _gate_futures_account_raw."""
+    data = _gate_futures_account_raw(api_key, api_secret, settle)
     total = float(data.get("total", 0) or 0)
     unrealised_pnl = float(data.get("unrealised_pnl", 0) or 0)
     return total + unrealised_pnl

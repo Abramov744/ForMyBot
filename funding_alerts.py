@@ -70,13 +70,11 @@ from datetime import datetime, timezone
 import requests
 
 import aster_interval_history
-from balances import _mexc_account_assets_raw
+from balances import _mexc_account_assets_raw, _gate_futures_account_raw
 from entry_price import _fetch_mexc_contract_size
 from liquidation_alerts import (
     _bybit_liquidation_positions,
     _aster_liquidation_positions,
-    _gate_liquidation_positions,
-    _mexc_liquidation_positions,
     _kucoin_liquidation_positions,
     _mexc_fair_price,
 )
@@ -95,6 +93,7 @@ from funding_report import (
     _cached_raw_positions,
     _lighter_positions_raw,
     _mexc_positions_raw,
+    _gate_positions_raw,
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
@@ -604,19 +603,68 @@ def _mexc_margin_pnl_positions(secrets: dict) -> list:
     return out
 
 
-# Bybit/Aster/Gate/KuCoin — те же position-фетчеры, что уже возвращают
-# и цену входа, и текущую (mark/fair) цену в liquidation_alerts.py
-# (переиспользуются через импорт, включая liq_price — здесь просто не
-# используется); Lighter — своя функция выше (там нет цены ликвидации, но
-# есть mark_price/entry_price, см. её докстринг). MEXC обрабатывается
-# отдельно в build_predicted_rates_report через _mexc_margin_pnl_positions
-# (% от маржи, а не от цены — см. её докстринг).
+def _gate_margin_base(secrets: dict, settle: str = "usdt") -> float:
+    """
+    Поддерживаемая маржа фьючерсного счёта Gate — та же формула, что и в
+    margin_alerts.py (см. её докстринг): margin_base = total (уже сам
+    сумма position_margin+order_margin+available, не зависит от
+    unrealised_pnl) — ПОДТВЕРЖДЕНО по офиц. докам Gate API v4. Отдельный
+    сырой фетчер _gate_futures_account_raw переиспользуется через импорт.
+    """
+    data = _gate_futures_account_raw(secrets["gate_api_key"], secrets["gate_api_secret"], settle)
+    return float(data.get("total", 0) or 0)
+
+
+def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
+    """
+    Для Gate — entry/mark как и в _gate_liquidation_positions, но
+    ДОПОЛНИТЕЛЬНО unrealised_pnl — Gate, в отличие от MEXC, отдаёт
+    долларовый PnL позиции ПРЯМО в ответе positions (поле unrealised_pnl,
+    подтверждено офиц. докам), поэтому не нужно домножать qty на разницу
+    цен самостоятельно — проще и надёжнее, чем для MEXC.
+    """
+    items = _cached_raw_positions(f"gate:{settle}", lambda: _gate_positions_raw(
+        secrets["gate_api_key"], secrets["gate_api_secret"], settle,
+    ))
+    out = []
+    for p in items:
+        size = float(p.get("size", 0) or 0)
+        if size >= 0:
+            continue  # у бота только шорты (см. CLAUDE.md)
+        entry, mark = p.get("entry_price"), p.get("mark_price")
+        if not entry or not mark:
+            continue
+        out.append({
+            "symbol": p["contract"],
+            "entry_price": float(entry),
+            "mark_price": float(mark),
+            "pnl_dollar": float(p.get("unrealised_pnl", 0) or 0),
+        })
+    return out
+
+
+# Bybit/Aster/KuCoin — те же position-фетчеры, что уже возвращают и цену
+# входа, и текущую (mark/fair) цену в liquidation_alerts.py (переиспользуются
+# через импорт, включая liq_price — здесь просто не используется); Lighter —
+# своя функция выше (там нет цены ликвидации, но есть mark_price/entry_price,
+# см. её докстринг). MEXC и Gate обрабатываются отдельно — см.
+# _MARGIN_PNL_FETCHERS ниже (% от маржи, а не от цены — см. их докстринги).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
-    "gate": _gate_liquidation_positions,
     "lighter": _lighter_price_positions,
     "kucoin": _kucoin_liquidation_positions,
+}
+
+# Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
+# вместо % от цены входа (явная просьба пользователя, сначала для MEXC,
+# затем для Gate — "сделай всё то же самое"). Каждая запись —
+# (pnl_positions_fetcher, margin_base_fetcher); структура рассчитана на
+# дальнейшее расширение на другие биржи без переделки build_predicted_
+# rates_report.
+_MARGIN_PNL_FETCHERS = {
+    "mexc": (_mexc_margin_pnl_positions, _mexc_margin_base),
+    "gate": (_gate_margin_pnl_positions, _gate_margin_base),
 }
 
 
@@ -636,17 +684,18 @@ def build_predicted_rates_report(secrets: dict) -> str:
     пользователем явно): цена ВЫШЕ входа — минус и 🔴 (убыток по шорту),
     цена НИЖЕ входа — плюс и 🟢.
 
-    Для MEXC (явная просьба пользователя) это НЕ % от цены входа, а % от
-    ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см. _mexc_margin_pnl_positions/
-    _mexc_margin_base: при плече небольшое движение цены может быть
-    значительным процентом от маржи, и голый "% от цены" этого не
-    отражает. Для Bybit/Aster/Gate/KuCoin — по-прежнему % от цены входа,
-    через те же position-фетчеры, что уже написаны и проверены для
-    liquidation_alerts.py (см. _PRICE_FETCHERS ниже) — переиспользуются
-    через импорт, не копируются заново; для Lighter — своя
-    _lighter_price_positions (там нет цены ликвидации, поэтому в
-    liquidation_alerts.py эта биржа не участвует, но mark_price/entry_price
-    доступны отдельно, см. её докстринг). Работает для всех шести бирж.
+    Для MEXC и Gate (явная просьба пользователя — сначала MEXC, затем
+    "сделай всё то же самое по Gate") это НЕ % от цены входа, а % от
+    ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см. _MARGIN_PNL_FETCHERS ниже: при плече
+    небольшое движение цены может быть значительным процентом от маржи, и
+    голый "% от цены" этого не отражает. Для Bybit/Aster/KuCoin —
+    по-прежнему % от цены входа, через те же position-фетчеры, что уже
+    написаны и проверены для liquidation_alerts.py (см. _PRICE_FETCHERS
+    ниже) — переиспользуются через импорт, не копируются заново; для
+    Lighter — своя _lighter_price_positions (там нет цены ликвидации,
+    поэтому в liquidation_alerts.py эта биржа не участвует, но mark_price/
+    entry_price доступны отдельно, см. её докстринг). Работает для всех
+    шести бирж.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)
@@ -671,20 +720,21 @@ def build_predicted_rates_report(secrets: dict) -> str:
         # Цена входа/текущая — одним запросом на всю биржу (не по одному на
         # символ), тот же список позиций, что уже пришлось бы получать
         # отдельно; ошибка здесь не должна ронять сами ставки ниже — просто
-        # строки останутся без цены. Для MEXC — отдельная ветка: вместо %
-        # от цены показываем % от маржи счёта (явная просьба пользователя,
-        # см. _mexc_margin_pnl_positions/_mexc_margin_base).
+        # строки останутся без цены. Для MEXC/Gate — отдельная ветка: вместо
+        # % от цены показываем % от маржи счёта (явная просьба пользователя,
+        # см. _MARGIN_PNL_FETCHERS).
         prices_by_symbol = {}
-        mexc_margin_base = None
-        if exchange == "mexc":
+        margin_base = None
+        if exchange in _MARGIN_PNL_FETCHERS:
+            pnl_fetcher, margin_base_fetcher = _MARGIN_PNL_FETCHERS[exchange]
             try:
-                mexc_margin_base = _mexc_margin_base(secrets)
+                margin_base = margin_base_fetcher(secrets)
             except Exception as e:
-                print(f"[rates/mexc] Не удалось получить маржу счёта: {e}")
+                print(f"[rates/{exchange}] Не удалось получить маржу счёта: {e}")
             try:
-                prices_by_symbol = {p["symbol"]: p for p in _mexc_margin_pnl_positions(secrets)}
+                prices_by_symbol = {p["symbol"]: p for p in pnl_fetcher(secrets)}
             except Exception as e:
-                print(f"[rates/mexc] Не удалось получить цены входа/текущую: {e}")
+                print(f"[rates/{exchange}] Не удалось получить цены входа/текущую: {e}")
         else:
             price_fetcher = _PRICE_FETCHERS.get(exchange)
             if price_fetcher:
@@ -720,13 +770,14 @@ def build_predicted_rates_report(secrets: dict) -> str:
             if info and info.get("entry_price"):
                 entry, mark = info["entry_price"], info["mark_price"]
                 pnl_dollar = info.get("pnl_dollar")
-                if exchange == "mexc" and pnl_dollar is not None and mexc_margin_base:
+                if exchange in _MARGIN_PNL_FETCHERS and pnl_dollar is not None and margin_base:
                     # % от поддерживаемой маржи счёта, а не от цены входа —
                     # явная просьба пользователя: при плече небольшое
                     # движение цены — это куда больший % от маржи, и голый
                     # "% от цены" этого не показывает. Знак уже учтён в
-                    # pnl_dollar (см. _mexc_margin_pnl_positions).
-                    margin_pct = pnl_dollar / mexc_margin_base * 100
+                    # pnl_dollar (см. _mexc_margin_pnl_positions/
+                    # _gate_margin_pnl_positions).
+                    margin_pct = pnl_dollar / margin_base * 100
                     price_emoji = "🟢" if margin_pct >= 0 else "🔴"
                     price_part = (
                         f"\n   {price_emoji} PnL: {pnl_dollar:+.2f} ({margin_pct:+.1f}% от маржи) "
@@ -738,8 +789,8 @@ def build_predicted_rates_report(secrets: dict) -> str:
                     # зеркалим относительно голого "цена выросла/упала":
                     # цена ВЫШЕ входа -> процент со знаком МИНУС и 🔴 (минус
                     # для шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
-                    # пользователем явно. Также fallback для MEXC, если не
-                    # удалось получить маржу счёта (см. выше) — лучше
+                    # пользователем явно. Также fallback для MEXC/Gate, если
+                    # не удалось получить маржу счёта (см. выше) — лучше
                     # показать % от цены, чем вообще ничего.
                     pnl_pct = (entry - mark) / entry * 100
                     price_emoji = "🟢" if pnl_pct >= 0 else "🔴"

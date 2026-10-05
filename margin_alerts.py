@@ -2,7 +2,8 @@
 """
 Алерт о приближении НЕРЕАЛИЗОВАННОГО УБЫТКА к порогу от поддерживаемой
 маржи на фьючерсном счёте биржи — согласовано с пользователем явно (порог
-70%, формула и её источник — ниже). Сначала только MEXC.
+70%, формула и её источник — ниже). MEXC и Gate (явная просьба — "сделай
+всё то же самое по бирже Gate").
 
 ФОРМУЛА (согласована с пользователем явно — после ДВУХ неверных попыток,
 проверена по РЕАЛЬНЫМ сырым данным его счёта, см. историю правок модуля):
@@ -27,6 +28,15 @@ unrealized=-169.40, equity=226.43. Пользователь подтвердил
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) — это ровно 70% от реального,
 статичного капитала счёта, без побочных математических эффектов.
 
+GATE — та же идея, аналогичные поля того же ответа GET /api/v4/futures/
+{settle}/accounts (ПОДТВЕРЖДЕНО по офиц. докам Gate API v4): total =
+position_margin + order_margin + available — то есть total уже САМ есть
+margin_base (сумма всех трёх компонентов капитала счёта, без unrealized
+PnL, который отдаётся отдельным полем unrealised_pnl) — никакого
+дополнительного сложения полей не требуется, в отличие от MEXC:
+  margin_base = total
+  unrealized  = unrealised_pnl
+
 Алерт срабатывает, когда unrealized ОТРИЦАТЕЛЕН и его модуль достиг
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) от margin_base:
   unrealized <= -MARGIN_ALERT_THRESHOLD * margin_base
@@ -49,13 +59,13 @@ liquidation_alerts.py, одна запись на биржу.
 import os
 import time
 
-from balances import _mexc_account_assets_raw
+from balances import _mexc_account_assets_raw, _gate_futures_account_raw
 from funding_report import load_secrets, send_telegram_broadcast
 
 MARGIN_CHECK_INTERVAL_MINUTES = float(os.environ.get("MARGIN_CHECK_INTERVAL_MINUTES", "5"))
 MARGIN_ALERT_THRESHOLD = float(os.environ.get("MARGIN_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"mexc": "MEXC"}
+_LABELS = {"mexc": "MEXC", "gate": "Gate"}
 
 
 def _mexc_margin_snapshot(secrets: dict) -> list:
@@ -82,8 +92,29 @@ def _mexc_margin_snapshot(secrets: dict) -> list:
     return out
 
 
+def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
+    """
+    Список {"currency", "margin_base", "unrealized"} для фьючерсного счёта
+    Gate (settle-валюта, на практике почти всегда только usdt, см. README)
+    — margin_base = total (уже сам сумма position_margin+order_margin+
+    available, см. докстринг модуля), unrealized = unrealised_pnl. В
+    отличие от MEXC — единственный аккаунт на settle-валюту, а не список
+    по всем валютам, поэтому здесь список из 0 или 1 элемента.
+    """
+    data = _gate_futures_account_raw(secrets["gate_api_key"], secrets["gate_api_secret"], settle)
+    margin_base = float(data.get("total", 0) or 0)
+    if margin_base <= 0:
+        return []
+    return [{
+        "currency": (data.get("currency") or settle).upper(),
+        "margin_base": margin_base,
+        "unrealized": float(data.get("unrealised_pnl", 0) or 0),
+    }]
+
+
 _MARGIN_FETCHERS = {
     "mexc": (_mexc_margin_snapshot, "mexc_api_key"),
+    "gate": (_gate_margin_snapshot, "gate_api_key"),
 }
 
 
