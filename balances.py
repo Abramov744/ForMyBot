@@ -629,11 +629,16 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     return {"total": total, "parts": parts}
 
 
-def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
-    """GET /api/v1/private/account/assets — тот же контрактный (фьючерсный)
-    API и та же подпись, что и funding_report.fetch_mexc. Суммирует поле
-    equity по всем валютам счёта (аккаунт USDT-маржинальный, см. README, —
-    практически всегда будет только запись USDT)."""
+def _mexc_account_assets_raw(api_key: str, api_secret: str) -> list:
+    """
+    Сырой data из GET /api/v1/private/account/assets (контрактный/фьючерсный
+    API MEXC, тот же эндпоинт и подпись, что и funding_report.fetch_mexc) —
+    общий источник для fetch_mexc_futures_balance ниже и margin_alerts.py
+    (там нужны equity И unrealized по отдельности, не только их сумма).
+    По каждой валюте счёта (аккаунт USDT-маржинальный, см. README — на
+    практике почти всегда только запись USDT): currency, equity (офиц. "Total
+    equity"), cashBalance (офиц. "Withdrawable balance"), unrealized и др.
+    """
     base_url = "https://api.mexc.com"
     api_key, api_secret = api_key.strip(), api_secret.strip()
     timestamp = str(int(time.time() * 1000))
@@ -648,7 +653,12 @@ def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
     data = resp.json()
     if not data.get("success", False):
         raise RuntimeError(f"MEXC account/assets error {data.get('code')}: {data.get('message') or data}")
-    return sum(float(a.get("equity", 0) or 0) for a in (data.get("data") or []))
+    return data.get("data") or []
+
+
+def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
+    """Суммирует поле equity по всем валютам счёта — см. _mexc_account_assets_raw."""
+    return sum(float(a.get("equity", 0) or 0) for a in _mexc_account_assets_raw(api_key, api_secret))
 
 
 def fetch_mexc_spot_balance(api_key: str, api_secret: str) -> dict:
