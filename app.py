@@ -63,6 +63,7 @@ from bot_worker import poll_forever
 from funding_alerts import alert_loop
 from funding_report import load_secrets
 from liquidation_alerts import liquidation_alert_loop
+from margin_alerts import margin_alert_loop
 from sheets_sync import sheet_sync_loop
 from short_position_tracker import short_position_check_loop
 from sltp_alerts import sltp_alert_loop
@@ -723,6 +724,7 @@ def main():
     threading.Thread(target=alert_loop, args=(secrets,), daemon=True, name="funding-alerts").start()
     threading.Thread(target=sltp_alert_loop, args=(secrets,), daemon=True, name="sltp-alerts").start()
     threading.Thread(target=liquidation_alert_loop, args=(secrets,), daemon=True, name="liquidation-alerts").start()
+    threading.Thread(target=margin_alert_loop, args=(secrets,), daemon=True, name="margin-alerts").start()
 
     # Опционально: пользователь может не подключать Google Sheet вовсе —
     # тогда просто не запускаем поток, а не падаем и не блокируем всё
