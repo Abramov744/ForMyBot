@@ -548,15 +548,22 @@ def _lighter_price_positions(secrets: dict) -> list:
 def _mexc_margin_base(secrets: dict) -> float:
     """
     Поддерживаемая маржа фьючерсного счёта MEXC — та же формула, что и в
-    margin_alerts.py (согласована с пользователем явно): сумма на счёте
-    (cashBalance) + нереализованный PNL (unrealized) = полю equity того же
-    ответа account/assets. Суммируется по всем валютам счёта (на практике
-    почти всегда только USDT, см. README) — отдельный сырой фетчер
-    _mexc_account_assets_raw переиспользуется через импорт, не копируется.
+    margin_alerts.py (согласована с пользователем явно, ДВА раза, на
+    конкретных числах): margin_base = cashBalance - unrealized (со знаком)
+    — РАСТЁТ по мере роста убытка, это НЕ стандартная equity-логика (где
+    margin, наоборот, падает с убытком) — пользователь явно подтвердил
+    именно такое поведение, см. докстринг margin_alerts.py про важный
+    математический нюанс (порог там эффективно куда выше 70% от исходного
+    cashBalance). cashBalance ("Withdrawable balance" по офиц. docs) не
+    включает floating PnL, берётся из ответа account/assets напрямую.
+    Суммируется по всем валютам счёта (на практике почти всегда только
+    USDT, см. README) — отдельный сырой фетчер _mexc_account_assets_raw
+    переиспользуется через импорт, не копируется.
     """
+    raw = _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
     return sum(
-        float(a.get("equity", 0) or 0)
-        for a in _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
+        float(a.get("cashBalance", 0) or 0) - float(a.get("unrealized", 0) or 0)
+        for a in raw
     )
 
 
