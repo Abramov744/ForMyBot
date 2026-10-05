@@ -4,35 +4,44 @@
 маржи на фьючерсном счёте биржи — согласовано с пользователем явно (порог
 70%, формула и её источник — ниже). Сначала только MEXC.
 
-ФОРМУЛА (согласована с пользователем явно, двумя сообщениями):
-  margin_base = сумма на фьючерсном счёте + нереализованный PNL
-Для MEXC "сумма на фьючерсном счёте" (без PnL) — это поле cashBalance
-("Withdrawable balance" по офиц. docs), а "нереализованный PNL" — поле
-unrealized. То есть:
-  margin_base = cashBalance + unrealized
-Это АЛГЕБРАИЧЕСКИ РАВНО полю equity ("Total equity" по офиц. docs) —
-третьему полю того же ответа account/assets, которое и так уже показывает
-команда /balance (см. balances.fetch_mexc_futures_balance). Никакого
-двойного учёта PnL здесь нет: equity уже включает unrealized, складывать
-unrealized ещё раз сверху НЕ нужно — это подтверждено явно пользователем
-(уточняющий вопрос был задан именно из-за этого риска).
+ФОРМУЛА (согласована с пользователем явно — ДВА РАЗА, на конкретных
+числах, после того как первая версия формулы оказалась неверной):
+  margin_base = сумма на фьючерсном счёте - нереализованный PNL (со знаком)
+Пример от пользователя: на счёте 200 USDT, нереализованный PNL -100 USDT
+(убыток) -> поддерживаемая маржа = 200 - (-100) = 300 USDT. То есть margin
+РАСТЁТ по мере роста убытка — это НЕ стандартная механика "equity" (где
+margin, наоборот, падает с убытком: equity = cashBalance + unrealized);
+пользователь явно подтвердил именно такое, растущее с убытком, поведение
+через прямой выбор между двумя вариантами (см. историю правок модуля).
+
+"Сумма на фьючерсном счёте" — это поле cashBalance ("Withdrawable
+balance" по офиц. docs MEXC) — оно НЕ включает floating PnL открытых
+позиций, поэтому берётся из ответа account/assets напрямую, без вычислений
+через equity:
+  margin_base = cashBalance - unrealized
+
+ВАЖНЫЙ МАТЕМАТИЧЕСКИЙ НЮАНС (идентифицирован и сообщён пользователю,
+проверьте, не нужно ли скорректировать порог): поскольку знаменатель сам
+РАСТЁТ вместе с убытком, порог "70% от margin_base" требует значительно
+БОЛЬШЕГО убытка, чем 70% от исходного cashBalance. Алгебраически, при
+L = |unrealized| (убыток), условие алерта
+  L >= THRESHOLD * (cashBalance + L)
+сводится к
+  L >= [THRESHOLD / (1 - THRESHOLD)] * cashBalance
+При THRESHOLD = 0.70 это L >= 2.33 * cashBalance — то есть алерт сработает
+только когда убыток уже БОЛЕЕ ЧЕМ В ДВА РАЗА превышает весь депонированный
+капитал (эквивалентно equity = cashBalance + unrealized уже значительно
+ОТРИЦАТЕЛЬНОЙ). На практике биржа обычно ликвидирует позицию значительно
+раньше этой точки (примерно когда equity приближается к нулю, т.е.
+L ≈ cashBalance, что по ЭТОЙ формуле соответствует всего ~50% от
+margin_base). Это означает, что при пороге 0.70 алерт скорее всего НЕ
+успеет сработать до реальной ликвидации — сообщено пользователю явно,
+порог можно изменить (переменная окружения MARGIN_ALERT_THRESHOLD) или
+формулу пересмотреть, если это не то поведение, которое нужно.
 
 Алерт срабатывает, когда unrealized ОТРИЦАТЕЛЕН и его модуль достиг
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) от margin_base:
   unrealized <= -MARGIN_ALERT_THRESHOLD * margin_base
-
-ВАЖНО (самореференция знаменателя): margin_base сам УМЕНЬШАЕТСЯ по мере
-роста убытка (margin_base = cashBalance + unrealized, а unrealized < 0) —
-поэтому порог "70% от margin_base" — это НЕ то же самое, что "70% от
-фиксированного cashBalance". Алгебраически:
-  -unrealized >= 0.70 * (cashBalance + unrealized)
-  -unrealized - 0.70*unrealized >= 0.70 * cashBalance   (unrealized < 0)
-  -1.70 * unrealized >= 0.70 * cashBalance
-  -unrealized >= (0.70/1.70) * cashBalance ≈ 0.4118 * cashBalance
-То есть условие срабатывает уже при убытке примерно в 41.2% от исходного
-cashBalance, а не в 70% — если нужен порог именно от фиксированной суммы
-на счёте (без самоуменьшения знаменателя убытком), скажите — формула легко
-меняется на unrealized <= -threshold * cashBalance.
 
 EDGE-TRIGGERED, как и funding/ликвидационные алерты: отправляется один раз
 при переходе доли убытка из "меньше порога" в "порог и больше" по каждой
@@ -63,21 +72,24 @@ _LABELS = {"mexc": "MEXC"}
 
 def _mexc_margin_snapshot(secrets: dict) -> list:
     """
-    Список {"currency", "equity", "unrealized"} по каждой валюте фьючерсного
-    счёта MEXC (см. докстринг модуля — equity тут и есть margin_base).
-    Валюты с нулевым equity (нет позиции и ничего не заведено) пропускаются —
-    формально 0 всегда даст pct=0, но нет смысла гонять их через state.
+    Список {"currency", "margin_base", "unrealized"} по каждой валюте
+    фьючерсного счёта MEXC — margin_base = cashBalance - unrealized (см.
+    докстринг модуля про формулу и про важный нюанс с растущим
+    знаменателем). Валюты с нулевым/отрицательным cashBalance (нет
+    задепонированного капитала) пропускаются — там нет смысла гонять их
+    через state.
     """
     raw = _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
     out = []
     for a in raw:
-        equity = float(a.get("equity", 0) or 0)
-        if equity <= 0:
+        cash_balance = float(a.get("cashBalance", 0) or 0)
+        if cash_balance <= 0:
             continue
+        unrealized = float(a.get("unrealized", 0) or 0)
         out.append({
             "currency": a.get("currency", "?"),
-            "equity": equity,
-            "unrealized": float(a.get("unrealized", 0) or 0),
+            "margin_base": cash_balance - unrealized,
+            "unrealized": unrealized,
         })
     return out
 
@@ -87,11 +99,11 @@ _MARGIN_FETCHERS = {
 }
 
 
-def _fmt_alert(exchange: str, currency: str, equity: float, unrealized: float, pct: float) -> str:
+def _fmt_alert(exchange: str, currency: str, margin_base: float, unrealized: float, pct: float) -> str:
     label = _LABELS.get(exchange, exchange)
     return (
         f"🚨 {label} ({currency}): нереализованный убыток достиг {pct * 100:.0f}% от маржи на счёте\n"
-        f"Маржа (equity): {equity:g} {currency} → нереализованный PNL: {unrealized:g} {currency}"
+        f"Маржа: {margin_base:g} {currency} → нереализованный PNL: {unrealized:g} {currency}"
     )
 
 
@@ -123,13 +135,13 @@ def check_margin_alerts(secrets: dict, state: dict) -> None:
             key = (exchange, currency)
             seen_keys.add(key)
 
-            equity, unrealized = item["equity"], item["unrealized"]
-            pct = (-unrealized / equity) if unrealized < 0 else 0.0
+            margin_base, unrealized = item["margin_base"], item["unrealized"]
+            pct = (-unrealized / margin_base) if unrealized < 0 and margin_base > 0 else 0.0
             was_triggered = state.get(key, False)
             is_triggered = unrealized < 0 and pct >= MARGIN_ALERT_THRESHOLD
 
             if is_triggered and not was_triggered:
-                text = _fmt_alert(exchange, currency, equity, unrealized, pct)
+                text = _fmt_alert(exchange, currency, margin_base, unrealized, pct)
                 send_telegram_broadcast(token, chat_ids, text)
                 print(f"[margin] Отправлен алерт: {exchange} {currency} {pct:.1%}")
 
