@@ -63,7 +63,6 @@ APR = ставка_за_выплату × (24 / интервал_в_часах) 
 если сама биржа перестанет отдавать это поле.
 """
 
-import html
 import os
 import time
 from datetime import datetime, timezone
@@ -77,9 +76,6 @@ from liquidation_alerts import (
     _bybit_liquidation_positions,
     _aster_liquidation_positions,
     _kucoin_liquidation_positions,
-    _gate_liquidation_positions,
-    _mexc_liquidation_positions,
-    _lighter_liquidation_positions,
     _mexc_fair_price,
 )
 from funding_report import (
@@ -666,21 +662,15 @@ def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     return out
 
 
-# Цена входа/текущая/ЛИКВИДАЦИИ для всех шести бирж — те же position-
-# фетчеры, что уже написаны и проверены для liquidation_alerts.py
-# (переиспользуются через импорт, не копируются заново). Раньше здесь не
-# было MEXC/Gate/Lighter (у них был отдельный путь без liq_price, когда
-# таблицы ещё не было) — теперь нужны ВСЕ восемь полей сразу (включая цену
-# ликвидации) в каждой строке таблицы /rates, так что это снова общий
-# источник для всех шести, а _MARGIN_PNL_FETCHERS ниже используется
-# ДОПОЛНИТЕЛЬНО (для PnL/% от маржи), не вместо.
+# Bybit/Aster/KuCoin — те же position-фетчеры, что уже возвращают и цену
+# входа, и текущую (mark/fair) цену в liquidation_alerts.py (переиспользуются
+# через импорт, включая liq_price — здесь просто не используется). MEXC/Gate/
+# Lighter обрабатываются отдельно — см. _MARGIN_PNL_FETCHERS ниже (% от маржи,
+# а не от цены — см. их докстринги).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
-    "gate": _gate_liquidation_positions,
     "kucoin": _kucoin_liquidation_positions,
-    "mexc": _mexc_liquidation_positions,
-    "lighter": _lighter_liquidation_positions,
 }
 
 # Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
@@ -696,126 +686,59 @@ _MARGIN_PNL_FETCHERS = {
 }
 
 
-# Заголовки таблицы /rates (build_predicted_rates_report) и то, как
-# выравнивается каждый столбец — текстовые столбцы (монета/биржа) влево,
-# числовые вправо (обычный вид таблицы, числа читаются по правому краю).
-_RATES_TABLE_HEADERS = ["Монета", "Биржа", "Ставка", "APR", "PnL", "%Маржи", "Цена", "Ликв."]
-_RATES_TABLE_LEFT_ALIGN = {0, 1}
-
-
-def _rates_table_row(symbol, exchange_label, rate, apr, pnl_dollar, margin_pct, mark, liq) -> list:
-    return [
-        symbol,
-        exchange_label,
-        f"{rate * 100:+.3f}%",
-        f"{apr:+.1f}%",
-        f"{pnl_dollar:+.2f}" if pnl_dollar is not None else "—",
-        f"{margin_pct:+.1f}%" if margin_pct is not None else "—",
-        f"{mark:g}" if mark is not None else "—",
-        f"{liq:g}" if liq is not None else "—",
-    ]
-
-
-def _render_monospace_table(headers: list, rows: list) -> str:
-    """
-    Моноширинная HTML-таблица (<pre>...</pre>) — Telegram выравнивает
-    пробелами только внутри <pre>/<code> (моноширинный шрифт), в обычном
-    тексте колонки "расползлись" бы, потому что шрифт пропорциональный.
-    Ширина каждого столбца — по самой длинной ячейке в нём (включая
-    заголовок); текстовые столбцы (индексы из _RATES_TABLE_LEFT_ALIGN)
-    выравниваются влево, числовые — вправо. html.escape на每 ячейку — на
-    случай, если в данных (символ/биржа — внешние данные бирж, не наш
-    ввод) окажется "<"/">"/"&", которые сломали бы HTML-разметку.
-    """
-    widths = [
-        max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
-        for i in range(len(headers))
-    ]
-
-    def fmt_row(cells: list) -> str:
-        parts = []
-        for i, cell in enumerate(cells):
-            padded = cell.ljust(widths[i]) if i in _RATES_TABLE_LEFT_ALIGN else cell.rjust(widths[i])
-            parts.append(html.escape(padded))
-        return "  ".join(parts)
-
-    lines = [fmt_row(headers), "  ".join("-" * w for w in widths)]
-    lines.extend(fmt_row(row) for row in rows)
-    return "<pre>" + "\n".join(lines) + "</pre>"
-
-
 def build_predicted_rates_report(secrets: dict) -> str:
     """
-    ТАБЛИЦА по всем открытым сейчас позициям — по явной просьбе
-    пользователя заменяет прежний текстовый список с разбивкой по биржам:
-    одна строка на (биржа, символ), столбцы Монета/Биржа/Ставка/APR/PnL/
-    %Маржи/Цена/Ликв. (именно в этом порядке и составе запрошены явно).
-    Рендерится как моноширинный блок <pre> (см. _render_monospace_table) —
-    без этого в Telegram колонки, выровненные пробелами, не совпадали бы
-    по вертикали (пропорциональный шрифт вне <pre>/<code>), поэтому вызов
-    send_telegram ниже по цепочке (bot_poll.send_predicted_rates_report)
-    должен передавать parse_mode="HTML".
-
     В отличие от build_open_positions_report в funding_report.py (это уже
     НАЧИСЛЕННЫЙ funding с момента открытия позиции), здесь — чего ждать на
     СЛЕДУЮЩУЮ выплату. Переиспользует get_open_positions()/get_predicted_rate()
     — те же функции, что и check_funding_alerts(), поэтому если логика
-    получения прогнозной ставки когда-нибудь изменится, эта команда
-    останется согласована с алертами автоматически.
+    получения прогнозной ставки когда-нибудь изменится (например, уточнится
+    источник для Lighter, см. докстринг модуля), эта команда останется
+    согласована с алертами автоматически, а не разъедется как отдельная
+    копия того же самого.
 
-    "Ставка" — за одну выплату (знак — платите вы или вам), "APR" —
-    приведённая к году (funding_alerts.annualize, т.к. периодичность
-    выплат разная по биржам/символам и ставки "за выплату" между собой
-    напрямую не сравнить, см. докстринг модуля).
+    Дополнительно к ставке — ТЕКУЩАЯ (mark/fair) цена актива и PnL, знак —
+    от лица P&L шорта, а не голого движения цены (согласовано с
+    пользователем явно): цена ВЫШЕ входа — минус и 🔴 (убыток по шорту),
+    цена НИЖЕ входа — плюс и 🟢.
 
-    "PnL"/"%Маржи" заполнены только для MEXC/Gate/Lighter (см.
-    _MARGIN_PNL_FETCHERS выше) — там есть формула поддерживаемой маржи
-    счёта (явная просьба пользователя, сначала MEXC, затем "сделай всё то
-    же самое" для Gate и Lighter). Для Bybit/Aster/KuCoin поддерживаемая
-    маржа не отслеживается — в этих столбцах "—", а не выдуманное число.
-
-    "Цена"/"Ликв." — для ВСЕХ шести бирж, через те же position-фетчеры,
-    что уже написаны и проверены для liquidation_alerts.py (_PRICE_FETCHERS
-    выше, переиспользуются через импорт, не копируются заново) — позиция
-    пропускается из этих двух столбцов (не из таблицы целиком), если биржа
-    не отдала валидную цену ликвидации для неё (см. докстринги конкретных
-    _*_liquidation_positions про когда так бывает, например кросс-маржа).
-
-    Строки отсортированы по ставке за выплату (сначала самое отрицательное
-    — то, что спишут в первую очередь), как и в прежнем текстовом отчёте.
+    Для MEXC, Gate и Lighter (явная просьба пользователя — сначала MEXC,
+    затем "сделай всё то же самое" для Gate и Lighter) это НЕ % от цены
+    входа, а % от ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см. _MARGIN_PNL_FETCHERS
+    ниже: при плече небольшое движение цены может быть значительным
+    процентом от маржи, и голый "% от цены" этого не отражает. Для
+    Bybit/Aster/KuCoin — по-прежнему % от цены входа, через те же
+    position-фетчеры, что уже написаны и проверены для liquidation_alerts.py
+    (см. _PRICE_FETCHERS ниже) — переиспользуются через импорт, не
+    копируются заново. Работает для всех шести бирж.
     """
+    lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)
 
-    header_lines = []
     if failed_exchanges:
         labels = ", ".join(EXCHANGE_LABELS.get(ex, ex) for ex in sorted(failed_exchanges))
-        header_lines.append(f"⚠️ Не удалось получить список открытых позиций: {labels} — по ним данных в таблице нет (это не значит, что там нет позиций).")
+        lines.append(f"⚠️ Не удалось получить список открытых позиций: {labels} — по ним данных в отчёте нет (это не значит, что там нет позиций).")
 
     if not any(open_positions.values()):
-        msg = "Сейчас нет ни одной открытой позиции ни на одной подключённой бирже (либо не удалось получить данные — см. предупреждение выше)."
-        return "\n\n".join(header_lines + [msg]) if header_lines else msg
+        lines.append("")
+        lines.append("Сейчас нет ни одной открытой позиции ни на одной подключённой бирже (либо не удалось получить данные — см. предупреждение выше).")
+        return "\n".join(lines)
 
-    table_rows = []
-    sort_rates = []  # параллельно table_rows — ставка за выплату, для сортировки
-    errors = []      # (exchange, symbol, текст_ошибки)
-
+    any_rate = False
     for exchange, symbols in open_positions.items():
         if not symbols:
             continue
+        label = EXCHANGE_LABELS.get(exchange, exchange)
+        lines.append("")
+        lines.append(f"── {label} ──")
 
-        # Цена входа/текущая/ликвидации — одним запросом на всю биржу (не
-        # по одному на символ); ошибка здесь не должна ронять саму ставку
-        # ниже — просто столбцы Цена/Ликв. останутся с "—".
-        price_by_symbol = {}
-        price_fetcher = _PRICE_FETCHERS.get(exchange)
-        if price_fetcher:
-            try:
-                price_by_symbol = {p["symbol"]: p for p in price_fetcher(secrets)}
-            except Exception as e:
-                print(f"[rates/{exchange}] Не удалось получить цену/ликвидацию: {e}")
-
-        # PnL/% от маржи — только для MEXC/Gate/Lighter (см. докстринг).
-        pnl_by_symbol = {}
+        # Цена входа/текущая — одним запросом на всю биржу (не по одному на
+        # символ), тот же список позиций, что уже пришлось бы получать
+        # отдельно; ошибка здесь не должна ронять сами ставки ниже — просто
+        # строки останутся без цены. Для MEXC/Gate/Lighter — отдельная ветка:
+        # вместо % от цены показываем % от маржи счёта (явная просьба
+        # пользователя, см. _MARGIN_PNL_FETCHERS).
+        prices_by_symbol = {}
         margin_base = None
         if exchange in _MARGIN_PNL_FETCHERS:
             pnl_fetcher, margin_base_fetcher = _MARGIN_PNL_FETCHERS[exchange]
@@ -824,47 +747,83 @@ def build_predicted_rates_report(secrets: dict) -> str:
             except Exception as e:
                 print(f"[rates/{exchange}] Не удалось получить маржу счёта: {e}")
             try:
-                pnl_by_symbol = {p["symbol"]: p for p in pnl_fetcher(secrets)}
+                prices_by_symbol = {p["symbol"]: p for p in pnl_fetcher(secrets)}
             except Exception as e:
-                print(f"[rates/{exchange}] Не удалось получить PnL позиций: {e}")
+                print(f"[rates/{exchange}] Не удалось получить цены входа/текущую: {e}")
+        else:
+            price_fetcher = _PRICE_FETCHERS.get(exchange)
+            if price_fetcher:
+                try:
+                    prices_by_symbol = {
+                        p["symbol"]: p for p in price_fetcher(secrets)
+                    }
+                except Exception as e:
+                    print(f"[rates/{exchange}] Не удалось получить цены входа/текущую: {e}")
 
+        rows = []    # (rate, symbol, next_ms, interval_hours) — успешно полученные ставки
+        errors = []  # (symbol, текст_ошибки)
         for symbol in symbols:
             try:
                 rate, next_ms, interval_hours = get_predicted_rate(exchange, symbol)
+                rows.append((rate, symbol, next_ms, interval_hours))
+                any_rate = True
             except Exception as e:
-                errors.append((exchange, symbol, str(e)))
-                continue
+                errors.append((symbol, str(e)))
 
+        # Сначала самые отрицательные (то, что заплатите) — так самое
+        # срочное сразу видно вверху секции, а не теряется среди строк.
+        # Показываем ОБА значения — ставку за конкретную выплату (сколько
+        # спишут/начислят в ближайший раз) и приведённую к году (APR), т.к.
+        # периодичность выплат разная по биржам/символам (1ч/4ч/8ч) и сами
+        # ставки "за выплату" между собой напрямую не сравнить — см.
+        # annualize() и докстринг модуля.
+        for rate, symbol, next_ms, interval_hours in sorted(rows, key=lambda x: x[0]):
+            emoji = "🟢" if rate >= 0 else "🔴"
             apr = annualize(rate, interval_hours)
-            price_info = price_by_symbol.get(symbol)
-            mark = price_info["mark_price"] if price_info else None
-            liq = price_info.get("liq_price") if price_info else None
+            price_part = ""
+            info = prices_by_symbol.get(symbol)
+            if info and info.get("entry_price"):
+                entry, mark = info["entry_price"], info["mark_price"]
+                pnl_dollar = info.get("pnl_dollar")
+                if exchange in _MARGIN_PNL_FETCHERS and pnl_dollar is not None and margin_base:
+                    # % от поддерживаемой маржи счёта, а не от цены входа —
+                    # явная просьба пользователя: при плече небольшое
+                    # движение цены — это куда больший % от маржи, и голый
+                    # "% от цены" этого не показывает. Знак уже учтён в
+                    # pnl_dollar (см. _mexc_margin_pnl_positions/
+                    # _gate_margin_pnl_positions).
+                    margin_pct = pnl_dollar / margin_base * 100
+                    price_emoji = "🟢" if margin_pct >= 0 else "🔴"
+                    price_part = (
+                        f"\n   {price_emoji} PnL: {pnl_dollar:+.2f} ({margin_pct:+.1f}% от маржи) "
+                        f"— цена: {mark:g} (вход {entry:g})"
+                    )
+                else:
+                    # У бота везде только ШОРТЫ (см. CLAUDE.md) — рост цены от
+                    # входа это убыток по позиции, а не прибыль, поэтому знак
+                    # зеркалим относительно голого "цена выросла/упала":
+                    # цена ВЫШЕ входа -> процент со знаком МИНУС и 🔴 (минус
+                    # для шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
+                    # пользователем явно. Также fallback для MEXC/Gate/Lighter,
+                    # если не удалось получить маржу счёта (см. выше) — лучше
+                    # показать % от цены, чем вообще ничего.
+                    pnl_pct = (entry - mark) / entry * 100
+                    price_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                    price_part = f"\n   {price_emoji} Цена: {mark:g} ({pnl_pct:+.1f}% от входа {entry:g})"
+            lines.append(
+                f"{emoji} {symbol}: {rate * 100:+.4f}% за выплату "
+                f"(годовых {apr:+.1f}%) — {_fmt_next_time(next_ms)}, "
+                f"funding раз в {interval_hours:g}ч{price_part}"
+            )
 
-            pnl_info = pnl_by_symbol.get(symbol)
-            pnl_dollar = pnl_info["pnl_dollar"] if pnl_info else None
-            margin_pct = (pnl_dollar / margin_base * 100) if (pnl_dollar is not None and margin_base) else None
+        for symbol, err in errors:
+            lines.append(f"⚠️ {symbol}: не удалось получить ставку ({err})")
 
-            table_rows.append(_rates_table_row(
-                symbol, EXCHANGE_LABELS.get(exchange, exchange), rate, apr, pnl_dollar, margin_pct, mark, liq,
-            ))
-            sort_rates.append(rate)
+    if not any_rate:
+        lines.append("")
+        lines.append("Не удалось получить прогнозную ставку ни по одной позиции.")
 
-    if not table_rows:
-        lines = header_lines + ["Не удалось получить прогнозную ставку ни по одной позиции."]
-        for exchange, symbol, err in errors:
-            lines.append(f"⚠️ {EXCHANGE_LABELS.get(exchange, exchange)} {symbol}: не удалось получить ставку ({err})")
-        return "\n".join(lines)
-
-    # Сначала самые отрицательные ставки (то, что спишут) — см. докстринг.
-    table_rows = [row for _, row in sorted(zip(sort_rates, table_rows), key=lambda x: x[0])]
-
-    result = list(header_lines)
-    result.append("🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату):")
-    result.append(_render_monospace_table(_RATES_TABLE_HEADERS, table_rows))
-    for exchange, symbol, err in errors:
-        result.append(f"⚠️ {EXCHANGE_LABELS.get(exchange, exchange)} {symbol}: не удалось получить ставку ({err})")
-
-    return "\n".join(result)
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

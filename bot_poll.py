@@ -486,17 +486,13 @@ def send_predicted_rates_report(secrets: dict, chat_id: str) -> None:
     Прогнозная ставка funding по открытым сейчас позициям (build_predicted_rates_report
     в funding_alerts.py — та же логика, что и в фоновых алертах на отрицательный
     фандинг, просто по запросу и сразу по всем позициям, а не только при
-    переходе в минус). Явная просьба пользователя — таблица, а не текстовый
-    список; build_predicted_rates_report рендерит её как моноширинный блок
-    <pre>, поэтому отправка идёт с parse_mode="HTML" (без этого Telegram
-    показал бы пропорциональным шрифтом, и столбцы не совпадали бы по
-    вертикали).
+    переходе в минус).
     """
     token = secrets["telegram_token"]
     try:
         send_telegram(token, chat_id, "⏳ Запрашиваю прогнозные ставки по открытым позициям…")
         report = build_predicted_rates_report(secrets)
-        send_telegram(token, chat_id, report, parse_mode="HTML")
+        send_telegram(token, chat_id, report)
         print("Отправлен отчёт по прогнозным ставкам.")
     except Exception as e:
         print(f"Ошибка при формировании отчёта по прогнозным ставкам: {e}")

@@ -1945,18 +1945,9 @@ def build_report(start_ms: int, end_ms: int,
 
 # ── Отправка в Telegram ───────────────────────────────────────────────────────
 
-def send_telegram(token: str, chat_id: str, text: str, parse_mode: str | None = None) -> None:
-    """
-    parse_mode — опционально ("HTML"), только когда вызывающему коду нужна
-    разметка (сейчас — моноширимная таблица /rates, funding_alerts.
-    build_predicted_rates_report, через <pre>). По умолчанию None — обычный
-    plain text, как было всегда для всех остальных вызовов в проекте (не
-    трогаем их поведение задним числом)."""
+def send_telegram(token: str, chat_id: str, text: str) -> None:
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    resp = requests.post(url, json=payload, timeout=30)
+    resp = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=30)
     resp.raise_for_status()
 
 
