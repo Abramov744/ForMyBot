@@ -525,20 +525,22 @@ def fetch_lighter(account_index: str, auth_token: str,
     return all_records
 
 
-def _lighter_positions_raw(account_index: str, auth_token: str) -> list:
+def _lighter_account_raw(account_index: str, auth_token: str) -> list:
     """
-    Сырой ПЛОСКИЙ список позиций Lighter — GET /api/v1/account?by=index&
-    value={account_index}&active_only=true (active_only=true просит сервер
-    сразу отдать только рынки с реальной открытой позицией, а не просто те,
-    где выставлялось плечо когда-то), позиции всех "accounts" в ответе
-    склеены в один список (на практике аккаунт всегда один, и ни один из
-    потребителей ниже не использует поля самого accounts[i], кроме
-    positions). Общий источник для fetch_lighter_open_symbols ниже,
-    funding_alerts._lighter_price_positions и short_position_tracker.
-    _fetch_lighter_open_shorts, через _cached_raw_positions выше. Точные
-    имена полей в ответе документированы не полностью, поэтому разбор в
-    каждом потребителе сделан с запасом — пробуются несколько вероятных
-    вариантов ключей.
+    Сырой НЕ расплющенный список "accounts" (на практике всегда один) из
+    GET /api/v1/account?by=index&value={account_index}&active_only=true —
+    общий источник и для _lighter_positions_raw ниже (просто расплющивает
+    positions всех accounts, как раньше — обратная совместимость с её уже
+    существующими потребителями), и для margin_alerts.py/funding_alerts.py
+    (там дополнительно нужно поле collateral на уровне самого аккаунта, а
+    не только positions — _lighter_positions_raw его отбрасывает).
+
+    collateral/available_balance — ПОДТВЕРЖДЕНО по офиц. docs SDK
+    (elliottech/lighter-python, docs/Account.md, дословный список полей на
+    06.10.2026): collateral — обеспечение БЕЗ учёта floating PnL открытых
+    позиций (тот же смысл, что cashBalance+positionMargin у MEXC и total у
+    Gate — весь реальный капитал счёта, не считая PnL), available_balance —
+    свободная (не занятая под позиции) часть этого обеспечения.
     """
     headers = {"authorization": auth_token.strip()}
     params = {"by": "index", "value": account_index, "active_only": "true"}
@@ -551,7 +553,23 @@ def _lighter_positions_raw(account_index: str, auth_token: str) -> list:
     if data.get("code", 200) != 200:
         raise RuntimeError(f"Lighter account error: {data}")
 
-    accounts = data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+    return data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+
+
+def _lighter_positions_raw(account_index: str, auth_token: str) -> list:
+    """
+    Сырой ПЛОСКИЙ список позиций Lighter — позиции всех "accounts" из
+    _lighter_account_raw склеены в один список (на практике аккаунт всегда
+    один, и ни один из потребителей ниже не использует поля самого
+    accounts[i], кроме positions). Общий источник для fetch_lighter_open_
+    symbols ниже, liquidation_alerts._lighter_liquidation_positions,
+    funding_alerts._lighter_margin_pnl_positions и short_position_tracker.
+    _fetch_lighter_open_shorts, через _cached_raw_positions выше. Точные
+    имена полей в ответе документированы не полностью, поэтому разбор в
+    каждом потребителе сделан с запасом — пробуются несколько вероятных
+    вариантов ключей.
+    """
+    accounts = _lighter_account_raw(account_index, auth_token)
     positions = []
     for acc in accounts:
         positions.extend(acc.get("positions", []))
