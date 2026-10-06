@@ -76,6 +76,9 @@ from liquidation_alerts import (
     _bybit_liquidation_positions,
     _aster_liquidation_positions,
     _kucoin_liquidation_positions,
+    _gate_liquidation_positions,
+    _mexc_liquidation_positions,
+    _lighter_liquidation_positions,
     _mexc_fair_price,
 )
 from funding_report import (
@@ -662,15 +665,20 @@ def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     return out
 
 
-# Bybit/Aster/KuCoin — те же position-фетчеры, что уже возвращают и цену
-# входа, и текущую (mark/fair) цену в liquidation_alerts.py (переиспользуются
-# через импорт, включая liq_price — здесь просто не используется). MEXC/Gate/
-# Lighter обрабатываются отдельно — см. _MARGIN_PNL_FETCHERS ниже (% от маржи,
-# а не от цены — см. их докстринги).
+# Цена входа/текущая/ЛИКВИДАЦИИ для всех шести бирж — те же position-
+# фетчеры, что уже написаны и проверены для liquidation_alerts.py
+# (переиспользуются через импорт, не копируются заново). Нужны даже для
+# MEXC/Gate/Lighter (которые дальше используют _MARGIN_PNL_FETCHERS для
+# PnL/% от маржи) — оттуда liq_price не приходит, а цену ликвидации в
+# скобках теперь показываем для всех (явная просьба пользователя — вместо
+# цены входа).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
+    "gate": _gate_liquidation_positions,
     "kucoin": _kucoin_liquidation_positions,
+    "mexc": _mexc_liquidation_positions,
+    "lighter": _lighter_liquidation_positions,
 }
 
 # Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
@@ -700,7 +708,12 @@ def build_predicted_rates_report(secrets: dict) -> str:
     Дополнительно к ставке — ТЕКУЩАЯ (mark/fair) цена актива и PnL, знак —
     от лица P&L шорта, а не голого движения цены (согласовано с
     пользователем явно): цена ВЫШЕ входа — минус и 🔴 (убыток по шорту),
-    цена НИЖЕ входа — плюс и 🟢.
+    цена НИЖЕ входа — плюс и 🟢. В скобках рядом с ценой — ЦЕНА ЛИКВИДАЦИИ
+    (явная просьба пользователя заменить ею цену входа, которая показывалась
+    там раньше), для всех шести бирж, через те же position-фетчеры, что
+    проверены для liquidation_alerts.py (_PRICE_FETCHERS ниже — нужны даже
+    для MEXC/Gate/Lighter, у которых margin-pnl-фетчеры возвращают PnL, но
+    не цену ликвидации).
 
     Для MEXC, Gate и Lighter (явная просьба пользователя — сначала MEXC,
     затем "сделай всё то же самое" для Gate и Lighter) это НЕ % от цены
@@ -740,6 +753,7 @@ def build_predicted_rates_report(secrets: dict) -> str:
         # пользователя, см. _MARGIN_PNL_FETCHERS).
         prices_by_symbol = {}
         margin_base = None
+        liq_by_symbol = {}
         if exchange in _MARGIN_PNL_FETCHERS:
             pnl_fetcher, margin_base_fetcher = _MARGIN_PNL_FETCHERS[exchange]
             try:
@@ -750,6 +764,16 @@ def build_predicted_rates_report(secrets: dict) -> str:
                 prices_by_symbol = {p["symbol"]: p for p in pnl_fetcher(secrets)}
             except Exception as e:
                 print(f"[rates/{exchange}] Не удалось получить цены входа/текущую: {e}")
+            # Цены ликвидации в ответе margin-pnl-фетчеров нет (см. их
+            # докстринги) — отдельный запрос через тот же _PRICE_FETCHERS,
+            # что и для остальных бирж (явная просьба пользователя — цена
+            # ликвидации в скобках вместо цены входа, для всех шести бирж).
+            liq_fetcher = _PRICE_FETCHERS.get(exchange)
+            if liq_fetcher:
+                try:
+                    liq_by_symbol = {p["symbol"]: p.get("liq_price") for p in liq_fetcher(secrets)}
+                except Exception as e:
+                    print(f"[rates/{exchange}] Не удалось получить цену ликвидации: {e}")
         else:
             price_fetcher = _PRICE_FETCHERS.get(exchange)
             if price_fetcher:
@@ -794,9 +818,16 @@ def build_predicted_rates_report(secrets: dict) -> str:
                     # _gate_margin_pnl_positions).
                     margin_pct = pnl_dollar / margin_base * 100
                     price_emoji = "🟢" if margin_pct >= 0 else "🔴"
+                    # Цена ликвидации в скобках вместо цены входа — явная
+                    # просьба пользователя; пусто, если для символа не
+                    # нашлось валидной цены ликвидации (см. докстринги
+                    # liquidation_alerts._*_liquidation_positions про когда
+                    # так бывает, например кросс-маржа).
+                    liq = liq_by_symbol.get(symbol)
+                    liq_part = f" (ликвидация {liq:g})" if liq is not None else ""
                     price_part = (
                         f"\n   {price_emoji} PnL: {pnl_dollar:+.2f} ({margin_pct:+.1f}% от маржи) "
-                        f"— цена: {mark:g} (вход {entry:g})"
+                        f"— цена: {mark:g}{liq_part}"
                     )
                 else:
                     # У бота везде только ШОРТЫ (см. CLAUDE.md) — рост цены от
@@ -806,10 +837,16 @@ def build_predicted_rates_report(secrets: dict) -> str:
                     # для шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
                     # пользователем явно. Также fallback для MEXC/Gate/Lighter,
                     # если не удалось получить маржу счёта (см. выше) — лучше
-                    # показать % от цены, чем вообще ничего.
+                    # показать % от цены, чем вообще ничего. Сам процент
+                    # по-прежнему считается от цены входа (не менялось), но
+                    # цена входа В СКОБКАХ заменена на цену ликвидации (явная
+                    # просьба пользователя) — liq_price уже есть в info из
+                    # _PRICE_FETCHERS, доп. запрос не нужен.
                     pnl_pct = (entry - mark) / entry * 100
                     price_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-                    price_part = f"\n   {price_emoji} Цена: {mark:g} ({pnl_pct:+.1f}% от входа {entry:g})"
+                    liq = info.get("liq_price")
+                    liq_part = f", ликвидация {liq:g}" if liq is not None else ""
+                    price_part = f"\n   {price_emoji} Цена: {mark:g} ({pnl_pct:+.1f}% от входа{liq_part})"
             lines.append(
                 f"{emoji} {symbol}: {rate * 100:+.4f}% за выплату "
                 f"(годовых {apr:+.1f}%) — {_fmt_next_time(next_ms)}, "
