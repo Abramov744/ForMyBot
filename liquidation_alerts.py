@@ -62,12 +62,21 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     {symbol} (поле fairPrice), по одному на каждый открытый на MEXC
     символ (подтверждено по офиц. docs — mexc.com/api-docs/futures/
     market-endpoints/get-fair-price).
-  - Lighter — НЕ включён: ни официальный SDK (elliottech/lighter-python),
-    ни документация не называют поле цены ликвидации в ответе аккаунта
-    (та же ситуация, что и с определением стороны позиции в
-    short_position_tracker.py и причины SL/TP в sltp_alerts.py на этой
-    бирже). Если попадётся реальный случай — пришлите (символ/время/
-    цены), тогда можно будет доработать прицельно.
+  - Lighter — ТЕПЕРЬ ВКЛЮЧЁН (явная просьба пользователя, "настрой Lighter
+    так же, как MEXC и Gate"). Раньше считалось, что поле цены ликвидации
+    нигде не документировано — это было верно на момент той проверки, но
+    офиц. SDK (elliottech/lighter-python, docs/AccountPosition.md,
+    дословно проверено 06.10.2026) с тех пор получил поле
+    liquidation_price прямо в ответе позиции (GET /api/v1/account), рядом
+    с avg_entry_price. mark_price берётся отдельным публичным запросом —
+    funding_report.fetch_lighter_mark_prices() (GET /api/v1/orderBook
+    Details), тот же источник, что уже использовался для /rates. ВАЖНО:
+    в отличие от остальных бирж здесь это поле НЕ проверено против
+    реального счёта с открытой позицией (доступа к боевому Lighter-аккаунту
+    из среды разработки нет) — та же оговорка, что уже стоит у "sign"
+    (определение шорта) в short_position_tracker.py. Первый реальный алерт
+    по Lighter стоит явно сверить с тем, что показывает само приложение
+    Lighter, прежде чем полностью доверять порогу.
 """
 
 import os
@@ -78,15 +87,16 @@ import requests
 from funding_report import (
     _cached_raw_positions,
     _aster_positions_raw, _bybit_positions_raw, _gate_positions_raw,
-    _kucoin_positions_raw, _mexc_positions_raw,
+    _kucoin_positions_raw, _mexc_positions_raw, _lighter_positions_raw,
     _get_mexc_proxies,
+    fetch_lighter_markets, fetch_lighter_mark_prices,
     load_secrets, send_telegram_broadcast,
 )
 
 LIQUIDATION_CHECK_INTERVAL_MINUTES = float(os.environ.get("LIQUIDATION_CHECK_INTERVAL_MINUTES", "5"))
 LIQUIDATION_ALERT_THRESHOLD = float(os.environ.get("LIQUIDATION_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin"}
+_LABELS = {"aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "lighter": "Lighter"}
 
 
 # ── Позиции с ценой входа/ликвидации/текущей — по одной функции на биржу ─────
@@ -188,14 +198,57 @@ def _mexc_liquidation_positions(secrets: dict) -> list:
     return out
 
 
+def _lighter_liquidation_positions(secrets: dict) -> list:
+    """
+    entry_price/liq_price — поля avg_entry_price/liquidation_price того же
+    сырого ответа позиций, что и в short_position_tracker._fetch_lighter_
+    open_shorts (через общий _cached_raw_positions); mark_price — отдельный
+    публичный запрос fetch_lighter_mark_prices() (см. докстринг модуля про
+    статус поддержки Lighter — поле liquidation_price не проверено против
+    реального счёта).
+    """
+    markets = fetch_lighter_markets()
+    mark_prices = fetch_lighter_mark_prices()
+    items = _cached_raw_positions("lighter", lambda: _lighter_positions_raw(
+        secrets["lighter_account_index"], secrets["lighter_auth_token"],
+    ))
+    out = []
+    for pos in items:
+        size = float(pos.get("position", pos.get("size", pos.get("position_size", 0))) or 0)
+        if size == 0:
+            continue
+        sign = pos.get("sign")
+        # "sign" не задокументирован официально — см. докстринг short_position_
+        # tracker.py про то же предположение (отрицательное = шорт).
+        is_short = (int(sign) < 0) if sign is not None else (size < 0)
+        if not is_short:
+            continue
+        entry = None
+        for key in ("avg_entry_price", "entry_price", "avgEntryPrice", "entryPrice"):
+            if pos.get(key) not in (None, ""):
+                entry = float(pos[key])
+                break
+        liq = pos.get("liquidation_price")
+        if entry is None or not liq:
+            continue
+        market_id = pos.get("market_id", pos.get("market_index"))
+        symbol = markets.get(market_id, f"MARKET_{market_id}")
+        mark = mark_prices.get(symbol)
+        if mark is None:
+            continue
+        out.append({"symbol": symbol, "entry_price": entry, "liq_price": float(liq), "mark_price": mark})
+    return out
+
+
 # Только биржи с подтверждённым полем цены ликвидации в ответе — см. докстринг
-# модуля про Lighter.
+# модуля (Lighter добавлен 06.10.2026, с оговоркой про непроверенность поля).
 _LIQUIDATION_POSITION_FETCHERS = {
     "bybit": (_bybit_liquidation_positions, "bybit_api_key"),
     "aster": (_aster_liquidation_positions, "user"),
     "gate": (_gate_liquidation_positions, "gate_api_key"),
     "kucoin": (_kucoin_liquidation_positions, "kucoin_api_key"),
     "mexc": (_mexc_liquidation_positions, "mexc_api_key"),
+    "lighter": (_lighter_liquidation_positions, "lighter_account_index"),
 }
 
 
