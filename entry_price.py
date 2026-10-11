@@ -748,8 +748,14 @@ def _search_spot_trade(secrets: dict, base_asset: str, center_ms: int, window_mi
     возвращает средневзвешенную (VWAP) цену/объём. Порядок котировок —
     QUOTE_CANDIDATES (USDT/USDC/WETH), берём первую, по которой вообще
     нашлись сделки хоть на одной бирже — не смешиваем котировки между собой."""
-    start_ms = center_ms - window_minutes * 60 * 1000
-    end_ms = center_ms + window_minutes * 60 * 1000
+    # int(...) обязателен: window_minutes приходит как float (например,
+    # CLOSE_PRICE_LOOKBACK_MINUTES из sltp_alerts.py) — без него start_ms/
+    # end_ms тоже float, и str(start_ms) превращается в "...610.0", что
+    # MEXC/Gate/KuCoin отвергают как невалидный timestamp (реальный баг:
+    # 11.10.2026 продажа BTW на споте при закрытии не нашлась ни на одной
+    # бирже именно из-за этого — все запросы падали с ошибкой формата).
+    start_ms = int(center_ms - window_minutes * 60 * 1000)
+    end_ms = int(center_ms + window_minutes * 60 * 1000)
 
     # Uniswap сканируется ОДИН раз на все котировки сразу (а не по разу на
     # каждую котировку внутри цикла ниже, как CEX-биржи) — иначе на каждый
