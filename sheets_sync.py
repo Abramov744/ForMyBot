@@ -443,8 +443,18 @@ def record_position_close(
               f"(нет ни даты закрытия, ни цен).", flush=True)
         return False
 
-    print(f"[sheets_sync] Пишу в строку {row_number} для {exchange}/{symbol}: "
-          f"{[(u['range'], u['values'][0][0]) for u in updates]}.", flush=True)
+    # Снимок (range, value) ДО вызова batch_update — gspread.Worksheet.
+    # batch_update мутирует каждый элемент updates на месте, заменяя "range"
+    # с голой метки ("F103") на абсолютизированную ("'Лист'!F103") перед
+    # отправкой в API (см. gspread/worksheet.py). Если читать range из
+    # updates ПОСЛЕ этого вызова (как было раньше) — ws.acell() получает
+    # уже абсолютизированную строку, а не голую метку, и падает с
+    # IncorrectCellLabel на каждой из 3 попыток (не транзиентно, retry не
+    # помогает) — реальный случай, из-за которого запись в F103/AE103
+    # ошибочно считалась неудавшейся 11.10.2026, хотя сам batch_update
+    # скорее всего прошёл успешно.
+    pending = [(u["range"], u["values"][0][0]) for u in updates]
+    print(f"[sheets_sync] Пишу в строку {row_number} для {exchange}/{symbol}: {pending}.", flush=True)
     _with_sheets_retry(ws.batch_update, updates)
 
     # Читаем обратно то, что реально оказалось в каждой ячейке — Sheets API
@@ -454,8 +464,7 @@ def record_position_close(
     # "записано" в финансовой таблице (см. CLAUDE.md). Реальный случай
     # именно с этим для F — 12.09.2026.
     any_ok = False
-    for u in updates:
-        rng, expected = u["range"], u["values"][0][0]
+    for rng, expected in pending:
         written_value = _with_sheets_retry(ws.acell, rng, value_render_option="UNFORMATTED_VALUE").value
         if written_value != expected:
             print(f"[sheets_sync] После записи в {rng} для {exchange}/{symbol} значение при чтении "
