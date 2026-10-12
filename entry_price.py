@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.parse
 from collections import defaultdict
+from datetime import datetime
 
 import requests
 
@@ -40,6 +41,7 @@ from funding_report import (
     _get_mexc_proxies,
     _get_gate_proxies,
     _kucoin_signed_get,
+    _dydx_subaccount_raw,
     _fetch_in_windows,
     _trim_to_continuous_run,
     _EXCHANGE_WINDOW_DAYS,
@@ -83,6 +85,12 @@ def _base_asset(exchange: str, symbol: str) -> str:
         return symbol.split("_")[0]
     if exchange == "lighter":
         return symbol  # у Lighter symbol уже "голый" базовый актив
+    if exchange == "dydx":
+        # Тикер dYdX — "SEI-USD" (база + "-USD", не "-USDT"/"-USDC" как у
+        # остальных бирж) — общий суффиксный разбор ниже съел бы только
+        # "USD" с конца строки и оставил бы висящий дефис ("SEI-"), поэтому
+        # разбор через дефис, тот же приём, что и у спот-формата KuCoin.
+        return symbol.split("-")[0]
     if exchange == "kucoin":
         # У KuCoin ДВА разных формата символа в зависимости от рынка: спот —
         # через дефис ("BTC-USDT"), фьючерсы — слитно с суффиксом контракта
@@ -331,6 +339,32 @@ def _kucoin_position_entry(secrets: dict, symbol: str) -> dict | None:
     return None
 
 
+def _dydx_position_entry(secrets: dict, symbol: str) -> dict | None:
+    """
+    dYdX отдаёт точное время открытия позиции (createdAt, ISO 8601 UTC) —
+    в отличие от Aster/Gate/Lighter, оценка через непрерывность funding не
+    нужна (см. докстринг модуля). side/size/entryPrice — см. комментарий
+    над funding_report._dydx_subaccount_raw.
+    """
+    subaccount = _dydx_subaccount_raw(secrets["dydx_address"], secrets["dydx_subaccount_number"])
+    pos = subaccount.get("openPerpetualPositions", {}).get(symbol)
+    if not pos or pos.get("side") != "SHORT":
+        return None
+    size = float(pos.get("size", 0) or 0)
+    if size == 0:
+        return None
+    created_at = pos.get("createdAt")
+    entry_time_ms = None
+    if created_at:
+        entry_time_ms = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000)
+    return {
+        "price": float(pos["entryPrice"]) if pos.get("entryPrice") else None,
+        "qty": abs(size),
+        "entry_time_ms": entry_time_ms,
+        "time_is_exact": True,
+    }
+
+
 _POSITION_ENTRY_FETCHERS = {
     "aster": _aster_position_entry,
     "bybit": _bybit_position_entry,
@@ -338,6 +372,7 @@ _POSITION_ENTRY_FETCHERS = {
     "gate": _gate_position_entry,
     "lighter": _lighter_position_entry,
     "kucoin": _kucoin_position_entry,
+    "dydx": _dydx_position_entry,
 }
 
 

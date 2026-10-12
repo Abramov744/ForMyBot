@@ -93,6 +93,7 @@ from funding_report import (
     fetch_mexc_open_symbols,
     fetch_gate_open_symbols,
     fetch_kucoin_open_symbols,
+    fetch_dydx_open_symbols,
     _cached_raw_positions,
     _lighter_positions_raw,
     _lighter_account_raw,
@@ -110,7 +111,7 @@ FUNDING_ALERT_THRESHOLD = float(os.environ.get("FUNDING_ALERT_THRESHOLD", "0.0")
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
 }
 
 # Дефолтный интервал выплат (часы), используется только если биржа не
@@ -206,6 +207,20 @@ def get_open_positions(secrets: dict) -> tuple[dict, set]:
         except Exception as e:
             print(f"[alerts/kucoin] Не удалось получить открытые позиции: {e}")
             failed.add("kucoin")
+
+    # dYdX — попадает в список открытых позиций (значит участвует в
+    # sltp_alerts.check_closed_positions, детекции закрытия), но НЕ в
+    # _PREDICTED_RATE_FETCHERS ниже — get_predicted_rate() для dydx кидает
+    # ValueError на каждый символ (см. её докстринг), что здесь и везде, где
+    # она используется, аккуратно ловится и просто пропускает символ без
+    # алерта по ставке funding — см. README про текущий охват интеграции.
+    if "dydx_address" in secrets:
+        try:
+            symbols = fetch_dydx_open_symbols(secrets["dydx_address"], secrets["dydx_subaccount_number"])
+            result["dydx"] = sorted(symbols)
+        except Exception as e:
+            print(f"[alerts/dydx] Не удалось получить открытые позиции: {e}")
+            failed.add("dydx")
 
     return result, failed
 

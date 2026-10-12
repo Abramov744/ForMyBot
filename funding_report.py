@@ -108,6 +108,19 @@ def load_secrets() -> dict:
         result["uniswap_wallet_address"] = uniswap_wallet_address
         result["etherscan_api_key"]      = etherscan_api_key
 
+    # dYdX v4 — опционально, только адрес кошелька (некастодиальная биржа —
+    # позиции/баланс читаются ПУБЛИЧНО через Indexer API по адресу, без
+    # API-ключа и без подписи запроса: ПОДТВЕРЖДЕНО офиц. docs.dydx.xyz,
+    # эндпоинт GET /v4/addresses/{address}/subaccountNumber/{n} не требует
+    # авторизации, проверено живым запросом к testnet-инстансу Indexer).
+    # subaccount_number почти всегда "0" (дефолтный саб-аккаунт), но даётся
+    # отдельной переменной на случай, если пользователь держит позиции на
+    # другом номере.
+    dydx_address = os.environ.get("DYDX_ADDRESS")
+    if dydx_address:
+        result["dydx_address"] = dydx_address.strip()
+        result["dydx_subaccount_number"] = os.environ.get("DYDX_SUBACCOUNT_NUMBER", "0").strip()
+
     return result
 
 
@@ -587,6 +600,90 @@ def fetch_lighter_open_symbols(account_index: str, auth_token: str) -> set:
         market_id = pos.get("market_id", pos.get("market_index"))
         open_symbols.add(markets.get(market_id, f"MARKET_{market_id}"))
     return open_symbols
+
+
+# ── Получение данных с dYdX v4 ────────────────────────────────────────────────
+#
+# dYdX v4 — некастодиальная (on-chain) биржа: нет API-ключа/секрета, сами
+# позиции и баланс саб-аккаунта читаются ПУБЛИЧНО через Indexer (read-only
+# слой между цепью и клиентами) по адресу кошелька. ПОДТВЕРЖДЕНО офиц. docs
+# (docs.dydx.xyz/indexer-client/http) и живым запросом к Indexer:
+#   GET /v4/addresses/{address}/subaccountNumber/{subaccountNumber}
+# отдаёт (без какой-либо авторизации):
+#   {"subaccount": {
+#       "equity": "...", "freeCollateral": "...",
+#       "openPerpetualPositions": {"BTC-USD": {"side": "SHORT"/"LONG",
+#           "size": "-3.73" (подписанный), "entryPrice": "...",
+#           "unrealizedPnl": "...", "createdAt": "2025-...Z" (ISO, точное
+#           время открытия), "status": "OPEN", ...}, ...},
+#       ...
+#   }}
+# Символ — тикер вида "SEI-USD" (базовый актив + "-USD", не "-USDT"/"-USDC"
+# как у остальных бирж — см. entry_price._base_asset).
+#
+# Поддержки прогнозной ставки funding (get_predicted_rate) и цены
+# ликвидации ПОКА НЕТ — задокументированный Indexer API не отдаёт цену
+# ликвидации позиции напрямую (есть maintenanceMarginFraction на уровне
+# рынка, но выводить из неё формулу ликвидации самостоятельно — риск
+# ошибиться на реальных деньгах, см. CLAUDE.md, пока не сделано). См.
+# README про текущий охват интеграции dYdX.
+
+DYDX_INDEXER_BASE_URL = "https://indexer.dydx.trade"
+
+
+def _get_dydx_proxies() -> dict | None:
+    """
+    Прокси для запросов к dYdX Indexer — тот же паттерн, что и для
+    MEXC/Gate. Особенно вероятно понадобится: dYdX Indexer активно
+    блокирует запросы по географии условий использования (подтверждено —
+    тестовый запрос с IP одного из облачных провайдеров словил именно
+    такую блокировку, не просто сетевую ошибку).
+    """
+    proxy = (
+        os.environ.get("DYDX_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not proxy:
+        return None
+
+    if not proxy.startswith(("http://", "https://")):
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            proxy = f"http://{user}:{pwd}@{host}:{port}"
+        else:
+            proxy = f"http://{proxy}"
+
+    return {"http": proxy, "https": proxy}
+
+
+def _dydx_subaccount_raw(address: str, subaccount_number: str) -> dict:
+    """
+    Сырой словарь "subaccount" (см. комментарий выше про форму ответа) —
+    общий источник и для _fetch_dydx_open_shorts (short_position_tracker.py),
+    и для _dydx_margin_snapshot (margin_alerts.py), и для _dydx_position_entry
+    (entry_price.py, автоподбор цены в калькуляторе).
+    """
+    resp = requests.get(
+        f"{DYDX_INDEXER_BASE_URL}/v4/addresses/{address}/subaccountNumber/{subaccount_number}",
+        timeout=30, proxies=_get_dydx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "subaccount" not in data:
+        raise RuntimeError(f"dYdX subaccount error: {data}")
+    return data["subaccount"]
+
+
+def fetch_dydx_open_symbols(address: str, subaccount_number: str) -> set:
+    subaccount = _cached_raw_positions(
+        "dydx", lambda: _dydx_subaccount_raw(address, subaccount_number)
+    )
+    return {
+        market for market, pos in subaccount.get("openPerpetualPositions", {}).items()
+        if pos.get("side") == "SHORT" and float(pos.get("size", 0) or 0) != 0
+    }
 
 
 # ── Получение данных с MEXC ───────────────────────────────────────────────────
