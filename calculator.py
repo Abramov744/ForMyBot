@@ -29,9 +29,10 @@ taker-ставки без VIP-скидок на момент написания)
 from collections import defaultdict
 
 from funding_report import (
-    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin,
+    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin, fetch_dydx,
     fetch_aster_open_symbols, fetch_bybit_open_symbols, fetch_lighter_open_symbols,
     fetch_mexc_open_symbols, fetch_gate_open_symbols, fetch_kucoin_open_symbols,
+    fetch_dydx_open_symbols,
     _fetch_in_windows, _EXCHANGE_WINDOW_DAYS, _trim_to_continuous_run,
 )
 
@@ -55,6 +56,12 @@ _EXACT_OPEN_TIME_FIELDS = {
     "bybit": "transactionTime",
     "mexc": "settleTime",
     "kucoin": "timePoint",
+    # dYdX, в отличие от Aster/Lighter/Gate, отдаёт ТОЧНОЕ время открытия
+    # позиции (createdAt) — попадает в ту же категорию, что Bybit/MEXC/
+    # KuCoin, а не в _CONTINUOUS_OPEN_TIME_FIELDS ниже. "time_ms" — поле,
+    # которое fetch_dydx сама добавляет в каждую запись (см. её докстринг
+    # в funding_report.py), уже в мс, как и у остальных трёх здесь.
+    "dydx": "time_ms",
 }
 _CONTINUOUS_OPEN_TIME_FIELDS = {
     "aster": ("time", "ms"),
@@ -81,8 +88,14 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
                 "kucoin": lambda: fetch_kucoin_open_symbols(
                     secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
                 ),
+                "dydx": lambda: fetch_dydx_open_symbols(
+                    secrets["dydx_address"], secrets["dydx_subaccount_number"],
+                ),
             }.get(exchange)
-            required_key = {"bybit": "bybit_api_key", "mexc": "mexc_api_key", "kucoin": "kucoin_api_key"}[exchange]
+            required_key = {
+                "bybit": "bybit_api_key", "mexc": "mexc_api_key", "kucoin": "kucoin_api_key",
+                "dydx": "dydx_address",
+            }[exchange]
             if required_key not in secrets or fetch_open is None:
                 return records
             open_times = fetch_open()
@@ -121,7 +134,7 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
 }
 
 # income_field/symbol_field/asset_field — те же имена полей, что и в
@@ -136,6 +149,10 @@ EXCHANGE_FIELDS = {
     "mexc":    {"income": "funding", "symbol": "symbol", "asset": "asset"},
     "gate":    {"income": "change",  "symbol": "symbol", "asset": "asset"},
     "kucoin":  {"income": "funding", "symbol": "symbol", "asset": "settleCurrency"},
+    # "symbol"/"asset" — синтетические поля, которые fetch_dydx сама
+    # добавляет в каждую запись (ticker/"USDC" — см. её докстринг в
+    # funding_report.py), а не "родные" имена полей ответа Indexer.
+    "dydx":    {"income": "payment", "symbol": "symbol", "asset": "asset"},
 }
 
 # Стандартные (не-VIP, tier 0) taker-ставки в % — только дефолт для UI.
@@ -204,6 +221,10 @@ def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: i
             secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
             symbol, s, e,
         )
+    elif exchange == "dydx":
+        if "dydx_address" not in secrets:
+            raise CalculatorError("dYdX не подключён (нет секретов)")
+        fn = lambda s, e: fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], s, e)
     else:
         raise CalculatorError(f"Неизвестная биржа: {exchange}")
 
@@ -314,6 +335,14 @@ def list_open_symbols(secrets: dict) -> dict:
         except Exception as e:
             print(f"[calculator] KuCoin open symbols error: {e}")
 
+    if "dydx_address" in secrets:
+        try:
+            result["dydx"] = sorted(fetch_dydx_open_symbols(
+                secrets["dydx_address"], secrets["dydx_subaccount_number"],
+            ).keys())
+        except Exception as e:
+            print(f"[calculator] dYdX open symbols error: {e}")
+
     return result
 
 
@@ -331,6 +360,8 @@ def list_connected_exchanges(secrets: dict) -> list:
         keys.append("gate")
     if "kucoin_api_key" in secrets:
         keys.append("kucoin")
+    if "dydx_address" in secrets:
+        keys.append("dydx")
     return keys
 
 

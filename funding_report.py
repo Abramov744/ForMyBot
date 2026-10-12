@@ -676,14 +676,92 @@ def _dydx_subaccount_raw(address: str, subaccount_number: str) -> dict:
     return data["subaccount"]
 
 
-def fetch_dydx_open_symbols(address: str, subaccount_number: str) -> set:
+def fetch_dydx_open_symbols(address: str, subaccount_number: str) -> dict:
+    """
+    {symbol: open_time_ms} — словарь, а не множество, как у Lighter/Gate/
+    Aster: dYdX, в отличие от них, отдаёт ТОЧНОЕ время открытия позиции
+    (createdAt) прямо в ответе, поэтому формат — как у Bybit/MEXC/KuCoin
+    (см. calculator._EXACT_OPEN_TIME_FIELDS, где это и используется для
+    обрезки funding-истории до текущей позиции). sorted(d) по словарю
+    уже даёт отсортированные ключи — единственный текущий потребитель
+    (funding_alerts.get_open_positions: sorted(symbols)) совместим с
+    обоими вариантами без изменений.
+    """
     subaccount = _cached_raw_positions(
         "dydx", lambda: _dydx_subaccount_raw(address, subaccount_number)
     )
-    return {
-        market for market, pos in subaccount.get("openPerpetualPositions", {}).items()
-        if pos.get("side") == "SHORT" and float(pos.get("size", 0) or 0) != 0
+    out = {}
+    for market, pos in subaccount.get("openPerpetualPositions", {}).items():
+        if pos.get("side") != "SHORT" or float(pos.get("size", 0) or 0) == 0:
+            continue
+        created_at = pos.get("createdAt")
+        out[market] = (
+            int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000)
+            if created_at else None
+        )
+    return out
+
+
+def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int) -> list:
+    """
+    Funding-записи с dYdX за период [start_ms, end_ms] — GET /v4/
+    fundingPayments (ПОДТВЕРЖДЕНО живым запросом к Indexer):
+      - сортировка ответа — по УБЫВАНИЮ createdAt (новые записи первыми);
+      - afterOrAt — единственный фильтр по времени в самом API, и это
+        ТОЛЬКО нижняя граница (верхней границы в API вообще нет) —
+        фильтрация по end_ms сделана здесь, на стороне бота;
+      - payment — уже знаковая величина с точки зрения ДЕРЖАТЕЛЯ позиции
+        (положительная — получили, отрицательная — заплатили), тот же
+        смысл, что unrealized_pnl у Lighter / change у Gate — пересчитывать
+        самостоятельно не нужно (ПОДТВЕРЖДЕНО живым ответом: rate>0 при
+        side=LONG дал payment<0, rate<0 дал payment>0 — соответствует
+        "положительная ставка -> лонги платят шортам").
+      - "symbol"/"asset" — синтетические поля (ticker/"USDC"), добавлены
+        здесь же, чтобы формат записи был совместим с calculator.
+        EXCHANGE_FIELDS (единая схема {"income","symbol","asset"} для всех
+        бирж) без привязки к специфике поля "ticker" именно у dYdX.
+    Пагинация (page) — раз верхней границы нет, идём по страницам (новые
+    записи сначала), пока не встретим страницу, где хотя бы одна запись
+    старше start_ms — дальше все записи будут только старше, можно
+    остановиться.
+    """
+    after_or_at = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    base_params = {
+        "address": address, "subaccountNumber": subaccount_number,
+        "afterOrAt": after_or_at, "limit": "100",
     }
+
+    records = []
+    page = 0
+    while True:
+        resp = requests.get(
+            f"{DYDX_INDEXER_BASE_URL}/v4/fundingPayments",
+            params={**base_params, "page": str(page)}, timeout=30, proxies=_get_dydx_proxies(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        payments = data.get("fundingPayments", [])
+        if not payments:
+            break
+
+        reached_start = False
+        for p in payments:
+            t_ms = int(datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00")).timestamp() * 1000)
+            if t_ms < start_ms:
+                reached_start = True  # дальше (по убыванию времени) будет только старше
+                continue
+            if t_ms > end_ms:
+                continue  # новее верхней границы окна — пропускаем, но продолжаем пагинацию
+            records.append({
+                "symbol": p["ticker"], "payment": float(p["payment"]),
+                "asset": "USDC", "time_ms": t_ms,
+            })
+
+        if reached_start or len(payments) < 100:
+            break
+        page += 1
+
+    return records
 
 
 # ── Получение данных с MEXC ───────────────────────────────────────────────────
@@ -1321,6 +1399,12 @@ _EXCHANGE_WINDOW_DAYS = {
     # startAt and endAt range cannot exceed 3 months" (история вообще не
     # хранится глубже 6 месяцев назад — не наше ограничение). См. fetch_kucoin.
     "kucoin": 90,
+    # dYdX — у fundingPayments нет лимита диапазона дат (afterOrAt — только
+    # нижняя граница, пагинация идёт постранично, см. fetch_dydx выше), но
+    # дробление на окна всё равно разумно ограничить, иначе при очень
+    # долго открытой позиции fetch_dydx будет листать огромное число
+    # страниц внутри одного окна (funding раз в час — до 720 записей/мес).
+    "dydx": 30,
 }
 
 # Некоторые биржи (подтверждено для Gate реальной ошибкой 400 "from time
