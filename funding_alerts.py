@@ -79,6 +79,7 @@ from liquidation_alerts import (
     _gate_liquidation_positions,
     _mexc_liquidation_positions,
     _lighter_liquidation_positions,
+    _dydx_liquidation_positions,
     _mexc_fair_price,
 )
 from funding_report import (
@@ -100,6 +101,8 @@ from funding_report import (
     _mexc_positions_raw,
     _gate_positions_raw,
     _dydx_subaccount_raw,
+    _dydx_market_info,
+    _dydx_mark_price,
     DYDX_INDEXER_BASE_URL,
     _get_proxies,
     _get_mexc_proxies,
@@ -686,35 +689,6 @@ def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     return out
 
 
-def _dydx_market_info(market: str) -> dict:
-    """
-    Публичный GET /v4/perpetualMarkets?market={ticker} (ПОДТВЕРЖДЕНО живым
-    запросом к Indexer) — отдаёт {"markets": {ticker: {"oraclePrice": ...,
-    "nextFundingRate": ..., "maintenanceMarginFraction": ..., ...}}}.
-    Общий источник для _dydx_mark_price (ниже) и _fetch_dydx_predicted_rate.
-    dYdX не отдаёт цену ликвидации позиции напрямую (см. README) —
-    поэтому dydx НЕ в _PRICE_FETCHERS ниже, liq_part в /rates для него
-    всегда пустой.
-    """
-    resp = requests.get(
-        f"{DYDX_INDEXER_BASE_URL}/v4/perpetualMarkets",
-        params={"market": market}, timeout=30, proxies=_get_dydx_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    info = data.get("markets", {}).get(market)
-    if not info:
-        raise RuntimeError(f"dYdX perpetualMarkets: рынок {market} не найден: {data}")
-    return info
-
-
-def _dydx_mark_price(market: str) -> float:
-    info = _dydx_market_info(market)
-    if not info.get("oraclePrice"):
-        raise RuntimeError(f"dYdX perpetualMarkets: нет oraclePrice для {market}: {info}")
-    return float(info["oraclePrice"])
-
-
 # dYdX заряжает funding КАЖДЫЙ ЧАС, в начале часа ("funding-tick epoch",
 # ПОДТВЕРЖДЕНО офиц. docs.dydx.xyz/concepts/trading/funding: "We charge
 # funding rates every hour on our platform... calculated at the end of
@@ -791,16 +765,14 @@ def _dydx_margin_pnl_positions(secrets: dict) -> list:
     return out
 
 
-# Цена входа/текущая/ЛИКВИДАЦИИ для всех шести бирж — те же position-
+# Цена входа/текущая/ЛИКВИДАЦИИ для всех семи бирж — те же position-
 # фетчеры, что уже написаны и проверены для liquidation_alerts.py
 # (переиспользуются через импорт, не копируются заново). Нужны даже для
-# MEXC/Gate/Lighter (которые дальше используют _MARGIN_PNL_FETCHERS для
-# PnL/% от маржи) — оттуда liq_price не приходит, а цену ликвидации в
+# MEXC/Gate/Lighter/dYdX (которые дальше используют _MARGIN_PNL_FETCHERS
+# для PnL/% от маржи) — оттуда liq_price не приходит, а цену ликвидации в
 # скобках теперь показываем для всех (явная просьба пользователя — вместо
-# цены входа). dYdX сюда НЕ входит — Indexer не отдаёт цену ликвидации
-# позиции напрямую (см. README, раздел «dYdX v4»), поэтому liq_part для
-# dydx в /rates всегда пустой — это задокументированное ограничение, не
-# ошибка кода.
+# цены входа). Для dYdX liq_price не поле ответа API, а вычисляется по
+# официальной формуле (см. liquidation_alerts._dydx_liquidation_positions).
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
@@ -808,6 +780,7 @@ _PRICE_FETCHERS = {
     "kucoin": _kucoin_liquidation_positions,
     "mexc": _mexc_liquidation_positions,
     "lighter": _lighter_liquidation_positions,
+    "dydx": _dydx_liquidation_positions,
 }
 
 # Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
