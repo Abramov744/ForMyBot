@@ -77,6 +77,25 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     (определение шорта) в short_position_tracker.py. Первый реальный алерт
     по Lighter стоит явно сверить с тем, что показывает само приложение
     Lighter, прежде чем полностью доверять порогу.
+  - dYdX — ЕДИНСТВЕННАЯ биржа из всех, где liq_price НЕ приходит готовым
+    полем в ответе API вообще — Indexer его не отдаёт никак. Вместо
+    отказа от поддержки вычисляется по ОФИЦИАЛЬНО ЗАДОКУМЕНТИРОВАННОЙ
+    формуле (docs.dydx.xyz/concepts/trading/liquidations, "Cross
+    Liquidation Price", сверено с её же числовым примером):
+      MMR_o = Σ |size_i| * entry_i * MMF_i   (по ВСЕМ ОСТАЛЬНЫМ открытым
+              позициям саб-аккаунта — общий margin-пул cross-режима)
+      p'    = (equity - size*entry - MMR_o) / (|size|*MMF - size)
+    где size — подписанный размер ЭТОЙ позиции (отрицательный для
+    шорта), entry — её цена входа, MMF — maintenanceMarginFraction рынка
+    (GET /v4/perpetualMarkets), equity — саб-аккаунта целиком. Для
+    единственной открытой на dYdX позиции (самый частый случай) MMR_o=0,
+    и формула сводится ровно к "Isolated Liquidation Price" из тех же
+    докс — та же формула, что проверена числовым примером документации.
+    ОГОВОРКА: формула не различает рынки с ISOLATED margin type (у них
+    margin не делится с остальным саб-аккаунтом вовсе) — если на dYdX
+    одновременно открыта позиция в ISOLATED-рынке, результат для ОСТАЛЬНЫХ
+    позиций может быть неточным; для случая "одна позиция на dYdX"
+    (текущий реальный случай пользователя) это не имеет значения.
 """
 
 import os
@@ -90,13 +109,17 @@ from funding_report import (
     _kucoin_positions_raw, _mexc_positions_raw, _lighter_positions_raw,
     _get_mexc_proxies,
     fetch_lighter_markets, fetch_lighter_mark_prices,
+    _dydx_subaccount_raw, _dydx_market_info, _dydx_mark_price,
     load_secrets, send_telegram_broadcast,
 )
 
 LIQUIDATION_CHECK_INTERVAL_MINUTES = float(os.environ.get("LIQUIDATION_CHECK_INTERVAL_MINUTES", "5"))
 LIQUIDATION_ALERT_THRESHOLD = float(os.environ.get("LIQUIDATION_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "lighter": "Lighter"}
+_LABELS = {
+    "aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate",
+    "kucoin": "KuCoin", "lighter": "Lighter", "dydx": "dYdX",
+}
 
 
 # ── Позиции с ценой входа/ликвидации/текущей — по одной функции на биржу ─────
@@ -240,8 +263,65 @@ def _lighter_liquidation_positions(secrets: dict) -> list:
     return out
 
 
+def _dydx_liquidation_positions(secrets: dict) -> list:
+    """
+    liq_price вычисляется по официальной формуле dYdX v4 (Cross Liquidation
+    Price, см. докстринг модуля) — Indexer не отдаёт его готовым полем ни
+    для одной позиции, в отличие от всех остальных пяти бирж.
+    """
+    subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
+        secrets["dydx_address"], secrets["dydx_subaccount_number"],
+    ))
+    equity = float(subaccount.get("equity", 0) or 0)
+    positions = subaccount.get("openPerpetualPositions", {})
+
+    out = []
+    for symbol, pos in positions.items():
+        if pos.get("side") != "SHORT" or not pos.get("entryPrice"):
+            continue
+        size = float(pos.get("size", 0) or 0)
+        if size == 0:
+            continue
+        entry = float(pos["entryPrice"])
+        try:
+            mmf = float(_dydx_market_info(symbol)["maintenanceMarginFraction"])
+        except Exception as e:
+            print(f"[liquidation/dydx] Не удалось получить maintenanceMarginFraction для {symbol}: {e}")
+            continue
+
+        mmr_o = 0.0
+        try:
+            for other_symbol, other_pos in positions.items():
+                if other_symbol == symbol:
+                    continue
+                other_size = float(other_pos.get("size", 0) or 0)
+                if other_size == 0 or not other_pos.get("entryPrice"):
+                    continue
+                other_entry = float(other_pos["entryPrice"])
+                other_mmf = float(_dydx_market_info(other_symbol)["maintenanceMarginFraction"])
+                mmr_o += abs(other_size) * other_entry * other_mmf
+        except Exception as e:
+            print(f"[liquidation/dydx] Не удалось учесть другие позиции саб-аккаунта для MMR_o ({symbol}): {e}")
+            continue
+
+        denom = abs(size) * mmf - size  # для шорта (size<0) всегда > 0
+        if denom <= 0:
+            continue
+        liq = (equity - size * entry - mmr_o) / denom
+
+        try:
+            mark = _dydx_mark_price(symbol)
+        except Exception as e:
+            print(f"[liquidation/dydx] Не удалось получить текущую цену {symbol}: {e}")
+            continue
+        out.append({"symbol": symbol, "entry_price": entry, "liq_price": liq, "mark_price": mark})
+    return out
+
+
 # Только биржи с подтверждённым полем цены ликвидации в ответе — см. докстринг
-# модуля (Lighter добавлен 06.10.2026, с оговоркой про непроверенность поля).
+# модуля (Lighter добавлен 06.10.2026, с оговоркой про непроверенность поля;
+# dYdX добавлен позже — единственная биржа, где цена ликвидации не поле
+# ответа, а вычисляется по официальной формуле, см. докстринг модуля).
 _LIQUIDATION_POSITION_FETCHERS = {
     "bybit": (_bybit_liquidation_positions, "bybit_api_key"),
     "aster": (_aster_liquidation_positions, "user"),
@@ -249,6 +329,7 @@ _LIQUIDATION_POSITION_FETCHERS = {
     "kucoin": (_kucoin_liquidation_positions, "kucoin_api_key"),
     "mexc": (_mexc_liquidation_positions, "mexc_api_key"),
     "lighter": (_lighter_liquidation_positions, "lighter_account_index"),
+    "dydx": (_dydx_liquidation_positions, "dydx_address"),
 }
 
 

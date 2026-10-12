@@ -764,6 +764,34 @@ def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int)
     return records
 
 
+def _dydx_market_info(market: str) -> dict:
+    """
+    Публичный GET /v4/perpetualMarkets?market={ticker} (ПОДТВЕРЖДЕНО живым
+    запросом к Indexer) — отдаёт {"markets": {ticker: {"oraclePrice": ...,
+    "nextFundingRate": ..., "maintenanceMarginFraction": ..., ...}}}.
+    Общий источник для _dydx_mark_price (ниже), funding_alerts.
+    _fetch_dydx_predicted_rate и liquidation_alerts._dydx_liquidation_positions
+    (там нужна maintenanceMarginFraction для расчёта цены ликвидации).
+    """
+    resp = requests.get(
+        f"{DYDX_INDEXER_BASE_URL}/v4/perpetualMarkets",
+        params={"market": market}, timeout=30, proxies=_get_dydx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    info = data.get("markets", {}).get(market)
+    if not info:
+        raise RuntimeError(f"dYdX perpetualMarkets: рынок {market} не найден: {data}")
+    return info
+
+
+def _dydx_mark_price(market: str) -> float:
+    info = _dydx_market_info(market)
+    if not info.get("oraclePrice"):
+        raise RuntimeError(f"dYdX perpetualMarkets: нет oraclePrice для {market}: {info}")
+    return float(info["oraclePrice"])
+
+
 # ── Получение данных с MEXC ───────────────────────────────────────────────────
 #
 # Авторизация MEXC Futures отличается и от Bybit, и от Aster:
