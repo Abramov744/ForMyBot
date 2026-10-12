@@ -424,6 +424,10 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     тот же порядок, что и везде в Indexer) от текущего момента, пока не
     встретим страницу с записью старше начала окна — фильтрация по
     нижней границе окна сделана здесь же, на стороне бота.
+
+    ВАЖНО: параметр "page" передаётся ТОЛЬКО начиная со второй страницы
+    (page=1) — см. тот же реальный случай и докстринг funding_report.
+    fetch_dydx: сервер отвергает буквальное "page=0" как невалидное.
     """
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - int(CLOSE_PRICE_LOOKBACK_MINUTES * 60 * 1000)
@@ -432,13 +436,15 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     trades = []
     page = 0
     while True:
+        params = {
+            "address": secrets["dydx_address"], "subaccountNumber": secrets["dydx_subaccount_number"],
+            "market": symbol, "createdBeforeOrAt": before_or_at, "limit": "100",
+        }
+        if page > 0:
+            params["page"] = str(page)
         resp = requests.get(
             f"{DYDX_INDEXER_BASE_URL}/v4/fills",
-            params={
-                "address": secrets["dydx_address"], "subaccountNumber": secrets["dydx_subaccount_number"],
-                "market": symbol, "createdBeforeOrAt": before_or_at, "limit": "100", "page": str(page),
-            },
-            timeout=15, proxies=_get_dydx_proxies(),
+            params=params, timeout=15, proxies=_get_dydx_proxies(),
         )
         resp.raise_for_status()
         data = resp.json()

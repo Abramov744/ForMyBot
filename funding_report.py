@@ -724,6 +724,14 @@ def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int)
     записи сначала), пока не встретим страницу, где хотя бы одна запись
     старше start_ms — дальше все записи будут только старше, можно
     остановиться.
+
+    ВАЖНО: параметр "page" передаётся ТОЛЬКО начиная со второй страницы
+    (page=1) — реальный случай (12.10.2026, прод): сервер отвергает
+    буквальное "page=0" ошибкой валидации "page must be a non-negative
+    integer" (несмотря на то что 0 — неотрицательное целое; подтверждено
+    живым запросом к продовому Indexer, похоже на особенность/баг их
+    валидатора), поэтому для первой страницы параметр просто не
+    передаётся вовсе.
     """
     after_or_at = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     base_params = {
@@ -734,9 +742,12 @@ def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int)
     records = []
     page = 0
     while True:
+        params = dict(base_params)
+        if page > 0:
+            params["page"] = str(page)
         resp = requests.get(
             f"{DYDX_INDEXER_BASE_URL}/v4/fundingPayments",
-            params={**base_params, "page": str(page)}, timeout=30, proxies=_get_dydx_proxies(),
+            params=params, timeout=30, proxies=_get_dydx_proxies(),
         )
         resp.raise_for_status()
         data = resp.json()
