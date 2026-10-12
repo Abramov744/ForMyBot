@@ -99,10 +99,13 @@ from funding_report import (
     _lighter_account_raw,
     _mexc_positions_raw,
     _gate_positions_raw,
+    _dydx_subaccount_raw,
+    DYDX_INDEXER_BASE_URL,
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
     _get_kucoin_proxies,
+    _get_dydx_proxies,
 )
 
 ALERT_CHECK_INTERVAL_MINUTES = float(os.environ.get("ALERT_CHECK_INTERVAL_MINUTES", "60"))
@@ -680,13 +683,76 @@ def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     return out
 
 
+def _dydx_mark_price(market: str) -> float:
+    """
+    oraclePrice рынка — публичный GET /v4/perpetualMarkets?market={ticker}
+    (ПОДТВЕРЖДЕНО живым запросом к Indexer: возвращает {"markets":
+    {ticker: {..., "oraclePrice": "..."}}}). dYdX не отдаёт цену
+    ликвидации позиции напрямую (см. README) — поэтому dydx НЕ в
+    _PRICE_FETCHERS ниже, liq_part в /rates для него всегда пустой.
+    """
+    resp = requests.get(
+        f"{DYDX_INDEXER_BASE_URL}/v4/perpetualMarkets",
+        params={"market": market}, timeout=30, proxies=_get_dydx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    info = data.get("markets", {}).get(market)
+    if not info or not info.get("oraclePrice"):
+        raise RuntimeError(f"dYdX perpetualMarkets: нет oraclePrice для {market}: {data}")
+    return float(info["oraclePrice"])
+
+
+def _dydx_margin_base(secrets: dict) -> float:
+    """
+    margin_base = equity (саб-аккаунт dYdX) — та же формула и то же
+    отличие от MEXC/Gate/Lighter (equity УЖЕ включает floating PnL), что
+    описано в margin_alerts.py и README, раздел «dYdX v4».
+    """
+    subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
+        secrets["dydx_address"], secrets["dydx_subaccount_number"],
+    ))
+    return float(subaccount.get("equity", 0) or 0)
+
+
+def _dydx_margin_pnl_positions(secrets: dict) -> list:
+    """
+    Для dYdX — entry прямо в ответе позиции, unrealizedPnl тоже (как у
+    Gate/Lighter — доллаpовый PnL не нужно вычислять самостоятельно).
+    mark — отдельный запрос _dydx_mark_price (oraclePrice рынка, в ответе
+    позиции его нет).
+    """
+    subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
+        secrets["dydx_address"], secrets["dydx_subaccount_number"],
+    ))
+    out = []
+    for market, pos in subaccount.get("openPerpetualPositions", {}).items():
+        if pos.get("side") != "SHORT" or not pos.get("entryPrice"):
+            continue
+        try:
+            mark = _dydx_mark_price(market)
+        except Exception as e:
+            print(f"[rates/dydx] Не удалось получить текущую цену {market}: {e}")
+            continue
+        out.append({
+            "symbol": market,
+            "entry_price": float(pos["entryPrice"]),
+            "mark_price": mark,
+            "pnl_dollar": float(pos.get("unrealizedPnl", 0) or 0),
+        })
+    return out
+
+
 # Цена входа/текущая/ЛИКВИДАЦИИ для всех шести бирж — те же position-
 # фетчеры, что уже написаны и проверены для liquidation_alerts.py
 # (переиспользуются через импорт, не копируются заново). Нужны даже для
 # MEXC/Gate/Lighter (которые дальше используют _MARGIN_PNL_FETCHERS для
 # PnL/% от маржи) — оттуда liq_price не приходит, а цену ликвидации в
 # скобках теперь показываем для всех (явная просьба пользователя — вместо
-# цены входа).
+# цены входа). dYdX сюда НЕ входит — Indexer не отдаёт цену ликвидации
+# позиции напрямую (см. README, раздел «dYdX v4»), поэтому liq_part для
+# dydx в /rates всегда пустой — это задокументированное ограничение, не
+# ошибка кода.
 _PRICE_FETCHERS = {
     "bybit": _bybit_liquidation_positions,
     "aster": _aster_liquidation_positions,
@@ -706,6 +772,7 @@ _MARGIN_PNL_FETCHERS = {
     "mexc": (_mexc_margin_pnl_positions, _mexc_margin_base),
     "gate": (_gate_margin_pnl_positions, _gate_margin_base),
     "lighter": (_lighter_margin_pnl_positions, _lighter_margin_base),
+    "dydx": (_dydx_margin_pnl_positions, _dydx_margin_base),
 }
 
 
@@ -816,60 +883,81 @@ def build_predicted_rates_report(secrets: dict) -> str:
         # периодичность выплат разная по биржам/символам (1ч/4ч/8ч) и сами
         # ставки "за выплату" между собой напрямую не сравнить — см.
         # annualize() и докстринг модуля.
+        def _price_part_for(symbol: str) -> str:
+            """
+            Строка "\\n   emoji PnL/Цена: ..." для символа, или "" если
+            данных нет — общая для успешных ставок (rows) и символов без
+            ставки (errors, например dYdX, см. ниже): отсутствие
+            прогнозной ставки funding не должно скрывать уже полученные
+            PnL/% от маржи — это отдельные, независимые друг от друга
+            данные.
+            """
+            info = prices_by_symbol.get(symbol)
+            if not info or not info.get("entry_price"):
+                return ""
+            entry, mark = info["entry_price"], info["mark_price"]
+            pnl_dollar = info.get("pnl_dollar")
+            if exchange in _MARGIN_PNL_FETCHERS and pnl_dollar is not None and margin_base:
+                # % от поддерживаемой маржи счёта, а не от цены входа —
+                # явная просьба пользователя: при плече небольшое
+                # движение цены — это куда больший % от маржи, и голый
+                # "% от цены" этого не показывает. Знак уже учтён в
+                # pnl_dollar (см. _mexc_margin_pnl_positions/
+                # _gate_margin_pnl_positions/_dydx_margin_pnl_positions).
+                margin_pct = pnl_dollar / margin_base * 100
+                price_emoji = "🟢" if margin_pct >= 0 else "🔴"
+                # Цена ликвидации в скобках вместо цены входа — явная
+                # просьба пользователя; пусто, если для символа не
+                # нашлось валидной цены ликвидации (см. докстринги
+                # liquidation_alerts._*_liquidation_positions про когда
+                # так бывает, например кросс-маржа, или README про dYdX,
+                # где её нет вообще ни для одного символа).
+                liq = liq_by_symbol.get(symbol)
+                liq_part = f" (ликвидация {liq:g})" if liq is not None else ""
+                return (
+                    f"\n   {price_emoji} PnL: {pnl_dollar:+.2f} ({margin_pct:+.1f}% от маржи) "
+                    f"— цена: {mark:g}{liq_part}"
+                )
+            # У бота везде только ШОРТЫ (см. CLAUDE.md) — рост цены от
+            # входа это убыток по позиции, а не прибыль, поэтому знак
+            # зеркалим относительно голого "цена выросла/упала": цена
+            # ВЫШЕ входа -> процент со знаком МИНУС и 🔴 (минус для
+            # шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
+            # пользователем явно. Также fallback для MEXC/Gate/Lighter/
+            # dYdX, если не удалось получить маржу счёта (см. выше) —
+            # лучше показать % от цены, чем вообще ничего. Сам процент
+            # по-прежнему считается от цены входа (не менялось), но цена
+            # входа В СКОБКАХ заменена на цену ликвидации (явная просьба
+            # пользователя) — liq_price уже есть в info из
+            # _PRICE_FETCHERS, доп. запрос не нужен.
+            pnl_pct = (entry - mark) / entry * 100
+            price_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            liq = info.get("liq_price")
+            liq_part = f", ликвидация {liq:g}" if liq is not None else ""
+            return f"\n   {price_emoji} Цена: {mark:g} ({pnl_pct:+.1f}% от входа{liq_part})"
+
+        # Сначала самые отрицательные (то, что заплатите) — так самое
+        # срочное сразу видно вверху секции, а не теряется среди строк.
+        # Показываем ОБА значения — ставку за конкретную выплату (сколько
+        # спишут/начислят в ближайший раз) и приведённую к году (APR), т.к.
+        # периодичность выплат разная по биржам/символам (1ч/4ч/8ч) и сами
+        # ставки "за выплату" между собой напрямую не сравнить — см.
+        # annualize() и докстринг модуля.
         for rate, symbol, next_ms, interval_hours in sorted(rows, key=lambda x: x[0]):
             emoji = "🟢" if rate >= 0 else "🔴"
             apr = annualize(rate, interval_hours)
-            price_part = ""
-            info = prices_by_symbol.get(symbol)
-            if info and info.get("entry_price"):
-                entry, mark = info["entry_price"], info["mark_price"]
-                pnl_dollar = info.get("pnl_dollar")
-                if exchange in _MARGIN_PNL_FETCHERS and pnl_dollar is not None and margin_base:
-                    # % от поддерживаемой маржи счёта, а не от цены входа —
-                    # явная просьба пользователя: при плече небольшое
-                    # движение цены — это куда больший % от маржи, и голый
-                    # "% от цены" этого не показывает. Знак уже учтён в
-                    # pnl_dollar (см. _mexc_margin_pnl_positions/
-                    # _gate_margin_pnl_positions).
-                    margin_pct = pnl_dollar / margin_base * 100
-                    price_emoji = "🟢" if margin_pct >= 0 else "🔴"
-                    # Цена ликвидации в скобках вместо цены входа — явная
-                    # просьба пользователя; пусто, если для символа не
-                    # нашлось валидной цены ликвидации (см. докстринги
-                    # liquidation_alerts._*_liquidation_positions про когда
-                    # так бывает, например кросс-маржа).
-                    liq = liq_by_symbol.get(symbol)
-                    liq_part = f" (ликвидация {liq:g})" if liq is not None else ""
-                    price_part = (
-                        f"\n   {price_emoji} PnL: {pnl_dollar:+.2f} ({margin_pct:+.1f}% от маржи) "
-                        f"— цена: {mark:g}{liq_part}"
-                    )
-                else:
-                    # У бота везде только ШОРТЫ (см. CLAUDE.md) — рост цены от
-                    # входа это убыток по позиции, а не прибыль, поэтому знак
-                    # зеркалим относительно голого "цена выросла/упала":
-                    # цена ВЫШЕ входа -> процент со знаком МИНУС и 🔴 (минус
-                    # для шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
-                    # пользователем явно. Также fallback для MEXC/Gate/Lighter,
-                    # если не удалось получить маржу счёта (см. выше) — лучше
-                    # показать % от цены, чем вообще ничего. Сам процент
-                    # по-прежнему считается от цены входа (не менялось), но
-                    # цена входа В СКОБКАХ заменена на цену ликвидации (явная
-                    # просьба пользователя) — liq_price уже есть в info из
-                    # _PRICE_FETCHERS, доп. запрос не нужен.
-                    pnl_pct = (entry - mark) / entry * 100
-                    price_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-                    liq = info.get("liq_price")
-                    liq_part = f", ликвидация {liq:g}" if liq is not None else ""
-                    price_part = f"\n   {price_emoji} Цена: {mark:g} ({pnl_pct:+.1f}% от входа{liq_part})"
             lines.append(
                 f"{emoji} {symbol}: {rate * 100:+.4f}% за выплату "
                 f"(годовых {apr:+.1f}%) — {_fmt_next_time(next_ms)}, "
-                f"funding раз в {interval_hours:g}ч{price_part}"
+                f"funding раз в {interval_hours:g}ч{_price_part_for(symbol)}"
             )
 
         for symbol, err in errors:
-            lines.append(f"⚠️ {symbol}: не удалось получить ставку ({err})")
+            # Отсутствие прогнозной ставки (например, dYdX — Indexer её не
+            # отдаёт, см. README) не означает отсутствие PnL/% от маржи —
+            # показываем их здесь же, если есть, а не прячем просто потому,
+            # что ставки нет.
+            lines.append(f"⚠️ {symbol}: не удалось получить ставку ({err}){_price_part_for(symbol)}")
 
     if not any_rate:
         lines.append("")
