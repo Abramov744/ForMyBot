@@ -52,6 +52,15 @@ total у Gate). unrealized считается суммой поля unrealized_p
 лог сырых полей), для Lighter не делалось. Первый реальный алерт по
 Lighter стоит явно сверить с суммами на экране самого приложения Lighter.
 
+DYDX (v4) — margin_base = equity (поле саб-аккаунта, см. _dydx_margin_
+snapshot ниже), unrealized = сумма unrealizedPnl по открытым позициям.
+В ОТЛИЧИЕ от MEXC/Gate/Lighter, equity у dYdX УЖЕ включает floating PnL
+(Indexer не отдаёт отдельного поля "капитал без PnL") — порог 70%
+здесь означает "убыток съел 70% текущего equity", а не "70% от статичного
+капитала без PnL", как у остальных трёх бирж. Цены ликвидации для dYdX
+пока нет ни в этом алерте, ни в /rates — Indexer не отдаёт её напрямую
+(см. README).
+
 Алерт срабатывает, когда unrealized ОТРИЦАТЕЛЕН и его модуль достиг
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) от margin_base:
   unrealized <= -MARGIN_ALERT_THRESHOLD * margin_base
@@ -75,12 +84,15 @@ import os
 import time
 
 from balances import _mexc_account_assets_raw, _gate_futures_account_raw
-from funding_report import load_secrets, send_telegram_broadcast, _cached_raw_positions, _lighter_account_raw
+from funding_report import (
+    load_secrets, send_telegram_broadcast, _cached_raw_positions,
+    _lighter_account_raw, _dydx_subaccount_raw,
+)
 
 MARGIN_CHECK_INTERVAL_MINUTES = float(os.environ.get("MARGIN_CHECK_INTERVAL_MINUTES", "5"))
 MARGIN_ALERT_THRESHOLD = float(os.environ.get("MARGIN_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"mexc": "MEXC", "gate": "Gate", "lighter": "Lighter"}
+_LABELS = {"mexc": "MEXC", "gate": "Gate", "lighter": "Lighter", "dydx": "dYdX"}
 
 
 def _mexc_margin_snapshot(secrets: dict) -> list:
@@ -149,10 +161,38 @@ def _lighter_margin_snapshot(secrets: dict) -> list:
     return [{"currency": "USDC", "margin_base": margin_base, "unrealized": unrealized}]
 
 
+def _dydx_margin_snapshot(secrets: dict) -> list:
+    """
+    margin_base = equity (поле саб-аккаунта dYdX — весь капитал счёта,
+    включая floating PnL, см. комментарий над funding_report.
+    _dydx_subaccount_raw; ЭТО ОТЛИЧАЕТСЯ от MEXC/Gate/Lighter, где
+    margin_base сознательно НЕ включает unrealized PnL — у dYdX
+    отдельного "капитал без floating PnL" поля в ответе Indexer нет,
+    equity — единственная прямая метрика "сколько реально на счету", и
+    именно она используется биржей для расчёта риска ликвидации, поэтому
+    используем её как есть, а не пытаемся вычесть PnL вручную и
+    рискнуть ошибиться в формуле). unrealized — сумма unrealizedPnl по
+    всем открытым позициям саб-аккаунта. Валюта — USDC (подтверждено
+    живым ответом Indexer: assetPositions.USDC).
+    """
+    subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
+        secrets["dydx_address"], secrets["dydx_subaccount_number"],
+    ))
+    margin_base = float(subaccount.get("equity", 0) or 0)
+    if margin_base <= 0:
+        return []
+    unrealized = sum(
+        float(pos.get("unrealizedPnl", 0) or 0)
+        for pos in subaccount.get("openPerpetualPositions", {}).values()
+    )
+    return [{"currency": "USDC", "margin_base": margin_base, "unrealized": unrealized}]
+
+
 _MARGIN_FETCHERS = {
     "mexc": (_mexc_margin_snapshot, "mexc_api_key"),
     "gate": (_gate_margin_snapshot, "gate_api_key"),
     "lighter": (_lighter_margin_snapshot, "lighter_account_index"),
+    "dydx": (_dydx_margin_snapshot, "dydx_address"),
 }
 
 

@@ -105,6 +105,7 @@ from funding_report import (
     _kucoin_positions_raw,
     _lighter_positions_raw,
     _mexc_positions_raw,
+    _dydx_subaccount_raw,
     fetch_lighter_markets,
     load_secrets,
 )
@@ -247,6 +248,35 @@ def _fetch_lighter_open_shorts(secrets: dict) -> list:
     return out
 
 
+def _fetch_dydx_open_shorts(secrets: dict) -> list:
+    """
+    dYdX отдаёт ТОЧНОЕ время открытия позиции (createdAt) прямо в ответе —
+    в отличие от Gate/Lighter, оценка через непрерывность funding не нужна
+    (см. entry_price._dydx_position_entry, тот же разбор для калькулятора).
+    """
+    subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
+        secrets["dydx_address"], secrets["dydx_subaccount_number"],
+    ))
+    out = []
+    for symbol, pos in subaccount.get("openPerpetualPositions", {}).items():
+        if pos.get("side") != "SHORT":
+            continue
+        size = float(pos.get("size", 0) or 0)
+        if size == 0:
+            continue
+        entry_time_ms = None
+        created_at = pos.get("createdAt")
+        if created_at:
+            entry_time_ms = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp() * 1000)
+        price = pos.get("entryPrice")
+        out.append({
+            "symbol": symbol, "qty": abs(size),
+            "entry_time_ms": entry_time_ms, "time_is_exact": True,
+            "price": float(price) if price else None,
+        })
+    return out
+
+
 def _fetch_kucoin_open_shorts(secrets: dict) -> list:
     items = _cached_raw_positions("kucoin", lambda: _kucoin_positions_raw(
         secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
@@ -273,6 +303,7 @@ _OPEN_SHORTS_FETCHERS = {
     "gate": (_fetch_gate_open_shorts, "gate_api_key"),
     "lighter": (_fetch_lighter_open_shorts, "lighter_account_index"),
     "kucoin": (_fetch_kucoin_open_shorts, "kucoin_api_key"),
+    "dydx": (_fetch_dydx_open_shorts, "dydx_address"),
 }
 
 
