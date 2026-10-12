@@ -31,14 +31,17 @@
     на одной сравнимой шкале, а не дёргаются каждая в свои моменты времени.
 
 ИСТОЧНИК ДАННЫХ — фактически ПРИМЕНЁННЫЕ (не прогнозные) ставки funding:
-  - Bybit, Lighter — берутся из уже полученных для текстовой части отчёта
-    записей fetch_all_time_open_positions() (funding_report.py), без
+  - Bybit, Lighter, dYdX — берутся из уже полученных для текстовой части
+    отчёта записей fetch_all_time_open_positions() (funding_report.py), без
     дополнительных запросов к бирже: у Bybit в записи транзакции уже есть
     поле feeRate (реальная применённая ставка по конкретному начислению —
     но со знаком списания по счёту, а не рыночной ставки, знак
     переворачивается в _bybit_series_from_records, см. её докстринг),
     у Lighter — поле rate (см. WebSocket-схему PositionFunding в докстринге
-    funding_report.fetch_lighter — тот же REST-эндпоинт отдаёт эти же поля).
+    funding_report.fetch_lighter — тот же REST-эндпоинт отдаёт эти же поля),
+    у dYdX — тоже поле rate (GET /v4/fundingPayments, см. докстринг
+    funding_report.fetch_dydx) — чистая рыночная ставка, как у Lighter, знак
+    тоже не переворачивается.
   - Aster, MEXC, Gate — их записи о начислениях (income / funding_records /
     account_book) содержат только СУММУ в валюте, не сам процент ставки,
     поэтому для них отдельно (но так же без каких-либо ключей — это
@@ -95,11 +98,12 @@ from funding_alerts import (
     MEXC_DEFAULT_FUNDING_INTERVAL_HOURS,
     GATE_DEFAULT_FUNDING_INTERVAL_HOURS,
     LIGHTER_FUNDING_INTERVAL_HOURS,
+    DYDX_FUNDING_INTERVAL_HOURS,
 )
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate",
+    "mexc": "MEXC", "gate": "Gate", "dydx": "dYdX",
 }
 # Кислотная неоновая палитра — тёмный фон + свечение линий, см. build_positions_apr_chart.
 # Базовый цвет биржи — используется для ПЕРВОЙ (по алфавиту символа) открытой
@@ -111,6 +115,12 @@ EXCHANGE_COLORS = {
     "lighter": "#ff00e6",  # кислотный маджента
     "mexc":    "#39ff14",  # кислотный зелёный
     "gate":    "#ff3d3d",  # кислотный красный
+    # dYdX сознательно НЕ добавлен сюда — все 8 имеющихся цветов (5 выше +
+    # EXTRA_SERIES_COLORS) подобраны и проверены скриптом dataviz-скилла на
+    # различимость между собой (см. комментарий выше), добавлять девятый
+    # "на глаз" без повторного прогона валидатора — риск плохо различимой
+    # пары цветов на графике. EXCHANGE_COLORS.get(exchange, "#999999") уже
+    # даёт рабочий нейтральный fallback — им dYdX и пользуется сейчас.
 }
 
 # Пул цветов для ВТОРОЙ и последующих одновременно открытых позиций на ОДНОЙ
@@ -312,6 +322,22 @@ def _lighter_series_from_records(records: list) -> dict:
     return by_symbol
 
 
+def _dydx_series_from_records(records: list) -> dict:
+    """symbol -> [(time_ms, rate), ...] из поля rate записей fundingPayments
+    (funding_report.fetch_dydx уже прокидывает его в каждую запись) — та же
+    чистая рыночная ставка, что у Lighter, знак переворачивать не нужно
+    (см. докстринг fetch_dydx)."""
+    by_symbol: dict = defaultdict(list)
+    for r in records:
+        sym, t, rate = r.get("symbol"), r.get("time_ms"), r.get("rate")
+        if sym is None or t is None or rate in (None, ""):
+            continue
+        by_symbol[sym].append((int(t), float(rate)))
+    for points in by_symbol.values():
+        points.sort()
+    return by_symbol
+
+
 # ── Сбор всех серий (биржа, символ) -> [(time_ms, rate, interval_hours)] ─────
 
 def _collect_series(open_results: dict) -> dict:
@@ -354,6 +380,12 @@ def _collect_series(open_results: dict) -> dict:
                 points = [(t, r) for t, r in points if t >= cutoff_ms]
                 if points:
                     series[("lighter", symbol)] = [(t, r, LIGHTER_FUNDING_INTERVAL_HOURS) for t, r in points]
+
+        elif exchange == "dydx":
+            for symbol, points in _dydx_series_from_records(records).items():
+                points = [(t, r) for t, r in points if t >= cutoff_ms]
+                if points:
+                    series[("dydx", symbol)] = [(t, r, DYDX_FUNDING_INTERVAL_HOURS) for t, r in points]
 
         elif exchange in ("aster", "mexc", "gate"):
             time_field = {"aster": "time", "mexc": "settleTime", "gate": "time"}[exchange]

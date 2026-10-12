@@ -766,6 +766,14 @@ def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int)
             records.append({
                 "symbol": p["ticker"], "payment": float(p["payment"]),
                 "asset": "USDC", "time_ms": t_ms,
+                # "rate" — чистая рыночная ставка funding (ПОДТВЕРЖДЕНО живым
+                # ответом: side=LONG, rate>0 дал payment<0 и rate<0 дал
+                # payment>0 — "положительная ставка -> лонги платят шортам",
+                # знак НЕ привязан к стороне счёта, как у MEXC/Gate/Lighter;
+                # не требует переворота знака, в отличие от Bybit feeRate)
+                # — используется funding_chart._dydx_series_from_records
+                # для графика APR по открытым позициям.
+                "rate": float(p["rate"]) if p.get("rate") not in (None, "") else None,
             })
 
         if reached_start or len(payments) < 100:
