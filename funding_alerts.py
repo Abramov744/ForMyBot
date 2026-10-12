@@ -65,7 +65,7 @@ APR = ставка_за_выплату × (24 / интервал_в_часах) 
 
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -415,6 +415,9 @@ _PREDICTED_RATE_FETCHERS = {
     "gate": _fetch_gate_predicted_rate,
     "lighter": _fetch_lighter_predicted_rate,
     "kucoin": _fetch_kucoin_predicted_rate,
+    # "dydx" добавлен НИЖЕ в файле (_fetch_dydx_predicted_rate определена
+    # значительно позже, рядом с остальными dYdX-функциями — см. её
+    # регистрацию сразу после определения, иначе NameError при импорте).
 }
 
 
@@ -683,13 +686,15 @@ def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     return out
 
 
-def _dydx_mark_price(market: str) -> float:
+def _dydx_market_info(market: str) -> dict:
     """
-    oraclePrice рынка — публичный GET /v4/perpetualMarkets?market={ticker}
-    (ПОДТВЕРЖДЕНО живым запросом к Indexer: возвращает {"markets":
-    {ticker: {..., "oraclePrice": "..."}}}). dYdX не отдаёт цену
-    ликвидации позиции напрямую (см. README) — поэтому dydx НЕ в
-    _PRICE_FETCHERS ниже, liq_part в /rates для него всегда пустой.
+    Публичный GET /v4/perpetualMarkets?market={ticker} (ПОДТВЕРЖДЕНО живым
+    запросом к Indexer) — отдаёт {"markets": {ticker: {"oraclePrice": ...,
+    "nextFundingRate": ..., "maintenanceMarginFraction": ..., ...}}}.
+    Общий источник для _dydx_mark_price (ниже) и _fetch_dydx_predicted_rate.
+    dYdX не отдаёт цену ликвидации позиции напрямую (см. README) —
+    поэтому dydx НЕ в _PRICE_FETCHERS ниже, liq_part в /rates для него
+    всегда пустой.
     """
     resp = requests.get(
         f"{DYDX_INDEXER_BASE_URL}/v4/perpetualMarkets",
@@ -698,9 +703,52 @@ def _dydx_mark_price(market: str) -> float:
     resp.raise_for_status()
     data = resp.json()
     info = data.get("markets", {}).get(market)
-    if not info or not info.get("oraclePrice"):
-        raise RuntimeError(f"dYdX perpetualMarkets: нет oraclePrice для {market}: {data}")
+    if not info:
+        raise RuntimeError(f"dYdX perpetualMarkets: рынок {market} не найден: {data}")
+    return info
+
+
+def _dydx_mark_price(market: str) -> float:
+    info = _dydx_market_info(market)
+    if not info.get("oraclePrice"):
+        raise RuntimeError(f"dYdX perpetualMarkets: нет oraclePrice для {market}: {info}")
     return float(info["oraclePrice"])
+
+
+# dYdX заряжает funding КАЖДЫЙ ЧАС, в начале часа ("funding-tick epoch",
+# ПОДТВЕРЖДЕНО офиц. docs.dydx.xyz/concepts/trading/funding: "We charge
+# funding rates every hour on our platform... calculated at the end of
+# each hour"). Интервал зафиксирован протоколом на 1ч для всех рынков без
+# исключений — тот же случай, что уже есть у Lighter (см.
+# LIGHTER_FUNDING_INTERVAL_HOURS выше), не запрашивается через API.
+DYDX_FUNDING_INTERVAL_HOURS = 1.0
+
+
+def _dydx_next_funding_time_ms(now_ms: int) -> int:
+    """Следующая целая граница часа по UTC — момент, когда применится
+    nextFundingRate (см. докстринг DYDX_FUNDING_INTERVAL_HOURS выше)."""
+    dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+    next_hour = dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    return int(next_hour.timestamp() * 1000)
+
+
+def _fetch_dydx_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
+    """
+    nextFundingRate рынка — ставка, которая применится на СЛЕДУЮЩЕЙ
+    (а не уже прошедшей) часовой выплате (ПОДТВЕРЖДЕНО живым запросом к
+    Indexer: для ETH-USD на момент проверки nextFundingRate=
+    "0.0000185952380952381" — значение того же порядка, что и ожидаемая
+    часовая, а не 8-часовая, ставка). Уже доля за ОДНУ выплату (1ч), как и
+    у остальных бирж этого модуля — доп. пересчёта не требуется.
+    """
+    info = _dydx_market_info(symbol)
+    if info.get("nextFundingRate") in (None, ""):
+        raise RuntimeError(f"dYdX perpetualMarkets: нет nextFundingRate для {symbol}: {info}")
+    now_ms = int(time.time() * 1000)
+    return float(info["nextFundingRate"]), _dydx_next_funding_time_ms(now_ms), DYDX_FUNDING_INTERVAL_HOURS
+
+
+_PREDICTED_RATE_FETCHERS["dydx"] = _fetch_dydx_predicted_rate
 
 
 def _dydx_margin_base(secrets: dict) -> float:
