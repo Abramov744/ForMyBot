@@ -109,12 +109,14 @@ from funding_report import (
     fetch_kucoin_open_symbols,
     fetch_lighter_open_symbols,
     fetch_mexc_open_symbols,
+    fetch_dydx_open_symbols,
     load_secrets,
 )
 
 # Биржи с точным временем открытия позиции (используется как старт периода
 # напрямую) — те же, что и в calculator._trim_to_current_open_position.
-_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin")
+# dYdX — тоже точное время (createdAt), см. там же.
+_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin", "dydx")
 # Биржи без точного времени — старт периода берётся по OPEN_POSITIONS_LOOKBACK_DAYS.
 _CONTINUOUS_EXCHANGES = ("aster", "lighter", "gate")
 SUPPORTED_EXCHANGES = _EXACT_TIME_EXCHANGES + _CONTINUOUS_EXCHANGES
@@ -252,6 +254,12 @@ def build_open_symbol_index(secrets: dict) -> dict:
                 kucoin_symbol_history.record_observation(symbol)
         except Exception as e:
             print(f"[sheets_sync/kucoin] Не удалось получить открытые позиции: {e}", flush=True)
+
+    if "dydx_address" in secrets:
+        try:
+            index["dydx"] = fetch_dydx_open_symbols(secrets["dydx_address"], secrets["dydx_subaccount_number"])
+        except Exception as e:
+            print(f"[sheets_sync/dydx] Не удалось получить открытые позиции: {e}", flush=True)
 
     return index
 
