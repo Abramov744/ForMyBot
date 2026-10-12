@@ -49,6 +49,11 @@ check_closed_positions ниже). Раньше эти два случая не �
   - Aster — надёжно: GET /fapi/v1/allOrders (Binance-совместимый API)
     отдаёт origType ("STOP_MARKET"/"STOP"/"TAKE_PROFIT_MARKET"/
     "TAKE_PROFIT") для исполненного ордера — тоже прямой сигнал.
+  - dYdX — надёжно: GET /v4/orders?status=FILLED отдаёт поле type
+    ("STOP_MARKET"/"STOP_LIMIT"/"TAKE_PROFIT"/"TAKE_PROFIT_MARKET",
+    ПОДТВЕРЖДЕНО офиц. docs.dydx.xyz/types/order_type) — тоже прямой
+    сигнал, цена закрытия (AE) при этом отдельно берётся из /v4/fills
+    (там есть явное поле side — надёжнее, чем цена условного ордера).
   - MEXC, Gate, Lighter — причина НЕ уточняется в этой версии (см. историю
     решения ниже), но сам факт закрытия по-прежнему алертится — просто без
     пометки SL/TP:
@@ -75,12 +80,13 @@ check_closed_positions ниже). Раньше эти два случая не �
 import os
 import time
 import urllib.parse
+from datetime import datetime, timezone
 
 import requests
 
 from funding_report import (
     _get_proxies, _bybit_sign, _aster_sign, _mexc_sign, _gate_sign,
-    _get_mexc_proxies, _get_gate_proxies,
+    _get_mexc_proxies, _get_gate_proxies, _get_dydx_proxies, DYDX_INDEXER_BASE_URL,
     load_secrets, send_telegram_broadcast,
 )
 from funding_alerts import get_open_positions, EXCHANGE_LABELS
@@ -188,11 +194,50 @@ def _aster_close_reason(secrets: dict, symbol: str) -> tuple | None:
     return None
 
 
+# ── dYdX: GET /v4/orders, поле type ("STOP_MARKET"/"TAKE_PROFIT_MARKET"/...) ──
+
+def _dydx_close_reason(secrets: dict, symbol: str) -> tuple | None:
+    """
+    (kind, price) — как и у Bybit/Aster, прямой официально задокументированный
+    сигнал: GET /v4/orders?status=FILLED отдаёт поле type (ПОДТВЕРЖДЕНО офиц.
+    docs.dydx.xyz/types/order_type) со значениями STOP_MARKET/STOP_LIMIT (SL)
+    и TAKE_PROFIT/TAKE_PROFIT_MARKET (TP). price — цена САМОГО ОРДЕРА (лимитная
+    цена условного ордера, не фактическая цена исполнения — Indexer её здесь
+    не отдаёт отдельно, в отличие от Bybit/Aster, поэтому может чуть
+    отличаться от реальной цены филла; для фактической VWAP-цены закрытия
+    используется отдельный _dydx_close_price через /v4/fills). Публичный
+    эндпоинт, без подписи — как и весь остальной dYdX в этом проекте.
+    """
+    resp = requests.get(
+        f"{DYDX_INDEXER_BASE_URL}/v4/orders",
+        params={
+            "address": secrets["dydx_address"], "subaccountNumber": secrets["dydx_subaccount_number"],
+            "ticker": symbol, "status": "FILLED", "limit": "20",
+        },
+        timeout=15, proxies=_get_dydx_proxies(),
+    )
+    resp.raise_for_status()
+    orders = resp.json()
+    if isinstance(orders, dict):
+        raise RuntimeError(f"dYdX orders error: {orders}")
+
+    # От новых к старым по времени последнего обновления — берём первое совпадение.
+    for order in sorted(orders, key=lambda o: o.get("updatedAt") or "", reverse=True):
+        order_type = order.get("type", "")
+        price = float(order["price"]) if order.get("price") else None
+        if order_type in ("STOP_MARKET", "STOP_LIMIT"):
+            return ("SL", price)
+        if order_type in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
+            return ("TP", price)
+    return None
+
+
 # Только биржи, где сигнал SL/TP задокументирован прямо и однозначно —
 # см. докстринг модуля про MEXC/Gate/Lighter.
 _CLOSE_REASON_FETCHERS = {
     "bybit": _bybit_close_reason,
     "aster": _aster_close_reason,
+    "dydx": _dydx_close_reason,
 }
 
 
@@ -365,6 +410,58 @@ def _gate_close_price(secrets: dict, symbol: str, settle: str = "usdt") -> float
     return _vwap([(abs(float(t["size"])), float(t["price"])) for t in trades])
 
 
+def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
+    """
+    GET /v4/fills — явное поле side ("BUY"/"SELL", ПОДТВЕРЖДЕНО живым
+    запросом к Indexer) прямо в каждом исполнении, та же надёжная
+    ситуация, что у Bybit/Aster (не как у MEXC/Gate, где сторону не
+    фильтруем, см. докстринг раздела выше) — закрытие шорта = покупка,
+    фильтруем side == "BUY".
+
+    В отличие от fundingPayments (только afterOrAt, нижняя граница),
+    у /v4/fills наоборот — только createdBeforeOrAt (верхняя граница),
+    нижней границы в API нет вовсе: идём по страницам (новые сначала,
+    тот же порядок, что и везде в Indexer) от текущего момента, пока не
+    встретим страницу с записью старше начала окна — фильтрация по
+    нижней границе окна сделана здесь же, на стороне бота.
+    """
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(CLOSE_PRICE_LOOKBACK_MINUTES * 60 * 1000)
+    before_or_at = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    trades = []
+    page = 0
+    while True:
+        resp = requests.get(
+            f"{DYDX_INDEXER_BASE_URL}/v4/fills",
+            params={
+                "address": secrets["dydx_address"], "subaccountNumber": secrets["dydx_subaccount_number"],
+                "market": symbol, "createdBeforeOrAt": before_or_at, "limit": "100", "page": str(page),
+            },
+            timeout=15, proxies=_get_dydx_proxies(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        fills = data.get("fills", [])
+        if not fills:
+            break
+
+        reached_start = False
+        for f in fills:
+            t_ms = int(datetime.fromisoformat(f["createdAt"].replace("Z", "+00:00")).timestamp() * 1000)
+            if t_ms < start_ms:
+                reached_start = True
+                continue
+            if f.get("side") == "BUY" and f.get("price") and f.get("size"):
+                trades.append((float(f["size"]), float(f["price"])))
+
+        if reached_start or len(fills) < 100:
+            break
+        page += 1
+
+    return _vwap(trades)
+
+
 # Lighter намеренно не включён — как и для _CLOSE_REASON_FETCHERS, публичного
 # документированного эндпоинта истории сделок/ордеров аккаунта не нашлось
 # (см. докстринг модуля). Если понадобится — присылайте реальный случай
@@ -374,6 +471,7 @@ _CLOSE_PRICE_FETCHERS = {
     "aster": _aster_close_price,
     "mexc": _mexc_close_price,
     "gate": _gate_close_price,
+    "dydx": _dydx_close_price,
 }
 
 
