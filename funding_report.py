@@ -1412,6 +1412,14 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) ->
             results["kucoin"] = (None, "реестр символов KuCoin ещё пуст (kucoin_symbol_history) — "
                                         "подождите часового цикла синхронизации с Google Sheet")
 
+    if "dydx_address" in secrets:
+        try:
+            records = fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], start_ms, end_ms)
+            results["dydx"] = (records, None)
+        except Exception as e:
+            print(f"[dYdX] Ошибка: {e}")
+            results["dydx"] = (None, str(e))
+
     return results
 
 
@@ -1631,6 +1639,17 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols
         else:
             results["kucoin"] = (None, "реестр символов KuCoin ещё пуст (kucoin_symbol_history) — "
                                         "подождите часового цикла синхронизации с Google Sheet")
+
+    if "dydx_address" in secrets:
+        try:
+            records = _fetch_in_windows(
+                lambda s, e: fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], s, e),
+                _EXCHANGE_WINDOW_DAYS["dydx"], start_ms, end_ms,
+            )
+            results["dydx"] = (records, None)
+        except Exception as e:
+            print(f"[dYdX] Ошибка: {e}")
+            results["dydx"] = (None, str(e))
 
     return results, warnings
 
@@ -1974,6 +1993,31 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
             print(f"[KuCoin/positions] Ошибка: {e}")
             results["kucoin"] = (None, str(e))
 
+    if "dydx_address" in secrets:
+        try:
+            open_times = fetch_dydx_open_symbols(secrets["dydx_address"], secrets["dydx_subaccount_number"])
+            if open_times:
+                # Как Bybit/MEXC — точное время открытия прямо из API
+                # (createdAt, см. fetch_dydx_open_symbols), без доп.
+                # подстраховки через _trim_open_position_records: в
+                # отличие от Bybit, createdAt у dYdX — время именно
+                # ТЕКУЩЕЙ открытой позиции, не "залипающее" поле.
+                earliest_ms = min(t for t in open_times.values() if t is not None)
+                fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
+                records = _fetch_in_windows(
+                    lambda s, e: fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], s, e),
+                    _EXCHANGE_WINDOW_DAYS["dydx"], fetch_start_ms, now_ms,
+                )
+                records = [
+                    r for r in records
+                    if r.get("symbol") in open_times and open_times[r["symbol"]] is not None
+                    and r.get("time_ms", 0) >= open_times[r["symbol"]]
+                ]
+                results["dydx"] = (records, None)
+        except Exception as e:
+            print(f"[dYdX/positions] Ошибка: {e}")
+            results["dydx"] = (None, str(e))
+
     return results
 
 
@@ -1994,6 +2038,7 @@ def build_open_positions_report(results: dict) -> str:
         "mexc":    ("MEXC",    "funding", "symbol", "asset"),
         "gate":    ("Gate",    "change",  "symbol", "asset"),
         "kucoin":  ("KuCoin",  "funding", "symbol", "settleCurrency"),
+        "dydx":    ("dYdX",    "payment", "symbol", "asset"),
     }
 
     all_totals: dict = defaultdict(float)
@@ -2075,7 +2120,8 @@ def build_report(start_ms: int, end_ms: int,
                  lighter_records: list | None = None, lighter_error: str | None = None,
                  mexc_records: list | None = None, mexc_error: str | None = None,
                  gate_records: list | None = None, gate_error: str | None = None,
-                 kucoin_records: list | None = None, kucoin_error: str | None = None) -> str:
+                 kucoin_records: list | None = None, kucoin_error: str | None = None,
+                 dydx_records: list | None = None, dydx_error: str | None = None) -> str:
 
     header = [
         "📊 Отчёт по funding fee",
@@ -2140,13 +2186,23 @@ def build_report(start_ms: int, end_ms: int,
         )
         combined.extend(kucoin_lines)
 
+    # dYdX — только если запрашивался
+    dydx_totals: dict = {}
+    if dydx_records is not None or dydx_error is not None:
+        combined.append("")
+        dydx_lines, dydx_totals = _section_lines(
+            "dYdX", dydx_records, dydx_error,
+            income_field="payment", symbol_field="symbol", asset_field="asset",
+        )
+        combined.extend(dydx_lines)
+
     # Итог по всем биржам
-    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals or kucoin_totals:
+    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals or kucoin_totals or dydx_totals:
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
         all_assets: set = (
             set(aster_totals) | set(bybit_totals) | set(lighter_totals)
-            | set(mexc_totals) | set(gate_totals) | set(kucoin_totals)
+            | set(mexc_totals) | set(gate_totals) | set(kucoin_totals) | set(dydx_totals)
         )
         for asset in sorted(all_assets):
             total = (
@@ -2156,6 +2212,7 @@ def build_report(start_ms: int, end_ms: int,
                 + mexc_totals.get(asset, 0.0)
                 + gate_totals.get(asset, 0.0)
                 + kucoin_totals.get(asset, 0.0)
+                + dydx_totals.get(asset, 0.0)
             )
             emoji = "🟢" if total >= 0 else "🔴"
             combined.append(f"  {emoji} {asset}: {total:+.4f}")
@@ -2217,6 +2274,7 @@ def main():
         *results.get("mexc",    (None, None)),
         *results.get("gate",    (None, None)),
         *results.get("kucoin",  (None, None)),
+        *results.get("dydx",    (None, None)),
     )
 
     send_telegram_broadcast(secrets["telegram_token"], secrets["telegram_chat_ids"], message)
