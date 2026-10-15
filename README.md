@@ -476,6 +476,14 @@ VIP 0/tier 0, опубликовано на kucoin.com/vip/privilege/fee), ка�
   кошелёк/collateral, без PnL открытых позиций — из-за этого баланс
   расходился с реальным, пока позиции были открыты (замечено на реальном
   аккаунте).
+- **dYdX** — публичный Indexer API (без ключа, по адресу кошелька, тот же
+  эндпоинт `/v4/addresses/{address}/subaccountNumber/{n}`, что используют
+  `short_position_tracker`/`margin_alerts`/`entry_price`, см.
+  `funding_report._dydx_subaccount_raw`). В отличие от Aster/Gate/Lighter
+  выше, поле `equity` уже включает нереализованный PnL открытых позиций
+  (та же особенность, что у KuCoin `accountEquity`) — прибавлять отдельно
+  не нужно, задвоило бы PnL. Спота у dYdX нет вовсе — это чисто
+  perpetual-биржа.
 - **Aave v3** — ON-CHAIN, чистая стоимость позиции (обеспечение минус долг)
   через `Pool.getUserAccountData(address)`; сети — Ethereum/Arbitrum
   One/Base (адреса контрактов захардкожены в `AAVE_V3_POOL`, добавить сеть —

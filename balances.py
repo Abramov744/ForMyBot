@@ -37,6 +37,10 @@
     открытым позициям — по документации Lighter Total Account Value =
     Collateral + Unrealized PnL, а готового поля с суммой в API нет, считаем
     сами (см. fetch_lighter_balance).
+  - dYdX    — equity сабаккаунта (публичный Indexer API, без ключа, по
+    адресу кошелька) — в отличие от Lighter выше, это поле УЖЕ включает
+    нереализованный PnL открытых позиций, прибавлять отдельно не нужно
+    (см. fetch_dydx_balance).
   - Aave v3 — ON-CHAIN, чистая стоимость позиции (обеспечение минус долг)
     через view-функцию Pool.getUserAccountData(address).
 
@@ -94,6 +98,7 @@ from funding_report import (
     LIGHTER_BASE_URL,
     _aster_sign,
     _bybit_sign,
+    _dydx_subaccount_raw,
     _gate_sign,
     _get_gate_proxies,
     _get_mexc_proxies,
@@ -952,6 +957,21 @@ def fetch_lighter_balance(account_index: str) -> float:
     return total
 
 
+def fetch_dydx_balance(address: str, subaccount_number: str) -> float:
+    """
+    GET /v4/addresses/{address}/subaccountNumber/{n} — тот же публичный
+    Indexer-эндпоинт, что используют short_position_tracker/margin_alerts/
+    entry_price (см. funding_report._dydx_subaccount_raw).
+
+    В отличие от Aster/Gate/Lighter выше, поле equity у dYdX УЖЕ включает
+    нереализованный PnL открытых позиций (задокументированная особенность
+    dYdX v4 — equity считается по марк-цене прямо в ответе API, отдельно
+    прибавлять unrealizedPnl по позициям не нужно, это задвоило бы PnL).
+    """
+    subaccount = _dydx_subaccount_raw(address, subaccount_number)
+    return float(subaccount.get("equity", 0) or 0)
+
+
 # ── Aave v3 (on-chain, Pool.getUserAccountData) ────────────────────────────────
 
 # Proxy-адрес контракта Pool (не Pool Implementation) — проверено по
@@ -1149,6 +1169,9 @@ def fetch_all_balances(secrets: dict) -> dict:
             fetch_kucoin_ticker_prices,
         )
 
+    if "dydx_address" in secrets:
+        _try("dydx", lambda: fetch_dydx_balance(secrets["dydx_address"], secrets["dydx_subaccount_number"]))
+
     wallet_secrets = load_wallet_secrets()
     aave_result = None
     if wallet_secrets:
@@ -1170,7 +1193,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",
