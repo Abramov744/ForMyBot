@@ -430,6 +430,15 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     ВАЖНО: параметр "page" передаётся ТОЛЬКО начиная со второй страницы
     (page=1) — см. тот же реальный случай и докстринг funding_report.
     fetch_dydx: сервер отвергает буквальное "page=0" как невалидное.
+
+    ВАЖНО #2 (реальный случай, 19.10.2026, прод): сервер стал отвергать
+    запрос с параметром "market" без параметра "marketType" ошибкой
+    валидации "marketType must be provided if market is provided" (400
+    Bad Request) — ПОДТВЕРЖДЕНО живым запросом к Indexer; судя по всему,
+    это изменение в валидаторе API dYdX (раньше marketType не был
+    обязателен), не ошибка в этом коде. "PERPETUAL" — единственный
+    релевантный тип рынка для этого бота (он торгует только перпетуалами),
+    других значений marketType (например "SPOT") здесь не бывает.
     """
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - int(CLOSE_PRICE_LOOKBACK_MINUTES * 60 * 1000)
@@ -440,7 +449,8 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     while True:
         params = {
             "address": secrets["dydx_address"], "subaccountNumber": secrets["dydx_subaccount_number"],
-            "market": symbol, "createdBeforeOrAt": before_or_at, "limit": "100",
+            "market": symbol, "marketType": "PERPETUAL",
+            "createdBeforeOrAt": before_or_at, "limit": "100",
         }
         if page > 0:
             params["page"] = str(page)
