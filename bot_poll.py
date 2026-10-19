@@ -350,6 +350,7 @@ def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: i
             *results.get("gate",    (None, None)),
             *results.get("kucoin",  (None, None)),
             *results.get("dydx",    (None, None)),
+            *results.get("htx",     (None, None)),
         )
         send_telegram(token, chat_id, report)
         print("Отправлен отчёт.")
@@ -406,6 +407,7 @@ def send_period_report(secrets: dict, chat_id: str, start_ms: int, end_ms: int, 
             *results.get("gate",    (None, None)),
             *results.get("kucoin",  (None, None)),
             *results.get("dydx",    (None, None)),
+            *results.get("htx",     (None, None)),
         )
         if warnings:
             report += "\n\n" + "\n".join(warnings)

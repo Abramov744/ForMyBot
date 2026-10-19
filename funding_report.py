@@ -1481,6 +1481,92 @@ def fetch_htx_open_symbols(api_key: str, api_secret: str) -> dict:
     }
 
 
+# mar_acct ("margin account") — обязательный параметр swap_financial_record,
+# но для режима CROSS margin (единственного, что здесь поддерживается — см.
+# докстринг _htx_positions_raw) это не код контракта, а ОБЩИЙ счёт на всю
+# маржу в этой валюте: в примере ответа swap_cross_position_info ПОЛЕ
+# "margin_account" равно "USDT" у ЛЮБОГО контракта (BTC-USDT, ETH-USDT и
+# т.д.) — один и тот же общий cross-margin счёт, не отдельный на пару
+# (в отличие от isolated margin, где margin_account — код пары). Запрос
+# примера в самой документации financial_record показывает "BTC-USDT" как
+# возможное значение mar_acct — это для isolated, сюда не относится.
+# НЕ ПРОВЕРЕНО на реальном ответе API.
+HTX_CROSS_MARGIN_ACCOUNT = "USDT"
+
+
+def _htx_financial_records_raw(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list:
+    """
+    POST /linear-swap-api/v3/swap_financial_record, type="30,31" (30 —
+    funding fee-income, 31 — funding fee-expenditure, ПОДТВЕРЖДЕНО офиц.
+    документацией — расшифровка типов прямо в описании параметра "type").
+    Лимиты API (тоже из офиц. документации): окно ОДНОГО запроса — не
+    длиннее 48 часов, глубина — не больше 90 дней от текущего момента (см.
+    _EXCHANGE_WINDOW_DAYS["htx"]/_EXCHANGE_MAX_LOOKBACK_DAYS["htx"] ниже) —
+    разбиение на окна уже сделано на уровне fetch_htx/fetch_all_windowed,
+    эта функция просто один запрос (возможно, с пагинацией по from_id)
+    внутри уже допустимого окна.
+
+    Пагинация: direct="next" — страницы идут в ХРОНОЛОГИЧЕСКОМ порядке (от
+    старых к новым), следующая страница запрашивается с from_id = query_id
+    последней записи предыдущей страницы + 1 (документированное поведение:
+    "If the query direction is next, from_id should be the max query_id in
+    the last query result" — +1, чтобы не задвоить пограничную запись).
+    Останавливаемся, когда страница пуста.
+    """
+    records = []
+    from_id = None
+    while True:
+        body = {
+            "mar_acct": HTX_CROSS_MARGIN_ACCOUNT,
+            "type": "30,31",
+            "start_time": start_ms,
+            "end_time": end_ms,
+            "direct": "next",
+        }
+        if from_id is not None:
+            body["from_id"] = from_id
+        data = _htx_signed_post("/linear-swap-api/v3/swap_financial_record", body, api_key, api_secret)
+        page = data.get("data") or []
+        if not page:
+            break
+        records.extend(page)
+        from_id = max(r["query_id"] for r in page) + 1
+        if len(page) < 2:  # нет документированного page size — страница из 1 записи почти наверняка последняя
+            break
+    return records
+
+
+def fetch_htx(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list:
+    """
+    Funding-записи HTX за период — обёртка над _htx_financial_records_raw с
+    синтетическими полями под общую схему EXCHANGE_FIELDS ("payment"/
+    "symbol"/"asset", тот же приём, что и у fetch_dydx выше).
+
+    Знак funding НЕ берётся из сырого поля "amount" как есть (в отличие от
+    большинства остальных бирж) — офиц. документация подтверждает только
+    РАЗДЕЛЕНИЕ на два типа (30 — income, 31 — expenditure), но не сам знак
+    числа в ответе (пример в доках — для другого типа, 5, не 30/31). Чтобы
+    не полагаться на непроверенное предположение о знаке в финансовом коде
+    (см. CLAUDE.md), знак выставляется здесь ЯВНО по типу записи: income
+    (30) — всегда положительный, expenditure (31) — всегда отрицательный,
+    независимо от знака в самом "amount". Это безопаснее даже если
+    предположение о знаке исходного "amount" окажется неверным.
+    """
+    raw = _htx_financial_records_raw(api_key, api_secret, start_ms, end_ms)
+    records = []
+    for r in raw:
+        try:
+            amount = abs(float(r["amount"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+        signed = amount if r.get("type") == 30 else -amount
+        records.append({
+            "symbol": r.get("contract_code"), "payment": signed,
+            "asset": r.get("asset", "USDT"), "time_ms": int(r["ts"]),
+        })
+    return records
+
+
 def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> dict:
     """
     Опрашивает все биржи за период [start_ms, end_ms).
@@ -1581,6 +1667,22 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) ->
             print(f"[dYdX] Ошибка: {e}")
             results["dydx"] = (None, str(e))
 
+    if "htx_api_key" in secrets:
+        try:
+            # _fetch_in_windows, а не прямой вызов fetch_htx — у HTX, в
+            # отличие от dYdX, есть жёсткий лимит окна ОДНОГО запроса (48ч,
+            # см. _EXCHANGE_WINDOW_DAYS["htx"]); период /report обычно
+            # короче лимита (одни сутки), но так безопаснее и для
+            # редкого случая более длинного периода.
+            records = _fetch_in_windows(
+                lambda s, e: fetch_htx(secrets["htx_api_key"], secrets["htx_api_secret"], s, e),
+                _EXCHANGE_WINDOW_DAYS["htx"], start_ms, end_ms,
+            )
+            results["htx"] = (records, None)
+        except Exception as e:
+            print(f"[HTX] Ошибка: {e}")
+            results["htx"] = (None, str(e))
+
     return results
 
 
@@ -1613,6 +1715,9 @@ _EXCHANGE_WINDOW_DAYS = {
     # долго открытой позиции fetch_dydx будет листать огромное число
     # страниц внутри одного окна (funding раз в час — до 720 записей/мес).
     "dydx": 30,
+    # HTX — ПОДТВЕРЖДЕНО офиц. документацией (swap_financial_record):
+    # "maximum query window size is 48 hours" — ровно 2 суток, целое число.
+    "htx": 2,
 }
 
 # Некоторые биржи (подтверждено для Gate реальной ошибкой 400 "from time
@@ -1625,6 +1730,10 @@ _EXCHANGE_WINDOW_DAYS = {
 # границу лимита по факту исполнения запроса, а не по факту его расчёта.
 _EXCHANGE_MAX_LOOKBACK_DAYS = {
     "gate": 179,
+    # HTX — ПОДТВЕРЖДЕНО офиц. документацией (swap_financial_record):
+    # "query window shift should be within past 90 days" — на 1 день
+    # меньше официального лимита "про запас", см. комментарий выше.
+    "htx": 89,
 }
 
 
@@ -1811,6 +1920,28 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols
         except Exception as e:
             print(f"[dYdX] Ошибка: {e}")
             results["dydx"] = (None, str(e))
+
+    if "htx_api_key" in secrets:
+        try:
+            htx_start_ms = start_ms
+            htx_max_days = _EXCHANGE_MAX_LOOKBACK_DAYS.get("htx")
+            if htx_max_days is not None:
+                earliest_allowed_ms = now_ms - htx_max_days * 24 * 60 * 60 * 1000
+                if htx_start_ms < earliest_allowed_ms:
+                    htx_start_ms = earliest_allowed_ms
+                    warnings.append(
+                        f"⚠️ HTX: биржа не отдаёт историю глубже {htx_max_days} дней назад — "
+                        f"часть запрошенного периода по HTX ({_fmt_ms(start_ms)} — "
+                        f"{_fmt_ms(earliest_allowed_ms)} UTC) в отчёт не попала."
+                    )
+            records = _fetch_in_windows(
+                lambda s, e: fetch_htx(secrets["htx_api_key"], secrets["htx_api_secret"], s, e),
+                _EXCHANGE_WINDOW_DAYS["htx"], htx_start_ms, end_ms,
+            )
+            results["htx"] = (records, None)
+        except Exception as e:
+            print(f"[HTX] Ошибка: {e}")
+            results["htx"] = (None, str(e))
 
     return results, warnings
 
@@ -2281,7 +2412,8 @@ def build_report(start_ms: int, end_ms: int,
                  mexc_records: list | None = None, mexc_error: str | None = None,
                  gate_records: list | None = None, gate_error: str | None = None,
                  kucoin_records: list | None = None, kucoin_error: str | None = None,
-                 dydx_records: list | None = None, dydx_error: str | None = None) -> str:
+                 dydx_records: list | None = None, dydx_error: str | None = None,
+                 htx_records: list | None = None, htx_error: str | None = None) -> str:
 
     header = [
         "📊 Отчёт по funding fee",
@@ -2356,13 +2488,25 @@ def build_report(start_ms: int, end_ms: int,
         )
         combined.extend(dydx_lines)
 
+    # HTX — только если запрашивался
+    htx_totals: dict = {}
+    if htx_records is not None or htx_error is not None:
+        combined.append("")
+        htx_lines, htx_totals = _section_lines(
+            "HTX", htx_records, htx_error,
+            income_field="payment", symbol_field="symbol", asset_field="asset",
+        )
+        combined.extend(htx_lines)
+
     # Итог по всем биржам
-    if bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals or kucoin_totals or dydx_totals:
+    if (bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals
+            or kucoin_totals or dydx_totals or htx_totals):
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
         all_assets: set = (
             set(aster_totals) | set(bybit_totals) | set(lighter_totals)
             | set(mexc_totals) | set(gate_totals) | set(kucoin_totals) | set(dydx_totals)
+            | set(htx_totals)
         )
         for asset in sorted(all_assets):
             total = (
@@ -2373,6 +2517,7 @@ def build_report(start_ms: int, end_ms: int,
                 + gate_totals.get(asset, 0.0)
                 + kucoin_totals.get(asset, 0.0)
                 + dydx_totals.get(asset, 0.0)
+                + htx_totals.get(asset, 0.0)
             )
             emoji = "🟢" if total >= 0 else "🔴"
             combined.append(f"  {emoji} {asset}: {total:+.4f}")
@@ -2435,6 +2580,7 @@ def main():
         *results.get("gate",    (None, None)),
         *results.get("kucoin",  (None, None)),
         *results.get("dydx",    (None, None)),
+        *results.get("htx",     (None, None)),
     )
 
     send_telegram_broadcast(secrets["telegram_token"], secrets["telegram_chat_ids"], message)

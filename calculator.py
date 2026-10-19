@@ -29,10 +29,10 @@ taker-ставки без VIP-скидок на момент написания)
 from collections import defaultdict
 
 from funding_report import (
-    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin, fetch_dydx,
+    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin, fetch_dydx, fetch_htx,
     fetch_aster_open_symbols, fetch_bybit_open_symbols, fetch_lighter_open_symbols,
     fetch_mexc_open_symbols, fetch_gate_open_symbols, fetch_kucoin_open_symbols,
-    fetch_dydx_open_symbols,
+    fetch_dydx_open_symbols, fetch_htx_open_symbols,
     _fetch_in_windows, _EXCHANGE_WINDOW_DAYS, _trim_to_continuous_run,
 )
 
@@ -67,6 +67,10 @@ _CONTINUOUS_OPEN_TIME_FIELDS = {
     "aster": ("time", "ms"),
     "lighter": ("timestamp", "s"),
     "gate": ("time", "s"),
+    # HTX, как Aster/Lighter/Gate, не отдаёт точное время открытия позиции
+    # (см. funding_report.fetch_htx_open_symbols) — "time_ms", поле,
+    # которое fetch_htx сама добавляет в каждую запись, уже в мс.
+    "htx": ("time_ms", "ms"),
 }
 
 
@@ -114,8 +118,11 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
                     secrets["lighter_account_index"], secrets["lighter_auth_token"],
                 ),
                 "gate": lambda: fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"]),
+                "htx": lambda: fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"]),
             }.get(exchange)
-            required_key = {"aster": "user", "lighter": "lighter_account_index", "gate": "gate_api_key"}[exchange]
+            required_key = {
+                "aster": "user", "lighter": "lighter_account_index", "gate": "gate_api_key", "htx": "htx_api_key",
+            }[exchange]
             if required_key not in secrets or fetch_open is None:
                 return records
             open_symbols = fetch_open()
@@ -134,7 +141,7 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
+    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX", "htx": "HTX",
 }
 
 # income_field/symbol_field/asset_field — те же имена полей, что и в
@@ -153,6 +160,10 @@ EXCHANGE_FIELDS = {
     # добавляет в каждую запись (ticker/"USDC" — см. её докстринг в
     # funding_report.py), а не "родные" имена полей ответа Indexer.
     "dydx":    {"income": "payment", "symbol": "symbol", "asset": "asset"},
+    # "symbol"/"asset" — синтетические поля, которые fetch_htx сама
+    # добавляет в каждую запись (contract_code/asset из swap_financial_record),
+    # тот же приём, что и у dYdX выше.
+    "htx":     {"income": "payment", "symbol": "symbol", "asset": "asset"},
 }
 
 # Стандартные (не-VIP, tier 0) taker-ставки в % — только дефолт для UI.
@@ -225,6 +236,10 @@ def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: i
         if "dydx_address" not in secrets:
             raise CalculatorError("dYdX не подключён (нет секретов)")
         fn = lambda s, e: fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], s, e)
+    elif exchange == "htx":
+        if "htx_api_key" not in secrets:
+            raise CalculatorError("HTX не подключён (нет секретов)")
+        fn = lambda s, e: fetch_htx(secrets["htx_api_key"], secrets["htx_api_secret"], s, e)
     else:
         raise CalculatorError(f"Неизвестная биржа: {exchange}")
 
@@ -343,6 +358,14 @@ def list_open_symbols(secrets: dict) -> dict:
         except Exception as e:
             print(f"[calculator] dYdX open symbols error: {e}")
 
+    if "htx_api_key" in secrets:
+        try:
+            result["htx"] = sorted(fetch_htx_open_symbols(
+                secrets["htx_api_key"], secrets["htx_api_secret"],
+            ).keys())
+        except Exception as e:
+            print(f"[calculator] HTX open symbols error: {e}")
+
     return result
 
 
@@ -362,6 +385,8 @@ def list_connected_exchanges(secrets: dict) -> list:
         keys.append("kucoin")
     if "dydx_address" in secrets:
         keys.append("dydx")
+    if "htx_api_key" in secrets:
+        keys.append("htx")
     return keys
 
 
