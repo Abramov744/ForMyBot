@@ -11,8 +11,8 @@
   - столбец AE — СРЕДНЕВЗВЕШЕННАЯ (VWAP) цена закрытия ФЬЮЧЕРСА по всем
     исполнениям в окне CLOSE_PRICE_LOOKBACK_MINUTES, а не последнее из них
     — пользователь подтвердил, что иногда закрывает позицию ЧАСТЯМИ, растя-
-    нутыми по времени (см. _CLOSE_PRICE_FETCHERS — не все 5 бирж поддер-
-    живаются, см. её докстринг про Lighter);
+    нутыми по времени (все 6 бирж поддерживаются, см. _CLOSE_PRICE_FETCHERS,
+    включая Lighter — _lighter_close_price);
   - столбец AD — СРЕДНЕВЗВЕШЕННАЯ цена закрытия на СПОТЕ, все продажи того
     же актива в том же окне по всем подключённым спот-биржам сразу
     (симметрично поиску покупки при открытии позиции, см. entry_price.
@@ -67,10 +67,11 @@ check_closed_positions ниже). Раньше эти два случая не �
         — различить можно только косвенно (сравнением цены закрытия с ценой
         входа), а входа у уже закрытой позиции мы не знаем без отдельного
         кэширования на каждой итерации, чего в этой версии нет.
-      * Lighter — публичного REST-эндпоинта для истории ордеров аккаунта с
-        полем типа ордера (ORDER_TYPE_STOP_LOSS/ORDER_TYPE_TAKE_PROFIT,
-        такое значение есть в SDK при СОЗДАНИИ ордера) в документации не
-        нашлось вообще.
+      * Lighter — история СДЕЛОК аккаунта теперь есть (GET /api/v1/trades,
+        см. _lighter_close_price ниже — используется для AE), но в ней нет
+        поля типа ордера (ORDER_TYPE_STOP_LOSS/ORDER_TYPE_TAKE_PROFIT, такое
+        значение есть в SDK только при СОЗДАНИИ ордера, не в исполненной
+        сделке) — саму причину (SL/TP) отсюда всё равно не определить.
     Если реально словите SL/TP на одной из этих трёх бирж и захотите видеть
     пометку и там — пришлите, что произошло (биржа/символ/время/цена
     закрытия), тогда можно будет прицельно доработать именно уточнение
@@ -87,6 +88,7 @@ import requests
 from funding_report import (
     _get_proxies, _bybit_sign, _aster_sign, _mexc_sign, _gate_sign,
     _get_mexc_proxies, _get_gate_proxies, _get_dydx_proxies, DYDX_INDEXER_BASE_URL,
+    LIGHTER_BASE_URL, fetch_lighter_markets,
     load_secrets, send_telegram_broadcast,
 )
 from funding_alerts import get_open_positions, EXCHANGE_LABELS
@@ -468,16 +470,90 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     return _vwap(trades)
 
 
-# Lighter намеренно не включён — как и для _CLOSE_REASON_FETCHERS, публичного
-# документированного эндпоинта истории сделок/ордеров аккаунта не нашлось
-# (см. докстринг модуля). Если понадобится — присылайте реальный случай
-# (символ/время закрытия), тогда можно будет доработать прицельно.
+def _lighter_close_price(secrets: dict, symbol: str) -> float | None:
+    """
+    GET /api/v1/trades — ПОДТВЕРЖДЕНО офиц. документацией apidocs.lighter.xyz
+    (reference/trades: "Get trades for lighter accounts... auth is required
+    for master accounts") — реальный документированный эндпоинт именно для
+    сделок АККАУНТА (а не только публичной ленты рынка, которую раньше и
+    искали и не находили — см. прежний комментарий в истории коммитов и
+    докстринг модуля про Lighter в _CLOSE_REASON_FETCHERS). НЕ проверено на
+    реальном ответе API (нет доступа к аккаунту из этой среды разработки) —
+    поля взяты из офиц. OpenAPI-схемы этого эндпоинта, сверить с реальным
+    закрытием после деплоя всё равно стоит.
+
+    У сделки нет отдельного поля "сторона нашего аккаунта" — есть
+    ask_account_id/bid_account_id (кто продавец/покупатель) на КАЖДУЮ
+    сделку целиком (это рынок с ограничением цены, а не биржа в роли
+    контрагента). Закрытие шорта — это покупка, поэтому берём только
+    сделки, где bid_account_id == наш account_index (мы были покупателем);
+    сделки, где мы ask (продавец), — это открытие шорта или закрытие лонга,
+    не относятся к нашему случаю (бот только шортит фьючерсы).
+
+    Курсорная пагинация (next_cursor, НЕ offset/page, как у page=0 на dYdX)
+    — идём от новых к старым (sort_dir=desc), пока не наберём достаточно
+    старых записей (вышли за начало окна) или курсор не закончится.
+    """
+    markets = fetch_lighter_markets()
+    market_id = next((mid for mid, sym in markets.items() if sym == symbol), None)
+    if market_id is None:
+        raise RuntimeError(f"Lighter: рынок для символа {symbol} не найден в orderBookDetails")
+
+    account_index = int(secrets["lighter_account_index"])
+    headers = {"authorization": secrets["lighter_auth_token"].strip()}
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(CLOSE_PRICE_LOOKBACK_MINUTES * 60 * 1000)
+
+    trades = []
+    cursor = None
+    while True:
+        params: dict = {
+            "market_id": str(market_id), "account_index": str(account_index),
+            "sort_by": "timestamp", "sort_dir": "desc", "limit": "100",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{LIGHTER_BASE_URL}/api/v1/trades", params=params, headers=headers, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code", 200) != 200:
+            raise RuntimeError(f"Lighter trades error: {data}")
+
+        page = data.get("trades", [])
+        if not page:
+            break
+
+        reached_start = False
+        for t in page:
+            t_ms = int(t["timestamp"]) * 1000
+            if t_ms < start_ms:
+                reached_start = True
+                continue
+            if t.get("bid_account_id") == account_index and t.get("price") and t.get("size"):
+                trades.append((float(t["size"]), float(t["price"])))
+
+        cursor = data.get("next_cursor")
+        if reached_start or not cursor:
+            break
+
+    return _vwap(trades)
+
+
+# Lighter: причина (SL/TP) НЕ уточняется — _CLOSE_REASON_FETCHERS выше (см.
+# докстринг модуля) всё ещё не нашла надёжного прямого сигнала типа ордера.
+# Цена закрытия (AE) при этом теперь берётся — _lighter_close_price выше,
+# через GET /api/v1/trades (найден после реального случая: закрытие позиции
+# ANSEM не записало AE, потому что раньше Lighter был вовсе не включён в
+# этот словарь — считалось, что документированного эндпоинта нет).
 _CLOSE_PRICE_FETCHERS = {
     "bybit": _bybit_close_price,
     "aster": _aster_close_price,
     "mexc": _mexc_close_price,
     "gate": _gate_close_price,
     "dydx": _dydx_close_price,
+    "lighter": _lighter_close_price,
 }
 
 
