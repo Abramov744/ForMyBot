@@ -121,6 +121,14 @@ def load_secrets() -> dict:
         result["dydx_address"] = dydx_address.strip()
         result["dydx_subaccount_number"] = os.environ.get("DYDX_SUBACCOUNT_NUMBER", "0").strip()
 
+    # HTX — опционально. Та же схема ключей (Access Key + Secret Key), что
+    # у остальных централизованных бирж — см. _htx_sign.
+    htx_api_key    = os.environ.get("HTX_API_KEY")
+    htx_api_secret = os.environ.get("HTX_API_SECRET")
+    if htx_api_key and htx_api_secret:
+        result["htx_api_key"]    = htx_api_key
+        result["htx_api_secret"] = htx_api_secret
+
     return result
 
 
@@ -1364,6 +1372,113 @@ def _fetch_kucoin_multi_symbol(secrets: dict, symbols, start_ms: int, end_ms: in
         for future in futures:
             records.extend(future.result())
     return records
+
+
+# ── Получение данных с HTX ────────────────────────────────────────────────────
+#
+# Схема подписи — классическая Huobi/HTX (ПОДТВЕРЖДЕНО офиц. документацией
+# huobiapi.github.io/docs/usdt_swap/v1/en, раздел "Signature Authentication
+# & Verification"), ОТДЕЛЬНАЯ от HMAC-схем остальных бирж в этом файле:
+# Signature — не заголовок, а ЕЩЁ ОДИН query-параметр запроса. Строка для
+# подписи — "{METHOD}\n{host}\n{path}\n{query_string}", где query_string —
+# параметры, отсортированные по ASCII, urlencode'нутые и соединённые "&".
+# Для POST-запросов (все эндпоинты, что здесь используются) подписываются
+# ТОЛЬКО четыре служебных параметра (AccessKeyId/SignatureMethod/
+# SignatureVersion/Timestamp) — тело запроса (JSON) в подпись не входит,
+# передаётся отдельно. Результат — HMAC-SHA256, закодированный в base64 (не
+# hex, как у большинства остальных бирж).
+#
+# НЕ ПРОВЕРЕНО на реальном ответе API (нет доступа к аккаунту из этой среды
+# разработки) — сверить с реальными данными после деплоя всё равно стоит.
+
+HTX_HOST = "api.hbdm.com"
+HTX_BASE_URL = f"https://{HTX_HOST}"
+
+
+def _get_htx_proxies() -> dict | None:
+    """Прокси для запросов к HTX — тот же паттерн, что и у остальных бирж
+    (_get_mexc_proxies/_get_gate_proxies/_get_kucoin_proxies выше): сначала
+    HTX_PROXY, иначе общие HTTPS_PROXY/HTTP_PROXY."""
+    proxy = (
+        os.environ.get("HTX_PROXY")
+        or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    )
+    if not proxy:
+        return None
+    if not proxy.startswith(("http://", "https://")):
+        proxy = f"http://{proxy}"
+    return {"http": proxy, "https": proxy}
+
+
+def _htx_sign(method: str, path: str, params: dict, api_secret: str) -> str:
+    query_string = urllib.parse.urlencode(sorted(params.items()))
+    payload = f"{method}\n{HTX_HOST}\n{path}\n{query_string}"
+    digest = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _htx_signed_post(path: str, body: dict, api_key: str, api_secret: str) -> dict:
+    """
+    POST с подписью в query-параметрах (см. докстринг секции выше) + тело
+    запроса отдельным JSON (не входит в подпись). Timestamp — ISO8601 UTC
+    БЕЗ миллисекунд и БЕЗ суффикса "Z" (пример из офиц. докстрок:
+    "2017-05-11T15:19:30") — секундная точность, этого достаточно для
+    5-минутного окна действия подписи у HTX.
+
+    Ответ бывает в ДВУХ разных обёртках в зависимости от версии эндпоинта:
+    v1/v2 отдают {"status": "ok"/"error", ...}, v3 (swap_financial_record)
+    отдаёт {"code": 200, ...} — проверяются оба варианта.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    base_params = {
+        "AccessKeyId": api_key.strip(),
+        "SignatureMethod": "HmacSHA256",
+        "SignatureVersion": "2",
+        "Timestamp": timestamp,
+    }
+    signature = _htx_sign("POST", path, base_params, api_secret.strip())
+    query = dict(base_params)
+    query["Signature"] = signature
+
+    resp = requests.post(
+        f"{HTX_BASE_URL}{path}", params=query, json=body,
+        timeout=30, proxies=_get_htx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") == "error":
+        raise RuntimeError(f"HTX {path} error: {data}")
+    if "code" in data and data["code"] != 200:
+        raise RuntimeError(f"HTX {path} error: {data}")
+    return data
+
+
+def _htx_positions_raw(api_key: str, api_secret: str) -> list:
+    """
+    POST /linear-swap-api/v1/swap_cross_position_info, тело {} — все открытые
+    позиции USDT-margined свопов в режиме cross margin (единственный режим,
+    который здесь поддерживается — см. докстринг секции выше про
+    непроверенность; isolated margin использует другой эндпоинт,
+    swap_position_info, не добавлен). Общий источник для
+    fetch_htx_open_symbols ниже и short_position_tracker._fetch_htx_open_shorts.
+    """
+    data = _htx_signed_post("/linear-swap-api/v1/swap_cross_position_info", {}, api_key, api_secret)
+    return data.get("data") or []
+
+
+def fetch_htx_open_symbols(api_key: str, api_secret: str) -> dict:
+    """
+    {contract_code: None} — как у Aster/Gate/Lighter, HTX не отдаёт точное
+    время открытия позиции в ответе о позициях (только cost_open — цену, не
+    время), поэтому funding считается приближённо, по непрерывности
+    начислений (см. calculator._CONTINUOUS_OPEN_TIME_FIELDS).
+    """
+    items = _cached_raw_positions("htx", lambda: _htx_positions_raw(api_key, api_secret))
+    return {
+        p["contract_code"]: None
+        for p in items if float(p.get("volume", 0) or 0) > 0
+    }
 
 
 def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> dict:
