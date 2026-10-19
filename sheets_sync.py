@@ -110,6 +110,7 @@ from funding_report import (
     fetch_lighter_open_symbols,
     fetch_mexc_open_symbols,
     fetch_dydx_open_symbols,
+    fetch_dydx_net_funding,
     load_secrets,
 )
 
@@ -285,7 +286,20 @@ def compute_funding_total(secrets: dict, exchange: str, symbol: str, open_time_m
     (calculator._trim_to_current_open_position), sum_by_asset() суммирует
     ровно так же, как и funding_income_total в /api/calculate. Этот скрипт
     только выбирает старт периода, чтобы не тянуть лишнее.
+
+    ИСКЛЮЧЕНИЕ — dYdX: вместо ручного суммирования записей fundingPayments
+    используется готовое поле netFunding прямо с позиции (см. докстринг
+    funding_report.fetch_dydx_net_funding) — реальный случай: ручная сумма
+    в этой ячейке показывала $3.19, а в интерфейсе dYdX та же позиция
+    показывала $2.23. netFunding — то самое число, которое использует
+    официальный интерфейс (тот же Indexer), поэтому расхождение с ним
+    устранено переходом на этот источник, а не попыткой угадать причину
+    разницы в ручном подсчёте.
     """
+    if exchange == "dydx":
+        net_funding = fetch_dydx_net_funding(secrets["dydx_address"], secrets["dydx_subaccount_number"])
+        return net_funding.get(symbol, 0.0)
+
     now_ms = int(time.time() * 1000)
     if exchange in _EXACT_TIME_EXCHANGES and open_time_ms is not None:
         start_ms = open_time_ms
