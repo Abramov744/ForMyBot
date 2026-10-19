@@ -93,6 +93,7 @@ from entry_price import (
     WINDOW_MINUTES_APPROX,
     _base_asset,
     _fetch_mexc_contract_size,
+    _fetch_htx_contract_size,
     _infer_open_time_via_funding,
     _search_spot_entry,
 )
@@ -106,6 +107,7 @@ from funding_report import (
     _lighter_positions_raw,
     _mexc_positions_raw,
     _dydx_subaccount_raw,
+    _htx_positions_raw,
     fetch_lighter_markets,
     load_secrets,
 )
@@ -277,6 +279,34 @@ def _fetch_dydx_open_shorts(secrets: dict) -> list:
     return out
 
 
+def _fetch_htx_open_shorts(secrets: dict) -> list:
+    """
+    HTX (как Gate/Aster/Lighter) не отдаёт точное время открытия позиции —
+    только cost_open (среднюю цену). direction == "sell" — шорт (офиц.
+    документация HTX usdt_swap: direction — "buy":long "sell":short, см.
+    докстринг модуля про остальные биржи). volume — в КОНТРАКТАХ, не в
+    монетах (тот же случай, что у MEXC holdVol) — домножается на
+    contract_size, иначе объём не совпал бы со спот-покупкой при сверке
+    (_qty_matches). НЕ ПРОВЕРЕНО на реальном ответе API (нет доступа к
+    аккаунту из этой среды разработки).
+    """
+    items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
+        secrets["htx_api_key"], secrets["htx_api_secret"],
+    ))
+    out = []
+    for p in items:
+        volume = float(p.get("volume", 0) or 0)
+        if p.get("direction") == "sell" and volume > 0:
+            contract_size = _fetch_htx_contract_size(p["contract_code"])
+            price = p.get("cost_open")
+            out.append({
+                "symbol": p["contract_code"], "qty": volume * contract_size,
+                "entry_time_ms": None, "time_is_exact": False,
+                "price": float(price) if price else None,
+            })
+    return out
+
+
 def _fetch_kucoin_open_shorts(secrets: dict) -> list:
     items = _cached_raw_positions("kucoin", lambda: _kucoin_positions_raw(
         secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
@@ -304,6 +334,7 @@ _OPEN_SHORTS_FETCHERS = {
     "lighter": (_fetch_lighter_open_shorts, "lighter_account_index"),
     "kucoin": (_fetch_kucoin_open_shorts, "kucoin_api_key"),
     "dydx": (_fetch_dydx_open_shorts, "dydx_address"),
+    "htx": (_fetch_htx_open_shorts, "htx_api_key"),
 }
 
 

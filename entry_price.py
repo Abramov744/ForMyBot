@@ -91,6 +91,11 @@ def _base_asset(exchange: str, symbol: str) -> str:
         # "USD" с конца строки и оставил бы висящий дефис ("SEI-"), поэтому
         # разбор через дефис, тот же приём, что и у спот-формата KuCoin.
         return symbol.split("-")[0]
+    if exchange == "htx":
+        # Тикер HTX (contract_code) — "SEI-USDT" (база + "-" + котируемая
+        # валюта) — тот же случай, что и у dYdX чуть выше: общий суффиксный
+        # разбор ниже оставил бы висящий дефис ("SEI-").
+        return symbol.split("-")[0]
     if exchange == "kucoin":
         # У KuCoin ДВА разных формата символа в зависимости от рынка: спот —
         # через дефис ("BTC-USDT"), фьючерсы — слитно с суффиксом контракта
@@ -365,6 +370,67 @@ def _dydx_position_entry(secrets: dict, symbol: str) -> dict | None:
     }
 
 
+_htx_contract_size_cache: dict = {}
+
+
+def _fetch_htx_contract_size(contract_code: str) -> float:
+    """
+    Сколько монет в ОДНОМ контракте HTX linear swap — тот же случай, что и
+    у MEXC (см. _fetch_mexc_contract_size выше): объём позиции ("volume")
+    отдаётся в количестве КОНТРАКТОВ, не в монетах, множитель свой у
+    каждого символа. Публичный эндпоинт (без авторизации, ПОДТВЕРЖДЕНО
+    офиц. документацией — curl-пример без ключей), GET /linear-swap-api/
+    v1/swap_contract_info. Кэшируется в памяти процесса (контрактные
+    спецификации почти не меняются). При любой неожиданности в формате
+    ответа — множитель 1 (старое поведение) и предупреждение в лог, тот же
+    приём, что и у MEXC.
+    """
+    if contract_code in _htx_contract_size_cache:
+        return _htx_contract_size_cache[contract_code]
+    contract_size = 1.0
+    try:
+        from funding_report import HTX_BASE_URL, _get_htx_proxies
+        resp = requests.get(
+            f"{HTX_BASE_URL}/linear-swap-api/v1/swap_contract_info",
+            params={"contract_code": contract_code}, timeout=15, proxies=_get_htx_proxies(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data") or []
+        item = next((c for c in items if c.get("contract_code") == contract_code), None)
+        if not isinstance(item, dict) or item.get("contract_size") is None:
+            raise RuntimeError(f"неожиданный формат ответа: {data}")
+        contract_size = float(item["contract_size"])
+    except Exception as e:
+        print(f"[entry_price/htx] Не удалось получить contract_size для {contract_code}, использую 1 "
+              f"(объём позиции может быть занижен/завышен, если у контракта множитель ≠ 1): {e}")
+    _htx_contract_size_cache[contract_code] = contract_size
+    return contract_size
+
+
+def _htx_position_entry(secrets: dict, symbol: str) -> dict | None:
+    """direction == "sell" — шорт (см. докстринг short_position_tracker._fetch_htx_open_shorts).
+    cost_open — средняя цена открытия позиции; времени открытия HTX не отдаёт
+    (см. докстринг модуля про _infer_open_time_via_funding)."""
+    from funding_report import _htx_positions_raw
+    items = _htx_positions_raw(secrets["htx_api_key"], secrets["htx_api_secret"])
+    for p in items:
+        if p.get("contract_code") != symbol or p.get("direction") != "sell":
+            continue
+        volume = float(p.get("volume", 0) or 0)
+        if volume <= 0:
+            continue
+        contract_size = _fetch_htx_contract_size(symbol)
+        price = p.get("cost_open")
+        return {
+            "price": float(price) if price else None,
+            "qty": volume * contract_size,
+            "entry_time_ms": None,
+            "time_is_exact": False,
+        }
+    return None
+
+
 _POSITION_ENTRY_FETCHERS = {
     "aster": _aster_position_entry,
     "bybit": _bybit_position_entry,
@@ -373,6 +439,7 @@ _POSITION_ENTRY_FETCHERS = {
     "lighter": _lighter_position_entry,
     "kucoin": _kucoin_position_entry,
     "dydx": _dydx_position_entry,
+    "htx": _htx_position_entry,
 }
 
 
