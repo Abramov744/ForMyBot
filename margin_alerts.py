@@ -61,6 +61,15 @@ snapshot ниже), unrealized = сумма unrealizedPnl по открытым 
 пока нет ни в этом алерте, ни в /rates — Indexer не отдаёт её напрямую
 (см. README).
 
+HTX — margin_base = margin_static ("Static Margin" — капитал БЕЗ floating
+PnL, тот же смысл, что cashBalance+positionMargin у MEXC), unrealized =
+profit_unreal. Оба поля — часть одного ответа POST /linear-swap-api/v1/
+swap_cross_account_info (cross-режим, единственный поддерживаемый) и
+ОФИЦИАЛЬНО задокументированы раздельно друг от друга — вычитать/
+складывать вручную, как для MEXC, не требуется. НЕ ПРОВЕРЕНО на реальном
+счёте (нет доступа к аккаунту из этой среды разработки) — первый реальный
+алерт по HTX стоит сверить с суммами на экране самого приложения HTX.
+
 Алерт срабатывает, когда unrealized ОТРИЦАТЕЛЕН и его модуль достиг
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) от margin_base:
   unrealized <= -MARGIN_ALERT_THRESHOLD * margin_base
@@ -86,13 +95,13 @@ import time
 from balances import _mexc_account_assets_raw, _gate_futures_account_raw
 from funding_report import (
     load_secrets, send_telegram_broadcast, _cached_raw_positions,
-    _lighter_account_raw, _dydx_subaccount_raw,
+    _lighter_account_raw, _dydx_subaccount_raw, _htx_cross_account_raw,
 )
 
 MARGIN_CHECK_INTERVAL_MINUTES = float(os.environ.get("MARGIN_CHECK_INTERVAL_MINUTES", "5"))
 MARGIN_ALERT_THRESHOLD = float(os.environ.get("MARGIN_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"mexc": "MEXC", "gate": "Gate", "lighter": "Lighter", "dydx": "dYdX"}
+_LABELS = {"mexc": "MEXC", "gate": "Gate", "lighter": "Lighter", "dydx": "dYdX", "htx": "HTX"}
 
 
 def _mexc_margin_snapshot(secrets: dict) -> list:
@@ -188,11 +197,37 @@ def _dydx_margin_snapshot(secrets: dict) -> list:
     return [{"currency": "USDC", "margin_base": margin_base, "unrealized": unrealized}]
 
 
+def _htx_margin_snapshot(secrets: dict) -> list:
+    """
+    margin_base = margin_static ("Static Margin" — капитал БЕЗ floating
+    PnL, тот же смысл, что cashBalance+positionMargin у MEXC / total у
+    Gate), unrealized = profit_unreal — оба поля ОФИЦИАЛЬНО
+    задокументированы РАЗДЕЛЬНО (margin_static и profit_unreal — соседние,
+    но разные поля в описании ответа swap_cross_account_info), вычитать/
+    складывать вручную не нужно, в отличие от MEXC. Валюта — margin_asset
+    ("USDT" для единственного поддерживаемого margin_account, см.
+    funding_report.HTX_CROSS_MARGIN_ACCOUNT). НЕ ПРОВЕРЕНО на реальном
+    счёте (нет доступа к аккаунту из этой среды разработки).
+    """
+    account = _cached_raw_positions("htx:account", lambda: _htx_cross_account_raw(
+        secrets["htx_api_key"], secrets["htx_api_secret"],
+    ))
+    margin_base = float(account.get("margin_static", 0) or 0)
+    if margin_base <= 0:
+        return []
+    return [{
+        "currency": account.get("margin_asset", "USDT"),
+        "margin_base": margin_base,
+        "unrealized": float(account.get("profit_unreal", 0) or 0),
+    }]
+
+
 _MARGIN_FETCHERS = {
     "mexc": (_mexc_margin_snapshot, "mexc_api_key"),
     "gate": (_gate_margin_snapshot, "gate_api_key"),
     "lighter": (_lighter_margin_snapshot, "lighter_account_index"),
     "dydx": (_dydx_margin_snapshot, "dydx_address"),
+    "htx": (_htx_margin_snapshot, "htx_api_key"),
 }
 
 
