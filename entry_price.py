@@ -409,9 +409,14 @@ def _fetch_htx_contract_size(contract_code: str) -> float:
 
 
 def _htx_position_entry(secrets: dict, symbol: str) -> dict | None:
-    """direction == "sell" — шорт (см. докстринг short_position_tracker._fetch_htx_open_shorts).
-    cost_open — средняя цена открытия позиции; времени открытия HTX не отдаёт
-    (см. докстринг модуля про _infer_open_time_via_funding)."""
+    """
+    HTX теперь на новом /v5/trade/position/opens (см. докстринг
+    funding_report._htx_positions_raw про миграцию со старого API) —
+    direction == "sell" — шорт (конвенция не изменилась, см. докстринг
+    short_position_tracker._fetch_htx_open_shorts), open_avg_price —
+    средняя цена входа (было cost_open), created_time — точное время
+    открытия (в старом API этого поля не было вовсе).
+    """
     from funding_report import _htx_positions_raw
     items = _htx_positions_raw(secrets["htx_api_key"], secrets["htx_api_secret"])
     for p in items:
@@ -421,12 +426,13 @@ def _htx_position_entry(secrets: dict, symbol: str) -> dict | None:
         if volume <= 0:
             continue
         contract_size = _fetch_htx_contract_size(symbol)
-        price = p.get("cost_open")
+        price = p.get("open_avg_price")
+        created_time = p.get("created_time")
         return {
             "price": float(price) if price else None,
             "qty": volume * contract_size,
-            "entry_time_ms": None,
-            "time_is_exact": False,
+            "entry_time_ms": int(created_time) if created_time else None,
+            "time_is_exact": created_time is not None,
         }
     return None
 

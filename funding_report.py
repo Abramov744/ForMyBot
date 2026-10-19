@@ -1376,17 +1376,28 @@ def _fetch_kucoin_multi_symbol(secrets: dict, symbols, start_ms: int, end_ms: in
 
 # ── Получение данных с HTX ────────────────────────────────────────────────────
 #
-# Схема подписи — классическая Huobi/HTX (ПОДТВЕРЖДЕНО офиц. документацией
-# huobiapi.github.io/docs/usdt_swap/v1/en, раздел "Signature Authentication
-# & Verification"), ОТДЕЛЬНАЯ от HMAC-схем остальных бирж в этом файле:
-# Signature — не заголовок, а ЕЩЁ ОДИН query-параметр запроса. Строка для
-# подписи — "{METHOD}\n{host}\n{path}\n{query_string}", где query_string —
-# параметры, отсортированные по ASCII, urlencode'нутые и соединённые "&".
-# Для POST-запросов (все эндпоинты, что здесь используются) подписываются
-# ТОЛЬКО четыре служебных параметра (AccessKeyId/SignatureMethod/
-# SignatureVersion/Timestamp) — тело запроса (JSON) в подпись не входит,
-# передаётся отдельно. Результат — HMAC-SHA256, закодированный в base64 (не
-# hex, как у большинства остальных бирж).
+# ВАЖНО (реальный случай, 19.10.2026, прод): изначально этот раздел был
+# написан под "старый" API HTX (/linear-swap-api/v1/.../v3/...). HTX
+# officially объявила (htx.com/support/65042754281336) полный перенос ВСЕХ
+# приватных интерфейсов фьючерсов на новый /v5/... API с дедлайном миграции
+# 19.09.2026 — уже прошедшим на момент переписывания этого раздела. Первый
+# же реальный запрос (margin_alerts, swap_cross_account_info) упал с
+# error_code 6023 "The current API version has expired. Please upgrade to
+# the V5 interface". Публичные (без авторизации) рыночные эндпоинты —
+# GET .../swap_contract_info — миграция явно НЕ затронула ("with the
+# exception of market data interfaces" в самом объявлении), поэтому
+# _fetch_htx_contract_size в entry_price.py не менялся.
+#
+# Схема подписи — та же классическая Huobi/HTX HMAC-SHA256+base64 (Signature
+# — ещё один query-параметр, а не заголовок), что и была — ПОДТВЕРЖДЕНО
+# открытым кодом ccxt (ccxt/htx.py, метод sign(): v5-эндпоинты подписываются
+# ТЕМ ЖЕ алгоритмом, что и старые; это НЕ новая схема авторизации, несмотря
+# на формулировку "authentication methods are more standardized" в
+# объявлении HTX). Разница — все v5-эндпоинты, что здесь используются,
+# теперь GET (были POST): для GET подписываются ВСЕ параметры запроса
+# (бизнес + служебные) вместе, та же сортировка по ASCII и конкатенация, что
+# и для POST с его четырьмя служебными параметрами (см. _htx_sign/
+# _htx_signed_get).
 #
 # НЕ ПРОВЕРЕНО на реальном ответе API (нет доступа к аккаунту из этой среды
 # разработки) — сверить с реальными данными после деплоя всё равно стоит.
@@ -1418,31 +1429,33 @@ def _htx_sign(method: str, path: str, params: dict, api_secret: str) -> str:
     return base64.b64encode(digest).decode("utf-8")
 
 
-def _htx_signed_post(path: str, body: dict, api_key: str, api_secret: str) -> dict:
+def _htx_signed_get(path: str, params: dict, api_key: str, api_secret: str) -> dict:
     """
-    POST с подписью в query-параметрах (см. докстринг секции выше) + тело
-    запроса отдельным JSON (не входит в подпись). Timestamp — ISO8601 UTC
-    БЕЗ миллисекунд и БЕЗ суффикса "Z" (пример из офиц. докстрок:
-    "2017-05-11T15:19:30") — секундная точность, этого достаточно для
-    5-минутного окна действия подписи у HTX.
+    GET-запрос к /v5/... — подписываются ВСЕ параметры (бизнес + служебные)
+    вместе, в отличие от POST (там только 4 служебных, см. докстринг
+    секции выше). Timestamp — ISO8601 UTC без миллисекунд и без "Z"
+    (та же форма, что и раньше, HTX не поменяла это при переходе на v5).
+    None-значения из params отбрасываются перед подписью/отправкой —
+    удобно передавать опциональные фильтры без ветвления на вызывающей
+    стороне.
 
-    Ответ бывает в ДВУХ разных обёртках в зависимости от версии эндпоинта:
-    v1/v2 отдают {"status": "ok"/"error", ...}, v3 (swap_financial_record)
-    отдаёт {"code": 200, ...} — проверяются оба варианта.
+    Ответ всех v5-эндпоинтов — {"code": 200, "message": "Success", "data": ...}
+    (единая обёртка, в отличие от разнобоя v1/v2/v3 — тоже часть заявленной
+    HTX "Enhanced Data Consistency").
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    base_params = {
+    full_params = {k: v for k, v in params.items() if v is not None}
+    full_params.update({
         "AccessKeyId": api_key.strip(),
         "SignatureMethod": "HmacSHA256",
         "SignatureVersion": "2",
         "Timestamp": timestamp,
-    }
-    signature = _htx_sign("POST", path, base_params, api_secret.strip())
-    query = dict(base_params)
-    query["Signature"] = signature
+    })
+    signature = _htx_sign("GET", path, full_params, api_secret.strip())
+    full_params["Signature"] = signature
 
-    resp = requests.post(
-        f"{HTX_BASE_URL}{path}", params=query, json=body,
+    resp = requests.get(
+        f"{HTX_BASE_URL}{path}", params=full_params,
         timeout=30, proxies=_get_htx_proxies(),
     )
     resp.raise_for_status()
@@ -1456,102 +1469,110 @@ def _htx_signed_post(path: str, body: dict, api_key: str, api_secret: str) -> di
 
 def _htx_positions_raw(api_key: str, api_secret: str) -> list:
     """
-    POST /linear-swap-api/v1/swap_cross_position_info, тело {} — все открытые
-    позиции USDT-margined свопов в режиме cross margin (единственный режим,
-    который здесь поддерживается — см. докстринг секции выше про
-    непроверенность; isolated margin использует другой эндпоинт,
-    swap_position_info, не добавлен). Общий источник для
-    fetch_htx_open_symbols ниже и short_position_tracker._fetch_htx_open_shorts.
+    GET /v5/trade/position/opens — все текущие позиции (cross + isolated
+    вперемешку, фильтра по margin_mode у этого эндпоинта нет — см. офиц.
+    докстринг ответа). В отличие от старого /linear-swap-api/v1/
+    swap_cross_position_info, здесь ЕСТЬ created_time (точное время
+    открытия позиции, см. fetch_htx_open_symbols ниже) и liquidation_price
+    прямо в ответе. direction — по-прежнему "buy"/"sell" (лонг/шорт, та же
+    конвенция, что и раньше), volume — по-прежнему в КОНТРАКТАХ, не в
+    монетах (contract_size домножается отдельно, см. entry_price.
+    _fetch_htx_contract_size). Общий источник для fetch_htx_open_symbols
+    ниже и short_position_tracker._fetch_htx_open_shorts.
     """
-    data = _htx_signed_post("/linear-swap-api/v1/swap_cross_position_info", {}, api_key, api_secret)
+    data = _htx_signed_get("/v5/trade/position/opens", {}, api_key, api_secret)
     return data.get("data") or []
 
 
 def fetch_htx_open_symbols(api_key: str, api_secret: str) -> dict:
     """
-    {contract_code: None} — как у Aster/Gate/Lighter, HTX не отдаёт точное
-    время открытия позиции в ответе о позициях (только cost_open — цену, не
-    время), поэтому funding считается приближённо, по непрерывности
-    начислений (см. calculator._CONTINUOUS_OPEN_TIME_FIELDS).
+    {contract_code: created_time_ms} — в отличие от старого API, v5 отдаёт
+    ТОЧНОЕ время открытия позиции (created_time) прямо в ответе о позициях
+    — HTX попадает в ту же категорию, что Bybit/MEXC/KuCoin/dYdX (см.
+    calculator._EXACT_OPEN_TIME_FIELDS), а не в категорию "непрерывность
+    начислений", как было в версии под старый API.
     """
     items = _cached_raw_positions("htx", lambda: _htx_positions_raw(api_key, api_secret))
-    return {
-        p["contract_code"]: None
-        for p in items if float(p.get("volume", 0) or 0) > 0
-    }
+    out = {}
+    for p in items:
+        if float(p.get("volume", 0) or 0) <= 0:
+            continue
+        created_time = p.get("created_time")
+        out[p["contract_code"]] = int(created_time) if created_time else None
+    return out
 
 
-# mar_acct ("margin account") — обязательный параметр swap_financial_record,
-# но для режима CROSS margin (единственного, что здесь поддерживается — см.
-# докстринг _htx_positions_raw) это не код контракта, а ОБЩИЙ счёт на всю
-# маржу в этой валюте: в примере ответа swap_cross_position_info ПОЛЕ
-# "margin_account" равно "USDT" у ЛЮБОГО контракта (BTC-USDT, ETH-USDT и
-# т.д.) — один и тот же общий cross-margin счёт, не отдельный на пару
-# (в отличие от isolated margin, где margin_account — код пары). Запрос
-# примера в самой документации financial_record показывает "BTC-USDT" как
-# возможное значение mar_acct — это для isolated, сюда не относится.
-# НЕ ПРОВЕРЕНО на реальном ответе API.
-HTX_CROSS_MARGIN_ACCOUNT = "USDT"
+# Единственный поддерживаемый режим — cross margin (тот же выбор, что и в
+# предыдущей версии под старый API) — фильтруется явно через margin_mode,
+# чтобы случайная isolated-позиция не попала в суммы наравне с cross.
+HTX_MARGIN_MODE = "cross"
 
 
 def _htx_cross_account_raw(api_key: str, api_secret: str) -> dict:
     """
-    POST /linear-swap-api/v1/swap_cross_account_info, margin_account="USDT"
-    (единственный поддерживаемый margin_account для cross-режима, см.
-    HTX_CROSS_MARGIN_ACCOUNT выше) — отдаёт margin_balance (эквити, С
-    учётом floating PnL), margin_static ("Static Margin" — капитал БЕЗ
-    floating PnL, ПОДТВЕРЖДЕНО офиц. документацией: отдельное от
-    margin_balance поле прямо в описании ответа), profit_unreal
-    (нереализованный PnL). Общий источник для
-    margin_alerts._htx_margin_snapshot. НЕ ПРОВЕРЕНО на реальном ответе
-    API (нет доступа к аккаунту из этой среды разработки).
+    GET /v5/account/balance — ПОДТВЕРЖДЕНО офиц. документацией: возвращает
+    один объект на ВЕСЬ аккаунт (не список, как раньше), с разбивкой по
+    валютам в "details" (equity/profit_unreal на каждую, плюс отдельно
+    isolated_equity/isolated_profit_unreal — то, что приходится на
+    isolated-позиции внутри той же валюты). margin_mode как явный фильтр
+    запроса у этого эндпоинта НЕ документирован (возвращает ВСЁ: и cross,
+    и isolated, смешанными в одних и тех же полях equity/profit_unreal) —
+    отдельного "статического капитала без PnL" поля, как было в старом
+    API (margin_static), здесь тоже нет. Общий источник для
+    margin_alerts._htx_margin_snapshot — см. её докстринг про то, как это
+    разрулено. НЕ ПРОВЕРЕНО на реальном ответе API (нет доступа к аккаунту
+    из этой среды разработки).
     """
-    data = _htx_signed_post(
-        "/linear-swap-api/v1/swap_cross_account_info",
-        {"margin_account": HTX_CROSS_MARGIN_ACCOUNT}, api_key, api_secret,
-    )
-    items = data.get("data") or []
-    return items[0] if items else {}
+    data = _htx_signed_get("/v5/account/balance", {}, api_key, api_secret)
+    return data.get("data") or {}
 
 
 def _htx_financial_records_raw(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list:
     """
-    POST /linear-swap-api/v3/swap_financial_record, type="30,31" (30 —
-    funding fee-income, 31 — funding fee-expenditure, ПОДТВЕРЖДЕНО офиц.
-    документацией — расшифровка типов прямо в описании параметра "type").
-    Лимиты API (тоже из офиц. документации): окно ОДНОГО запроса — не
-    длиннее 48 часов, глубина — не больше 90 дней от текущего момента (см.
-    _EXCHANGE_WINDOW_DAYS["htx"]/_EXCHANGE_MAX_LOOKBACK_DAYS["htx"] ниже) —
-    разбиение на окна уже сделано на уровне fetch_htx/fetch_all_windowed,
-    эта функция просто один запрос (возможно, с пагинацией по from_id)
-    внутри уже допустимого окна.
+    GET /v5/account/bills, type="30,31" (30 — funding fee-income, 31 —
+    funding fee-expenditure, ПОДТВЕРЖДЕНО офиц. документацией — та же
+    расшифровка типов, что и в старом API). В отличие от старого
+    swap_financial_record, margin_account здесь не параметр вообще —
+    вместо него опциональный margin_mode (см. HTX_MARGIN_MODE выше),
+    contract_code тоже опционален — можно запросить сразу по всем
+    контрактам, не перечисляя их.
 
-    Пагинация: direct="next" — страницы идут в ХРОНОЛОГИЧЕСКОМ порядке (от
-    старых к новым), следующая страница запрашивается с from_id = query_id
-    последней записи предыдущей страницы + 1 (документированное поведение:
-    "If the query direction is next, from_id should be the max query_id in
-    the last query result" — +1, чтобы не задвоить пограничную запись).
-    Останавливаемся, когда страница пуста.
+    Лимиты окна/глубины запроса, что были у старого API (48ч/90 дней),
+    в новой документации явно не переподтверждены (офиц. описание
+    start_time/end_time говорит только про ЗНАЧЕНИЯ ПО УМОЛЧАНИЮ — "now",
+    "(now)-48h" — не про максимум) — оставлены те же консервативные
+    значения (_EXCHANGE_WINDOW_DAYS["htx"]/_EXCHANGE_MAX_LOOKBACK_DAYS
+    ["htx"] ниже) на случай, если лимит просто не обновили в тексте;
+    лишние запросы при их отсутствии не страшны, в отличие от ошибки
+    из-за слишком широкого окна.
+
+    Пагинация — ОФСЕТНАЯ по id записи (не по отдельному query_id, как
+    раньше): direct="next" идёт в хронологическом порядке (от старых к
+    новым), следующая страница запрашивается с from = id последней записи
+    предыдущей страницы + 1 (та же идея "+1, чтобы не задвоить
+    пограничную запись", что и в старом API). limit — максимум 100 за
+    страницу (ПОДТВЕРЖДЕНО офиц. документацией).
     """
     records = []
     from_id = None
     while True:
-        body = {
-            "mar_acct": HTX_CROSS_MARGIN_ACCOUNT,
+        params = {
+            "margin_mode": HTX_MARGIN_MODE,
             "type": "30,31",
             "start_time": start_ms,
             "end_time": end_ms,
             "direct": "next",
+            "limit": "100",
         }
         if from_id is not None:
-            body["from_id"] = from_id
-        data = _htx_signed_post("/linear-swap-api/v3/swap_financial_record", body, api_key, api_secret)
+            params["from"] = str(from_id)
+        data = _htx_signed_get("/v5/account/bills", params, api_key, api_secret)
         page = data.get("data") or []
         if not page:
             break
         records.extend(page)
-        from_id = max(r["query_id"] for r in page) + 1
-        if len(page) < 2:  # нет документированного page size — страница из 1 записи почти наверняка последняя
+        from_id = max(int(r["id"]) for r in page) + 1
+        if len(page) < 100:
             break
     return records
 
@@ -1565,12 +1586,15 @@ def fetch_htx(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list
     Знак funding НЕ берётся из сырого поля "amount" как есть (в отличие от
     большинства остальных бирж) — офиц. документация подтверждает только
     РАЗДЕЛЕНИЕ на два типа (30 — income, 31 — expenditure), но не сам знак
-    числа в ответе (пример в доках — для другого типа, 5, не 30/31). Чтобы
+    числа в ответе (пример в доках — для другого типа, 15, не 30/31). Чтобы
     не полагаться на непроверенное предположение о знаке в финансовом коде
     (см. CLAUDE.md), знак выставляется здесь ЯВНО по типу записи: income
     (30) — всегда положительный, expenditure (31) — всегда отрицательный,
     независимо от знака в самом "amount". Это безопаснее даже если
     предположение о знаке исходного "amount" окажется неверным.
+
+    "type" в ответе v5 — СТРОКА ("30"/"31"), не число, как было в v1/v3
+    (ПОДТВЕРЖДЕНО офиц. примером ответа — "type": "15" в кавычках).
     """
     raw = _htx_financial_records_raw(api_key, api_secret, start_ms, end_ms)
     records = []
@@ -1579,10 +1603,10 @@ def fetch_htx(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list
             amount = abs(float(r["amount"]))
         except (TypeError, ValueError, KeyError):
             continue
-        signed = amount if r.get("type") == 30 else -amount
+        signed = amount if r.get("type") == "30" else -amount
         records.append({
             "symbol": r.get("contract_code"), "payment": signed,
-            "asset": r.get("asset", "USDT"), "time_ms": int(r["ts"]),
+            "asset": r.get("currency", "USDT"), "time_ms": int(r["created_time"]),
         })
     return records
 
@@ -1735,8 +1759,12 @@ _EXCHANGE_WINDOW_DAYS = {
     # долго открытой позиции fetch_dydx будет листать огромное число
     # страниц внутри одного окна (funding раз в час — до 720 записей/мес).
     "dydx": 30,
-    # HTX — ПОДТВЕРЖДЕНО офиц. документацией (swap_financial_record):
-    # "maximum query window size is 48 hours" — ровно 2 суток, целое число.
+    # HTX — старый лимит API (swap_financial_record v3, уже отключённого —
+    # см. докстринг секции "Получение данных с HTX"): "maximum query window
+    # size is 48 hours". Новая документация (v5/account/bills) явно не
+    # переподтверждает этот максимум (говорит только про умолчания), но
+    # оставлено то же консервативное значение — безопаснее лишних запросов,
+    # чем угадать, что лимит сняли, и словить ошибку.
     "htx": 2,
 }
 
@@ -1750,9 +1778,10 @@ _EXCHANGE_WINDOW_DAYS = {
 # границу лимита по факту исполнения запроса, а не по факту его расчёта.
 _EXCHANGE_MAX_LOOKBACK_DAYS = {
     "gate": 179,
-    # HTX — ПОДТВЕРЖДЕНО офиц. документацией (swap_financial_record):
-    # "query window shift should be within past 90 days" — на 1 день
-    # меньше официального лимита "про запас", см. комментарий выше.
+    # HTX — старый лимит API ("query window shift should be within past
+    # 90 days", см. комментарий в _EXCHANGE_WINDOW_DAYS выше про то, что
+    # новая документация его явно не переподтверждает) — на 1 день меньше
+    # "про запас", тот же приём, что и для Gate.
     "htx": 89,
 }
 

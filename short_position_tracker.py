@@ -281,14 +281,16 @@ def _fetch_dydx_open_shorts(secrets: dict) -> list:
 
 def _fetch_htx_open_shorts(secrets: dict) -> list:
     """
-    HTX (как Gate/Aster/Lighter) не отдаёт точное время открытия позиции —
-    только cost_open (среднюю цену). direction == "sell" — шорт (офиц.
-    документация HTX usdt_swap: direction — "buy":long "sell":short, см.
-    докстринг модуля про остальные биржи). volume — в КОНТРАКТАХ, не в
-    монетах (тот же случай, что у MEXC holdVol) — домножается на
-    contract_size, иначе объём не совпал бы со спот-покупкой при сверке
-    (_qty_matches). НЕ ПРОВЕРЕНО на реальном ответе API (нет доступа к
-    аккаунту из этой среды разработки).
+    HTX теперь на новом /v5/trade/position/opens (см. докстринг
+    funding_report._htx_positions_raw про миграцию) — в отличие от старого
+    API, здесь ЕСТЬ created_time (точное время открытия). direction ==
+    "sell" — шорт (та же конвенция, что и раньше, см. докстринг модуля про
+    остальные биржи), поле не переименовано миграцией. volume — в
+    КОНТРАКТАХ, не в монетах (тот же случай, что у MEXC holdVol) —
+    домножается на contract_size, иначе объём не совпал бы со спот-
+    покупкой при сверке (_qty_matches). Цена входа — open_avg_price (было
+    cost_open в старом API). НЕ ПРОВЕРЕНО на реальном ответе API (нет
+    доступа к аккаунту из этой среды разработки).
     """
     items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
         secrets["htx_api_key"], secrets["htx_api_secret"],
@@ -298,10 +300,12 @@ def _fetch_htx_open_shorts(secrets: dict) -> list:
         volume = float(p.get("volume", 0) or 0)
         if p.get("direction") == "sell" and volume > 0:
             contract_size = _fetch_htx_contract_size(p["contract_code"])
-            price = p.get("cost_open")
+            price = p.get("open_avg_price")
+            created_time = p.get("created_time")
             out.append({
                 "symbol": p["contract_code"], "qty": volume * contract_size,
-                "entry_time_ms": None, "time_is_exact": False,
+                "entry_time_ms": int(created_time) if created_time else None,
+                "time_is_exact": created_time is not None,
                 "price": float(price) if price else None,
             })
     return out

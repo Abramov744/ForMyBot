@@ -61,14 +61,16 @@ snapshot ниже), unrealized = сумма unrealizedPnl по открытым 
 пока нет ни в этом алерте, ни в /rates — Indexer не отдаёт её напрямую
 (см. README).
 
-HTX — margin_base = margin_static ("Static Margin" — капитал БЕЗ floating
-PnL, тот же смысл, что cashBalance+positionMargin у MEXC), unrealized =
-profit_unreal. Оба поля — часть одного ответа POST /linear-swap-api/v1/
-swap_cross_account_info (cross-режим, единственный поддерживаемый) и
-ОФИЦИАЛЬНО задокументированы раздельно друг от друга — вычитать/
-складывать вручную, как для MEXC, не требуется. НЕ ПРОВЕРЕНО на реальном
-счёте (нет доступа к аккаунту из этой среды разработки) — первый реальный
-алерт по HTX стоит сверить с суммами на экране самого приложения HTX.
+HTX — GET /v5/account/balance (новый API, см. докстринг funding_report.
+_htx_cross_account_raw про миграцию со старого /linear-swap-api/v1/
+swap_cross_account_info — тот отключён, реальный случай 19.10.2026).
+margin_base = equity - profit_unreal (на каждую валюту из "details") —
+в новом API нет готового поля "статический капитал без PnL" (margin_static
+было в старом), поэтому вычитается вручную, в отличие от предыдущей
+версии. equity/profit_unreal у HTX включают cross и isolated вперемешку
+— для этого бота не проблема (используется только cross). НЕ ПРОВЕРЕНО
+на реальном счёте — первый реальный алерт по HTX стоит сверить с суммами
+на экране приложения HTX.
 
 Алерт срабатывает, когда unrealized ОТРИЦАТЕЛЕН и его модуль достиг
 MARGIN_ALERT_THRESHOLD (0.70 = 70%) от margin_base:
@@ -199,27 +201,39 @@ def _dydx_margin_snapshot(secrets: dict) -> list:
 
 def _htx_margin_snapshot(secrets: dict) -> list:
     """
-    margin_base = margin_static ("Static Margin" — капитал БЕЗ floating
-    PnL, тот же смысл, что cashBalance+positionMargin у MEXC / total у
-    Gate), unrealized = profit_unreal — оба поля ОФИЦИАЛЬНО
-    задокументированы РАЗДЕЛЬНО (margin_static и profit_unreal — соседние,
-    но разные поля в описании ответа swap_cross_account_info), вычитать/
-    складывать вручную не нужно, в отличие от MEXC. Валюта — margin_asset
-    ("USDT" для единственного поддерживаемого margin_account, см.
-    funding_report.HTX_CROSS_MARGIN_ACCOUNT). НЕ ПРОВЕРЕНО на реальном
-    счёте (нет доступа к аккаунту из этой среды разработки).
+    HTX перешла на новый /v5/account/balance (см. докстринг
+    funding_report._htx_cross_account_raw про полную историю миграции) —
+    структура ответа изменилась: один объект на аккаунт, разбивка по
+    валютам в "details", без отдельного поля "статический капитал без
+    PnL" (margin_static), которое было в старом API. margin_base
+    вычисляется как equity - profit_unreal на каждую валюту (та же идея,
+    что и раньше — "эквити минус то, что в нём floating", просто без
+    готового поля под неё). per-currency equity/profit_unreal у HTX
+    включают ОБЕ маржи (cross и isolated) вперемешку — отдельного
+    cross-only среза в ответе нет; для этого бота это не проблема на
+    практике (поддерживается только cross margin, isolated не
+    используется — см. докстринг _htx_cross_account_raw), но если
+    когда-нибудь появится isolated-позиция, margin_base/unrealized будут
+    завышены на её часть. НЕ ПРОВЕРЕНО на реальном счёте (нет доступа к
+    аккаунту из этой среды разработки) — первый реальный алерт по HTX
+    стоит явно сверить с суммами на экране приложения HTX.
     """
     account = _cached_raw_positions("htx:account", lambda: _htx_cross_account_raw(
         secrets["htx_api_key"], secrets["htx_api_secret"],
     ))
-    margin_base = float(account.get("margin_static", 0) or 0)
-    if margin_base <= 0:
-        return []
-    return [{
-        "currency": account.get("margin_asset", "USDT"),
-        "margin_base": margin_base,
-        "unrealized": float(account.get("profit_unreal", 0) or 0),
-    }]
+    out = []
+    for d in account.get("details", []):
+        equity = float(d.get("equity", 0) or 0)
+        unrealized = float(d.get("profit_unreal", 0) or 0)
+        margin_base = equity - unrealized
+        if margin_base <= 0:
+            continue
+        out.append({
+            "currency": d.get("currency", "USDT"),
+            "margin_base": margin_base,
+            "unrealized": unrealized,
+        })
+    return out
 
 
 _MARGIN_FETCHERS = {
