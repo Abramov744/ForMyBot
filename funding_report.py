@@ -1494,6 +1494,26 @@ def fetch_htx_open_symbols(api_key: str, api_secret: str) -> dict:
 HTX_CROSS_MARGIN_ACCOUNT = "USDT"
 
 
+def _htx_cross_account_raw(api_key: str, api_secret: str) -> dict:
+    """
+    POST /linear-swap-api/v1/swap_cross_account_info, margin_account="USDT"
+    (единственный поддерживаемый margin_account для cross-режима, см.
+    HTX_CROSS_MARGIN_ACCOUNT выше) — отдаёт margin_balance (эквити, С
+    учётом floating PnL), margin_static ("Static Margin" — капитал БЕЗ
+    floating PnL, ПОДТВЕРЖДЕНО офиц. документацией: отдельное от
+    margin_balance поле прямо в описании ответа), profit_unreal
+    (нереализованный PnL). Общий источник для
+    margin_alerts._htx_margin_snapshot. НЕ ПРОВЕРЕНО на реальном ответе
+    API (нет доступа к аккаунту из этой среды разработки).
+    """
+    data = _htx_signed_post(
+        "/linear-swap-api/v1/swap_cross_account_info",
+        {"margin_account": HTX_CROSS_MARGIN_ACCOUNT}, api_key, api_secret,
+    )
+    items = data.get("data") or []
+    return items[0] if items else {}
+
+
 def _htx_financial_records_raw(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list:
     """
     POST /linear-swap-api/v3/swap_financial_record, type="30,31" (30 —
