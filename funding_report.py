@@ -702,6 +702,44 @@ def fetch_dydx_open_symbols(address: str, subaccount_number: str) -> dict:
     return out
 
 
+def fetch_dydx_net_funding(address: str, subaccount_number: str) -> dict:
+    """
+    {symbol: netFunding} — суммарный funding ТЕКУЩЕЙ открытой позиции,
+    ПОДТВЕРЖДЕНО офиц. схемой Indexer API (api-documentation.md в
+    dydxprotocol/v4-chain): объект каждой позиции в openPerpetualPositions
+    содержит готовое поле "netFunding" (соседнее с "sumOpen"/"sumClose"/
+    "realizedPnl" — то же место, где indexer сам ведёт накопительный учёт
+    по позиции), а не только через историю /v4/fundingPayments.
+
+    РЕАЛЬНЫЙ СЛУЧАЙ, из-за которого это поле стали использовать: столбец P
+    в Google Sheet для SEI-USD показывал $3.19 (ручная сумма записей
+    fundingPayments с момента открытия, см. старую версию
+    sheets_sync.compute_funding_total), а в самом интерфейсе dYdX у той же
+    позиции значилось $2.23 — РАСХОЖДЕНИЕ. netFunding — то самое число,
+    которое показывает официальный интерфейс (тот же Indexer, та же
+    позиция), поэтому для "funding с момента открытия позиции" оно
+    используется вместо ручного суммирования fundingPayments — см.
+    sheets_sync.compute_funding_total и fetch_all_time_open_positions
+    ниже. Ручное суммирование по /v4/fundingPayments по-прежнему
+    используется, но только для ПРОИЗВОЛЬНОГО периода (например, "за
+    неделю" в /report и /calendar) — там netFunding не подходит, он даёт
+    только "с момента открытия", без верхней границы.
+
+    Делит cache-ключ "dydx" с fetch_dydx_open_symbols через
+    _cached_raw_positions (TTL 15с) — вызовы подряд не увеличивают число
+    запросов к Indexer.
+    """
+    subaccount = _cached_raw_positions(
+        "dydx", lambda: _dydx_subaccount_raw(address, subaccount_number)
+    )
+    out = {}
+    for market, pos in subaccount.get("openPerpetualPositions", {}).items():
+        net_funding = pos.get("netFunding")
+        if net_funding not in (None, ""):
+            out[market] = float(net_funding)
+    return out
+
+
 def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int) -> list:
     """
     Funding-записи с dYdX за период [start_ms, end_ms] — GET /v4/
@@ -2005,21 +2043,20 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_times = fetch_dydx_open_symbols(secrets["dydx_address"], secrets["dydx_subaccount_number"])
             if open_times:
-                # Как Bybit/MEXC — точное время открытия прямо из API
-                # (createdAt, см. fetch_dydx_open_symbols), без доп.
-                # подстраховки через _trim_open_position_records: в
-                # отличие от Bybit, createdAt у dYdX — время именно
-                # ТЕКУЩЕЙ открытой позиции, не "залипающее" поле.
-                earliest_ms = min(t for t in open_times.values() if t is not None)
-                fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
-                records = _fetch_in_windows(
-                    lambda s, e: fetch_dydx(secrets["dydx_address"], secrets["dydx_subaccount_number"], s, e),
-                    _EXCHANGE_WINDOW_DAYS["dydx"], fetch_start_ms, now_ms,
-                )
+                # Раньше здесь (как и для Bybit/MEXC/KuCoin) вручную
+                # суммировались сырые записи /v4/fundingPayments с момента
+                # открытия — но у dYdX indexer уже САМ ведёт этот накопи-
+                # тельный итог прямо на позиции (netFunding — см. докстринг
+                # fetch_dydx_net_funding: реальный случай, когда эта ручная
+                # сумма разошлась с тем, что показывает интерфейс dYdX).
+                # Синтетическая запись на символ — чтобы формат результата
+                # остался совместим с build_open_positions_report ниже
+                # (который просто группирует по symbol/payment/asset, как
+                # для остальных бирж).
+                net_funding = fetch_dydx_net_funding(secrets["dydx_address"], secrets["dydx_subaccount_number"])
                 records = [
-                    r for r in records
-                    if r.get("symbol") in open_times and open_times[r["symbol"]] is not None
-                    and r.get("time_ms", 0) >= open_times[r["symbol"]]
+                    {"symbol": symbol, "payment": net_funding.get(symbol, 0.0), "asset": "USDC"}
+                    for symbol in open_times
                 ]
                 results["dydx"] = (records, None)
         except Exception as e:
