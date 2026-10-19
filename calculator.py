@@ -62,15 +62,16 @@ _EXACT_OPEN_TIME_FIELDS = {
     # которое fetch_dydx сама добавляет в каждую запись (см. её докстринг
     # в funding_report.py), уже в мс, как и у остальных трёх здесь.
     "dydx": "time_ms",
+    # HTX — после перехода на новый /v5/ API (см. докстринг funding_report.
+    # fetch_htx_open_symbols про миграцию) тоже отдаёт ТОЧНОЕ время
+    # открытия (created_time) — раньше, под старый API, был в
+    # _CONTINUOUS_OPEN_TIME_FIELDS ниже, теперь в этой категории.
+    "htx": "time_ms",
 }
 _CONTINUOUS_OPEN_TIME_FIELDS = {
     "aster": ("time", "ms"),
     "lighter": ("timestamp", "s"),
     "gate": ("time", "s"),
-    # HTX, как Aster/Lighter/Gate, не отдаёт точное время открытия позиции
-    # (см. funding_report.fetch_htx_open_symbols) — "time_ms", поле,
-    # которое fetch_htx сама добавляет в каждую запись, уже в мс.
-    "htx": ("time_ms", "ms"),
 }
 
 
@@ -95,10 +96,11 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
                 "dydx": lambda: fetch_dydx_open_symbols(
                     secrets["dydx_address"], secrets["dydx_subaccount_number"],
                 ),
+                "htx": lambda: fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"]),
             }.get(exchange)
             required_key = {
                 "bybit": "bybit_api_key", "mexc": "mexc_api_key", "kucoin": "kucoin_api_key",
-                "dydx": "dydx_address",
+                "dydx": "dydx_address", "htx": "htx_api_key",
             }[exchange]
             if required_key not in secrets or fetch_open is None:
                 return records
@@ -118,11 +120,8 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
                     secrets["lighter_account_index"], secrets["lighter_auth_token"],
                 ),
                 "gate": lambda: fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"]),
-                "htx": lambda: fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"]),
             }.get(exchange)
-            required_key = {
-                "aster": "user", "lighter": "lighter_account_index", "gate": "gate_api_key", "htx": "htx_api_key",
-            }[exchange]
+            required_key = {"aster": "user", "lighter": "lighter_account_index", "gate": "gate_api_key"}[exchange]
             if required_key not in secrets or fetch_open is None:
                 return records
             open_symbols = fetch_open()

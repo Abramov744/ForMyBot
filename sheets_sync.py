@@ -117,12 +117,13 @@ from funding_report import (
 
 # Биржи с точным временем открытия позиции (используется как старт периода
 # напрямую) — те же, что и в calculator._trim_to_current_open_position.
-# dYdX — тоже точное время (createdAt), см. там же.
-_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin", "dydx")
+# dYdX — тоже точное время (createdAt), см. там же. HTX — после перехода
+# на новый /v5/ API (см. докстринг funding_report.fetch_htx_open_symbols
+# про миграцию) тоже отдаёт точное время (created_time); под старым API
+# отдавала только приближённое — была в _CONTINUOUS_EXCHANGES ниже.
+_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin", "dydx", "htx")
 # Биржи без точного времени — старт периода берётся по OPEN_POSITIONS_LOOKBACK_DAYS.
-# HTX, как Aster/Lighter/Gate, не отдаёт точное время открытия позиции
-# (см. fetch_htx_open_symbols в funding_report.py).
-_CONTINUOUS_EXCHANGES = ("aster", "lighter", "gate", "htx")
+_CONTINUOUS_EXCHANGES = ("aster", "lighter", "gate")
 SUPPORTED_EXCHANGES = _EXACT_TIME_EXCHANGES + _CONTINUOUS_EXCHANGES
 
 # Данные начинаются с этой строки (см. структуру таблицы: строки 1-7 —
@@ -267,10 +268,9 @@ def build_open_symbol_index(secrets: dict) -> dict:
 
     if "htx_api_key" in secrets:
         try:
-            # fetch_htx_open_symbols уже отдаёт {symbol: None} — точного
-            # времени открытия нет (см. _CONTINUOUS_EXCHANGES выше), доп.
-            # обёртка не нужна (в отличие от aster/lighter/gate, которые
-            # отдают set, а не dict).
+            # fetch_htx_open_symbols уже отдаёт {symbol: open_time_ms} —
+            # как и у Bybit/MEXC/dYdX (см. _EXACT_TIME_EXCHANGES выше),
+            # доп. обёртка не нужна.
             index["htx"] = fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"])
         except Exception as e:
             print(f"[sheets_sync/htx] Не удалось получить открытые позиции: {e}", flush=True)
