@@ -77,6 +77,18 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     (определение шорта) в short_position_tracker.py. Первый реальный алерт
     по Lighter стоит явно сверить с тем, что показывает само приложение
     Lighter, прежде чем полностью доверять порогу.
+  - HTX    — GET /v5/trade/position/opens: open_avg_price, liquidation_price
+    — оба поля прямо в ответе (в отличие от старого API, где
+    liquidation_price не было вообще — см. README). mark_price берётся
+    отдельным ПУБЛИЧНЫМ (без ключей) запросом GET /index/market/history/
+    linear_swap_mark_price_kline?period=1min&size=1 — последняя (самая
+    свежая) 1-минутная свеча цены маркировки, поле "close" (подтверждено
+    офиц. docs huobiapi.github.io/docs/usdt_swap — готового тикера с
+    ЕДИНСТВЕННЫМ текущим значением mark price нет, только kline; с
+    size=1 это фактически то же самое, с точностью до конца текущей
+    минуты). Этот эндпоинт НЕ затронут миграцией на v5 (рыночные данные —
+    см. README). volume — в КОНТРАКТАХ, но для цены (не объёма) это не
+    имеет значения, contract_size домножать не нужно.
   - dYdX — ЕДИНСТВЕННАЯ биржа из всех, где liq_price НЕ приходит готовым
     полем в ответе API вообще — Indexer его не отдаёт никак. Вместо
     отказа от поддержки вычисляется по ОФИЦИАЛЬНО ЗАДОКУМЕНТИРОВАННОЙ
@@ -107,7 +119,9 @@ from funding_report import (
     _cached_raw_positions,
     _aster_positions_raw, _bybit_positions_raw, _gate_positions_raw,
     _kucoin_positions_raw, _mexc_positions_raw, _lighter_positions_raw,
-    _get_mexc_proxies,
+    _htx_positions_raw,
+    _get_mexc_proxies, _get_htx_proxies,
+    HTX_BASE_URL,
     fetch_lighter_markets, fetch_lighter_mark_prices,
     _dydx_subaccount_raw, _dydx_market_info, _dydx_mark_price,
     load_secrets, send_telegram_broadcast,
@@ -118,7 +132,7 @@ LIQUIDATION_ALERT_THRESHOLD = float(os.environ.get("LIQUIDATION_ALERT_THRESHOLD"
 
 _LABELS = {
     "aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate",
-    "kucoin": "KuCoin", "lighter": "Lighter", "dydx": "dYdX",
+    "kucoin": "KuCoin", "lighter": "Lighter", "dydx": "dYdX", "htx": "HTX",
 }
 
 
@@ -318,6 +332,41 @@ def _dydx_liquidation_positions(secrets: dict) -> list:
     return out
 
 
+def _htx_mark_price(contract_code: str) -> float:
+    resp = requests.get(
+        f"{HTX_BASE_URL}/index/market/history/linear_swap_mark_price_kline",
+        params={"contract_code": contract_code, "period": "1min", "size": 1},
+        timeout=15, proxies=_get_htx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    candles = data.get("data") or []
+    if not candles:
+        raise RuntimeError(f"HTX mark_price_kline: нет данных по {contract_code}: {data}")
+    return float(candles[-1]["close"])
+
+
+def _htx_liquidation_positions(secrets: dict) -> list:
+    items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
+        secrets["htx_api_key"], secrets["htx_api_secret"],
+    ))
+    out = []
+    for p in items:
+        if p.get("direction") != "sell" or float(p.get("volume", 0) or 0) <= 0:
+            continue
+        entry, liq = p.get("open_avg_price"), p.get("liquidation_price")
+        if not entry or not liq:
+            continue
+        symbol = p["contract_code"]
+        try:
+            mark = _htx_mark_price(symbol)
+        except Exception as e:
+            print(f"[liquidation/htx] Не удалось получить текущую цену {symbol}: {e}")
+            continue
+        out.append({"symbol": symbol, "entry_price": float(entry), "liq_price": float(liq), "mark_price": mark})
+    return out
+
+
 # Только биржи с подтверждённым полем цены ликвидации в ответе — см. докстринг
 # модуля (Lighter добавлен 06.10.2026, с оговоркой про непроверенность поля;
 # dYdX добавлен позже — единственная биржа, где цена ликвидации не поле
@@ -330,6 +379,7 @@ _LIQUIDATION_POSITION_FETCHERS = {
     "mexc": (_mexc_liquidation_positions, "mexc_api_key"),
     "lighter": (_lighter_liquidation_positions, "lighter_account_index"),
     "dydx": (_dydx_liquidation_positions, "dydx_address"),
+    "htx": (_htx_liquidation_positions, "htx_api_key"),
 }
 
 
