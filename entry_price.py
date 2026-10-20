@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.parse
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -40,7 +40,9 @@ from funding_report import (
     _get_proxies,
     _get_mexc_proxies,
     _get_gate_proxies,
+    _get_htx_proxies,
     _kucoin_signed_get,
+    _htx_sign,
     _dydx_subaccount_raw,
     _fetch_in_windows,
     _trim_to_continuous_run,
@@ -607,6 +609,76 @@ def _fetch_kucoin_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
     ]
 
 
+# Спот-API HTX — ОТДЕЛЬНЫЙ хост (api.huobi.pro, не api.hbdm.com у фьючерсов),
+# та же классическая схема подписи (funding_report._htx_sign с явным host —
+# см. её докстринг и balances.py, где это уже используется для баланса).
+# _htx_spot_account_id НЕ импортируется из balances.py (там уже есть
+# идентичная функция) — balances.py сам импортирует entry_price._etherscan_get,
+# обратный импорт создал бы циклическую зависимость между модулями.
+_HTX_SPOT_HOST = "api.huobi.pro"
+_htx_spot_account_id_cache: dict = {}
+
+
+def _htx_spot_signed_get(path: str, params: dict, api_key: str, api_secret: str) -> dict:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    full_params = dict(params)
+    full_params.update({
+        "AccessKeyId": api_key.strip(),
+        "SignatureMethod": "HmacSHA256",
+        "SignatureVersion": "2",
+        "Timestamp": timestamp,
+    })
+    signature = _htx_sign("GET", path, full_params, api_secret.strip(), host=_HTX_SPOT_HOST)
+    full_params["Signature"] = signature
+    resp = requests.get(
+        f"https://{_HTX_SPOT_HOST}{path}", params=full_params, timeout=30, proxies=_get_htx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"HTX spot {path} error: {data}")
+    return data
+
+
+def _htx_spot_account_id(api_key: str, api_secret: str) -> str:
+    if api_key in _htx_spot_account_id_cache:
+        return _htx_spot_account_id_cache[api_key]
+    data = _htx_spot_signed_get("/v1/account/accounts", {}, api_key, api_secret)
+    for acc in data.get("data") or []:
+        if acc.get("type") == "spot":
+            account_id = str(acc["id"])
+            _htx_spot_account_id_cache[api_key] = account_id
+            return account_id
+    raise RuntimeError(f"HTX spot: аккаунт типа 'spot' не найден среди {data.get('data')}")
+
+
+def _fetch_htx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
+    """
+    GET /v1/order/matchresults ("Search Match Results") — ПОДТВЕРЖДЕНО
+    офиц. документацией (huobiapi.github.io/docs/spot/v1/en). symbol — в
+    спот-формате, слитно и в нижнем регистре ("btcusdt", см.
+    _SPOT_TRADE_FETCHERS ниже). "types" фильтрует направление+тип ордера
+    сразу (buy-market/buy-limit/... или sell-*) — официально
+    задокументированный список значений, не угадывание. Максимальное окно
+    запроса — 48 часов (сдвигаемое в пределах 120 дней) — не ограничение
+    этого кода, а официальный лимит эндпоинта; WINDOW_MINUTES_EXACT/
+    WINDOW_MINUTES_APPROX выше в разы меньше, так что на практике не
+    задевается.
+    """
+    api_key = secrets["htx_api_key"].strip()
+    api_secret = secrets["htx_api_secret"].strip()
+    types = ",".join(f"{side}-{t}" for t in ("market", "limit", "ioc", "limit-maker", "stop-limit"))
+    data = _htx_spot_signed_get("/v1/order/matchresults", {
+        "symbol": symbol, "types": types,
+        "start-time": str(start_ms), "end-time": str(end_ms), "size": "500",
+    }, api_key, api_secret)
+    return [
+        {"price": float(t["price"]), "qty": float(t["filled-amount"]), "side": side}
+        for t in (data.get("data") or [])
+        if t.get("price") and t.get("filled-amount")
+    ]
+
+
 # ── Uniswap (любая EVM-сеть) — поиск покупки через историю переводов кошелька ─
 #
 # У Uniswap/блокчейна нет REST-эндпоинта "история моих сделок по паре", как у
@@ -831,6 +903,7 @@ _SPOT_TRADE_FETCHERS = {
     "mexc":  (lambda secrets, symbol, s, e, side: _fetch_mexc_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
     "gate":  (lambda secrets, symbol, s, e, side: _fetch_gate_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}_{quote}"),
     "kucoin": (lambda secrets, symbol, s, e, side: _fetch_kucoin_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
+    "htx": (lambda secrets, symbol, s, e, side: _fetch_htx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}".lower()),
     # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
     # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
     # _search_spot_trade), а не через этот реестр из (fetch_fn, symbol_fn) на
@@ -846,6 +919,7 @@ _SPOT_EXCHANGE_SECRET_KEY = {
     "mexc": "mexc_api_key",
     "gate": "gate_api_key",
     "kucoin": "kucoin_api_key",
+    "htx": "htx_api_key",
 }
 
 
