@@ -103,6 +103,8 @@ from funding_report import (
     _lighter_account_raw,
     _mexc_positions_raw,
     _gate_positions_raw,
+    _htx_positions_raw,
+    _htx_cross_account_raw,
     _dydx_subaccount_raw,
     _dydx_market_info,
     _dydx_mark_price,
@@ -809,6 +811,50 @@ def _dydx_margin_pnl_positions(secrets: dict) -> list:
     return out
 
 
+def _htx_margin_base(secrets: dict) -> float:
+    """
+    Та же формула, что и в margin_alerts._htx_margin_snapshot: margin_base
+    = equity - profit_unreal на каждую валюту счёта (equity у HTX уже
+    включает floating PnL, готового "статического" поля нет — см.
+    докстринг margin_alerts.py/README про миграцию на v5). Суммируется по
+    всем валютам (на практике почти всегда только USDT).
+    """
+    account = _cached_raw_positions("htx:account", lambda: _htx_cross_account_raw(
+        secrets["htx_api_key"], secrets["htx_api_secret"],
+    ))
+    return sum(
+        float(d.get("equity", 0) or 0) - float(d.get("profit_unreal", 0) or 0)
+        for d in account.get("details", [])
+    )
+
+
+def _htx_margin_pnl_positions(secrets: dict) -> list:
+    """
+    entry/liq/mark — тот же сырой ответ позиций, что и в
+    liquidation_alerts._htx_liquidation_positions (та же кэшированная
+    "htx" через _cached_raw_positions, доп. запроса нет), profit_unreal —
+    готовый долларовый PnL позиции прямо в том же ответе (как у Gate/
+    Lighter/dYdX — не нужно домножать на contract_size, как у MEXC).
+    """
+    items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
+        secrets["htx_api_key"], secrets["htx_api_secret"],
+    ))
+    out = []
+    for p in items:
+        if p.get("direction") != "sell" or float(p.get("volume", 0) or 0) <= 0:
+            continue
+        entry, mark = p.get("open_avg_price"), p.get("mark_price")
+        if not entry or not mark:
+            continue
+        out.append({
+            "symbol": p["contract_code"],
+            "entry_price": float(entry),
+            "mark_price": float(mark),
+            "pnl_dollar": float(p.get("profit_unreal", 0) or 0),
+        })
+    return out
+
+
 # Цена входа/текущая/ЛИКВИДАЦИИ для всех семи бирж — те же position-
 # фетчеры, что уже написаны и проверены для liquidation_alerts.py
 # (переиспользуются через импорт, не копируются заново). Нужны даже для
@@ -839,6 +885,7 @@ _MARGIN_PNL_FETCHERS = {
     "gate": (_gate_margin_pnl_positions, _gate_margin_base),
     "lighter": (_lighter_margin_pnl_positions, _lighter_margin_base),
     "dydx": (_dydx_margin_pnl_positions, _dydx_margin_base),
+    "htx": (_htx_margin_pnl_positions, _htx_margin_base),
 }
 
 

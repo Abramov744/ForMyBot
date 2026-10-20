@@ -78,17 +78,15 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     по Lighter стоит явно сверить с тем, что показывает само приложение
     Lighter, прежде чем полностью доверять порогу.
   - HTX    — GET /v5/trade/position/opens: open_avg_price, liquidation_price
-    — оба поля прямо в ответе (в отличие от старого API, где
-    liquidation_price не было вообще — см. README). mark_price берётся
-    отдельным ПУБЛИЧНЫМ (без ключей) запросом GET /index/market/history/
-    linear_swap_mark_price_kline?period=1min&size=1 — последняя (самая
-    свежая) 1-минутная свеча цены маркировки, поле "close" (подтверждено
-    офиц. docs huobiapi.github.io/docs/usdt_swap — готового тикера с
-    ЕДИНСТВЕННЫМ текущим значением mark price нет, только kline; с
-    size=1 это фактически то же самое, с точностью до конца текущей
-    минуты). Этот эндпоинт НЕ затронут миграцией на v5 (рыночные данные —
-    см. README). volume — в КОНТРАКТАХ, но для цены (не объёма) это не
-    имеет значения, contract_size домножать не нужно.
+    И mark_price — ВСЕ ТРИ прямо в одном ответе (в отличие от старого
+    API, где liquidation_price не было вообще — см. README). mark_price
+    не упомянут в таблице описания полей офиц. докстринга HTX
+    (htx.com/en-us/opend/newApiPages, id 8cb89359-...-19594266bd8), но
+    ПРИСУТСТВУЕТ в её же Success Example ("mark_price": "1197.58") —
+    расхождение самой документации, не наше предположение. Доп. запрос
+    за текущей ценой, в отличие от dYdX, не нужен. volume — в
+    КОНТРАКТАХ, но для цены (не объёма) это не имеет значения,
+    contract_size домножать не нужно.
   - dYdX — ЕДИНСТВЕННАЯ биржа из всех, где liq_price НЕ приходит готовым
     полем в ответе API вообще — Indexer его не отдаёт никак. Вместо
     отказа от поддержки вычисляется по ОФИЦИАЛЬНО ЗАДОКУМЕНТИРОВАННОЙ
@@ -120,8 +118,7 @@ from funding_report import (
     _aster_positions_raw, _bybit_positions_raw, _gate_positions_raw,
     _kucoin_positions_raw, _mexc_positions_raw, _lighter_positions_raw,
     _htx_positions_raw,
-    _get_mexc_proxies, _get_htx_proxies,
-    HTX_BASE_URL,
+    _get_mexc_proxies,
     fetch_lighter_markets, fetch_lighter_mark_prices,
     _dydx_subaccount_raw, _dydx_market_info, _dydx_mark_price,
     load_secrets, send_telegram_broadcast,
@@ -332,21 +329,16 @@ def _dydx_liquidation_positions(secrets: dict) -> list:
     return out
 
 
-def _htx_mark_price(contract_code: str) -> float:
-    resp = requests.get(
-        f"{HTX_BASE_URL}/index/market/history/linear_swap_mark_price_kline",
-        params={"contract_code": contract_code, "period": "1min", "size": 1},
-        timeout=15, proxies=_get_htx_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    candles = data.get("data") or []
-    if not candles:
-        raise RuntimeError(f"HTX mark_price_kline: нет данных по {contract_code}: {data}")
-    return float(candles[-1]["close"])
-
-
 def _htx_liquidation_positions(secrets: dict) -> list:
+    """
+    mark_price — ПРЯМО в ответе /v5/trade/position/opens (подтверждено
+    Success-примером офиц. докстринга HTX, хотя в самой таблице описания
+    полей ответа это поле почему-то не упомянуто — расхождение в
+    документации, а не предположение: поле видно в примере реального
+    JSON-ответа). Отдельный публичный запрос за текущей ценой, в отличие
+    от dYdX, не нужен — тот же сырой ответ позиций даёт entry/liq/mark
+    одним запросом, как у Bybit/Aster/Gate/KuCoin.
+    """
     items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
         secrets["htx_api_key"], secrets["htx_api_secret"],
     ))
@@ -354,16 +346,10 @@ def _htx_liquidation_positions(secrets: dict) -> list:
     for p in items:
         if p.get("direction") != "sell" or float(p.get("volume", 0) or 0) <= 0:
             continue
-        entry, liq = p.get("open_avg_price"), p.get("liquidation_price")
-        if not entry or not liq:
+        entry, liq, mark = p.get("open_avg_price"), p.get("liquidation_price"), p.get("mark_price")
+        if not entry or not liq or not mark:
             continue
-        symbol = p["contract_code"]
-        try:
-            mark = _htx_mark_price(symbol)
-        except Exception as e:
-            print(f"[liquidation/htx] Не удалось получить текущую цену {symbol}: {e}")
-            continue
-        out.append({"symbol": symbol, "entry_price": float(entry), "liq_price": float(liq), "mark_price": mark})
+        out.append({"symbol": p["contract_code"], "entry_price": float(entry), "liq_price": float(liq), "mark_price": float(mark)})
     return out
 
 
