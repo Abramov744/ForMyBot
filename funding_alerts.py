@@ -95,6 +95,8 @@ from funding_report import (
     fetch_gate_open_symbols,
     fetch_kucoin_open_symbols,
     fetch_dydx_open_symbols,
+    fetch_htx_open_symbols,
+    HTX_BASE_URL,
     _cached_raw_positions,
     _lighter_positions_raw,
     _lighter_account_raw,
@@ -109,6 +111,7 @@ from funding_report import (
     _get_gate_proxies,
     _get_kucoin_proxies,
     _get_dydx_proxies,
+    _get_htx_proxies,
 )
 
 ALERT_CHECK_INTERVAL_MINUTES = float(os.environ.get("ALERT_CHECK_INTERVAL_MINUTES", "60"))
@@ -118,6 +121,7 @@ FUNDING_ALERT_THRESHOLD = float(os.environ.get("FUNDING_ALERT_THRESHOLD", "0.0")
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
+    "htx": "HTX",
 }
 
 # Дефолтный интервал выплат (часы), используется только если биржа не
@@ -131,6 +135,11 @@ GATE_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 # документации, но остальные биржи в этом файле тоже на этот случай имеют
 # дефолт, см. остальные константы выше).
 KUCOIN_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
+# HTX — стандартный 8-часовой цикл расчёта (00:00/08:00/16:00 по Сингапуру,
+# GMT+8), подтверждено офиц. docs (раздел FAQ "Settlement"). Публичный
+# эндпоинт swap_funding_rate интервал явно не отдаёт, поэтому дефолт
+# используется всегда (не как запасной вариант, как у остальных бирж выше).
+HTX_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 # У Lighter funding зафиксирован протоколом на "раз в час" для всех рынков
 # без исключений — не запрашивается через API, см. докстринг модуля.
 LIGHTER_FUNDING_INTERVAL_HOURS = 1.0
@@ -227,6 +236,14 @@ def get_open_positions(secrets: dict) -> tuple[dict, set]:
         except Exception as e:
             print(f"[alerts/dydx] Не удалось получить открытые позиции: {e}")
             failed.add("dydx")
+
+    if "htx_api_key" in secrets:
+        try:
+            open_times = fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"])
+            result["htx"] = sorted(open_times.keys())
+        except Exception as e:
+            print(f"[alerts/htx] Не удалось получить открытые позиции: {e}")
+            failed.add("htx")
 
     return result, failed
 
@@ -411,6 +428,31 @@ def _fetch_kucoin_predicted_rate(symbol: str) -> tuple[float, int | None, float]
     return float(d["value"]), next_ms, interval_hours
 
 
+def _fetch_htx_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
+    """
+    GET /linear-swap-api/v1/swap_funding_rate — ПУБЛИЧНЫЙ эндпоинт HTX (без
+    подписи), не затронутый миграцией на v5 (см. докстринг блока HTX в
+    funding_report.py — миграция касалась только приватных интерфейсов).
+
+    funding_rate (не estimated_rate!) — уже зафиксированная ставка на
+    БЛИЖАЙШУЮ выплату (funding_time -> next_funding_time), та же семантика
+    "ставка за следующую выплату", что и у остальных бирж в этом файле.
+    estimated_rate — отдельная, непрерывно обновляемая оценка ТЕКУЩЕГО
+    периода (обновляется раз в минуту) — не то, что нужно здесь.
+    """
+    resp = requests.get(
+        f"{HTX_BASE_URL}/linear-swap-api/v1/swap_funding_rate",
+        params={"contract_code": symbol}, timeout=15, proxies=_get_htx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"HTX swap_funding_rate error: {data}")
+    d = data.get("data") or {}
+    next_ms = int(d["next_funding_time"]) if d.get("next_funding_time") else None
+    return float(d["funding_rate"]), next_ms, HTX_DEFAULT_FUNDING_INTERVAL_HOURS
+
+
 _PREDICTED_RATE_FETCHERS = {
     "aster": _fetch_aster_predicted_rate,
     "bybit": _fetch_bybit_predicted_rate,
@@ -418,6 +460,7 @@ _PREDICTED_RATE_FETCHERS = {
     "gate": _fetch_gate_predicted_rate,
     "lighter": _fetch_lighter_predicted_rate,
     "kucoin": _fetch_kucoin_predicted_rate,
+    "htx": _fetch_htx_predicted_rate,
     # "dydx" добавлен НИЖЕ в файле (_fetch_dydx_predicted_rate определена
     # значительно позже, рядом с остальными dYdX-функциями — см. её
     # регистрацию сразу после определения, иначе NameError при импорте).
