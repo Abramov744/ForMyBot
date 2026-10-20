@@ -54,6 +54,18 @@ check_closed_positions ниже). Раньше эти два случая не �
     ПОДТВЕРЖДЕНО офиц. docs.dydx.xyz/types/order_type) — тоже прямой
     сигнал, цена закрытия (AE) при этом отдельно берётся из /v4/fills
     (там есть явное поле side — надёжнее, чем цена условного ордера).
+  - HTX — надёжно: GET /v5/algo/order/history отдаёт state="effective"
+    (условный ордер реально сработал) и actual_price (фактическая цена
+    срабатывания) прямо в ответе — тоже прямой сигнал, не угадывание.
+    Параметр "type" у этого эндпоинта ОБЯЗАТЕЛЬНЫЙ (нет значения "все
+    типы сразу"), поэтому запрашивается отдельно type="sl" и type="tp"
+    (см. _htx_close_reason). Цена закрытия (AE) — отдельно, через
+    GET /v5/trade/order/details (явное поле side, тот же принцип, что у
+    Bybit/Aster/dYdX). Офиц. страница документации algo/order/history
+    указывает "Signature verification: No", что похоже на ту же
+    неточность документации HTX, что уже встречалась (mark_price в
+    /v5/trade/position/opens, см. README) — запрос всё равно
+    подписывается по общей v5-схеме.
   - MEXC, Gate, Lighter — причина НЕ уточняется в этой версии (см. историю
     решения ниже), но сам факт закрытия по-прежнему алертится — просто без
     пометки SL/TP:
@@ -89,6 +101,7 @@ from funding_report import (
     _get_proxies, _bybit_sign, _aster_sign, _mexc_sign, _gate_sign,
     _get_mexc_proxies, _get_gate_proxies, _get_dydx_proxies, DYDX_INDEXER_BASE_URL,
     LIGHTER_BASE_URL, fetch_lighter_markets,
+    _htx_signed_get,
     load_secrets, send_telegram_broadcast,
 )
 from funding_alerts import get_open_positions, EXCHANGE_LABELS
@@ -234,12 +247,63 @@ def _dydx_close_reason(secrets: dict, symbol: str) -> tuple | None:
     return None
 
 
+# ── HTX: GET /v5/algo/order/history, параметры type=sl/type=tp ───────────────
+
+def _htx_close_reason(secrets: dict, symbol: str) -> tuple | None:
+    """
+    (kind, price) — как у Bybit/Aster/dYdX: прямой сигнал типа условного
+    ордера, не косвенное угадывание по цене (в отличие от Gate, см.
+    докстринг модуля). GET /v5/algo/order/history отдаёт state="effective"
+    (условный ордер реально сработал, а не просто стоял/отменился) и
+    actual_price (фактическая цена срабатывания) ПРЯМО в ответе — но
+    параметр "type" у этого эндпоинта ОБЯЗАТЕЛЬНЫЙ (tp/sl/tpsl/trigger/
+    trailing_stop, нет значения "все типы сразу"), поэтому запрашивается
+    ДВА раза — отдельно type="sl" и type="tp" — и берётся самый недавний
+    (по actual_time) сработавший ордер из обоих ответов. side фильтруется
+    как "buy" (закрытие шорта).
+
+    ОГОВОРКА (как и у dYdX, см. докстринг _dydx_close_reason): официальная
+    страница документации этого эндпоинта указывает "Signature
+    verification: No", хотя это явно приватный эндпоинт аккаунта (Interface
+    permission: Read, в ответе собственные algo_id/relation_order_id) —
+    похоже на ту же неточность документации HTX, что уже встречалась с
+    mark_price (см. README/liquidation_alerts.py) — запрос всё равно
+    подписывается по общей схеме v5 (funding_report._htx_signed_get), это
+    не должно мешать, даже если подпись на самом деле не проверяется.
+    """
+    api_key, api_secret = secrets["htx_api_key"], secrets["htx_api_secret"]
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
+
+    candidates = []  # (actual_time_ms, kind, price)
+    for kind, type_param in (("SL", "sl"), ("TP", "tp")):
+        try:
+            data = _htx_signed_get("/v5/algo/order/history", {
+                "contract_code": symbol, "type": type_param, "states": "effective",
+                "start_time": str(start_ms), "end_time": str(now_ms), "limit": "20",
+            }, api_key, api_secret)
+        except Exception as e:
+            print(f"[sltp/htx/{symbol}] Не удалось получить историю {type_param}-ордеров: {e}")
+            continue
+        for item in data.get("data") or []:
+            if item.get("side") != "buy" or not item.get("actual_price") or not item.get("actual_time"):
+                continue
+            candidates.append((int(item["actual_time"]), kind, float(item["actual_price"])))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    _, kind, price = candidates[0]
+    return (kind, price)
+
+
 # Только биржи, где сигнал SL/TP задокументирован прямо и однозначно —
 # см. докстринг модуля про MEXC/Gate/Lighter.
 _CLOSE_REASON_FETCHERS = {
     "bybit": _bybit_close_reason,
     "aster": _aster_close_reason,
     "dydx": _dydx_close_reason,
+    "htx": _htx_close_reason,
 }
 
 
@@ -551,6 +615,34 @@ def _lighter_close_price(secrets: dict, symbol: str) -> float | None:
     return _vwap(trades)
 
 
+def _htx_close_price(secrets: dict, symbol: str) -> float | None:
+    """
+    GET /v5/trade/order/details ("Get Execution Details") — исполнения
+    (match results) по контракту за период: side, trade_price,
+    trade_volume ПРЯМО в ответе, тот же принцип, что у Bybit/Aster
+    (фильтр по стороне исполнения, а не угадывание, см. докстринг раздела
+    выше). closes — side == "buy" (закрытие шорта).
+
+    Заголовок страницы документации — "(last 3 days)", но Value Range у
+    start_time/end_time в той же таблице указывает "Last 90 days" — то же
+    расхождение внутри документации HTX, что уже встречалось (mark_price,
+    Signature verification у algo/order/history) — не влияет на практике:
+    CLOSE_PRICE_LOOKBACK_MINUTES (по умолчанию 6ч) укладывается в любую
+    из двух трактовок.
+    """
+    api_key, api_secret = secrets["htx_api_key"], secrets["htx_api_secret"]
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(CLOSE_PRICE_LOOKBACK_MINUTES * 60 * 1000)
+    data = _htx_signed_get("/v5/trade/order/details", {
+        "contract_code": symbol, "start_time": str(start_ms), "end_time": str(now_ms), "limit": "100",
+    }, api_key, api_secret)
+    closes = [
+        f for f in (data.get("data") or [])
+        if f.get("side") == "buy" and f.get("trade_price") and f.get("trade_volume")
+    ]
+    return _vwap([(float(f["trade_volume"]), float(f["trade_price"])) for f in closes])
+
+
 # Lighter: причина (SL/TP) НЕ уточняется — _CLOSE_REASON_FETCHERS выше (см.
 # докстринг модуля) всё ещё не нашла надёжного прямого сигнала типа ордера.
 # Цена закрытия (AE) при этом теперь берётся — _lighter_close_price выше,
@@ -564,6 +656,7 @@ _CLOSE_PRICE_FETCHERS = {
     "gate": _gate_close_price,
     "dydx": _dydx_close_price,
     "lighter": _lighter_close_price,
+    "htx": _htx_close_price,
 }
 
 
