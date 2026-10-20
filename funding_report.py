@@ -1422,9 +1422,17 @@ def _get_htx_proxies() -> dict | None:
     return {"http": proxy, "https": proxy}
 
 
-def _htx_sign(method: str, path: str, params: dict, api_secret: str) -> str:
+def _htx_sign(method: str, path: str, params: dict, api_secret: str, host: str = HTX_HOST) -> str:
+    """
+    host по умолчанию — HTX_HOST (api.hbdm.com, фьючерсы). Та же схема
+    подписи используется и для спот-API HTX (api.huobi.pro, см.
+    balances._htx_spot_signed_get) — ПОДТВЕРЖДЕНО офиц. документацией
+    ("The API key is shared for all instruments in Huobi including spot,
+    futures, swap, options", huobiapi.github.io/docs/spot/v1/en) — поэтому
+    host параметризован, а не продублирован отдельной функцией в balances.py.
+    """
     query_string = urllib.parse.urlencode(sorted(params.items()))
-    payload = f"{method}\n{HTX_HOST}\n{path}\n{query_string}"
+    payload = f"{method}\n{host}\n{path}\n{query_string}"
     digest = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     return base64.b64encode(digest).decode("utf-8")
 

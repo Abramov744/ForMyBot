@@ -1099,7 +1099,26 @@ HTX явно их исключает ("with the exception of market data interfa
   `mark_price` не упомянут в таблице описания полей офиц. докстринга HTX,
   но присутствует в её же Success Example — расхождение самой
   документации, подтверждено прямой цитатой примера ответа, не наше
-  предположение.
+  предположение;
+- **сводный баланс** (`balances.py`, `/balances` и `/balance` в Telegram) —
+  фьючерсный (`fetch_htx_futures_balance` — сумма `equity` по валютам
+  счёта, та же формула, что и для PnL/маржи выше, но БЕЗ вычитания
+  `profit_unreal`: здесь нужен полный капитал С floating PnL, а не
+  "статическая" маржа) и спот-баланс. Спот-API HTX — ДРУГОЙ хост
+  (`api.huobi.pro`, не `api.hbdm.com` у фьючерсов), но ТА ЖЕ классическая
+  схема подписи (ПОДТВЕРЖДЕНО офиц. документацией: "The API key is shared
+  for all instruments in Huobi including spot, futures, swap, options") —
+  `funding_report._htx_sign` параметризован host'ом, чтобы не копировать
+  логику подписи заново (`balances._htx_spot_signed_get`). Баланс — через
+  `GET /v1/account/accounts` (чтобы узнать `account-id` типа `"spot"`,
+  кэшируется в памяти процесса — не меняется) + `GET /v1/account/
+  accounts/{id}/balance` (сумма по `type` `"trade"`+`"frozen"` на каждую
+  валюту, тот же принцип, что и у KuCoin). Цена монет на споте — сначала
+  публичный тикер самой HTX (`GET /market/tickers`, `fetch_htx_ticker_
+  prices`), CoinGecko — только как fallback (тот же принцип, что у MEXC/
+  Gate/KuCoin, см. докстринг `price_spot_balances_usd` про коллизию
+  тикеров). НЕ ПРОВЕРЕНО на реальном счёте (нет доступа к аккаунту из
+  этой среды разработки).
 
 Важная деталь для первых трёх пунктов: `volume` у HTX — в КОНТРАКТАХ, не в
 монетах (тот же случай, что у MEXC `holdVol`) — домножается на
@@ -1110,8 +1129,6 @@ HTX явно их исключает ("with the exception of market data interfa
 ПОКА НЕ реализовано (появится по мере следующих запросов, тем же
 способом, что и у dYdX — см. раздел выше):
 - детекция закрытия позиции + цена закрытия/причина SL-TP (`sltp_alerts.py`);
-- сводный баланс (`balances.py`) — ни фьючерсный, ни спот-баланс HTX пока
-  не учитываются;
 - спот-нога (поиск покупки/продажи на HTX для `entry_price.
   _search_spot_entry`/`_search_spot_exit` — автоподбора цены входа/выхода
   и сверки объёма в `short_position_tracker.py`/`sltp_alerts.py`).
