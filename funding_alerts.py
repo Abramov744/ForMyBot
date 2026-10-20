@@ -80,6 +80,7 @@ from liquidation_alerts import (
     _mexc_liquidation_positions,
     _lighter_liquidation_positions,
     _dydx_liquidation_positions,
+    _htx_liquidation_positions,
     _mexc_fair_price,
 )
 from funding_report import (
@@ -824,6 +825,7 @@ _PRICE_FETCHERS = {
     "mexc": _mexc_liquidation_positions,
     "lighter": _lighter_liquidation_positions,
     "dydx": _dydx_liquidation_positions,
+    "htx": _htx_liquidation_positions,
 }
 
 # Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
