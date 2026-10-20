@@ -90,6 +90,7 @@ import json
 import os
 import time
 import urllib.parse
+from datetime import datetime, timezone
 
 import requests
 
@@ -103,8 +104,11 @@ from funding_report import (
     _get_gate_proxies,
     _get_mexc_proxies,
     _get_proxies,
+    _get_htx_proxies,
     _kucoin_signed_get,
     _mexc_sign,
+    _htx_sign,
+    _htx_cross_account_raw,
 )
 
 
@@ -957,6 +961,119 @@ def fetch_lighter_balance(account_index: str) -> float:
     return total
 
 
+def fetch_htx_ticker_prices() -> dict:
+    """GET /market/tickers — публичный (без ключа) эндпоинт спот-рынка HTX,
+    отдаёт последнюю цену сразу по ВСЕМ спот-парам, аналог
+    fetch_mexc_ticker_prices/fetch_gate_ticker_prices/fetch_kucoin_ticker_prices
+    выше. У HTX спот-символы — слитно и в нижнем регистре ("btcusdt"), в
+    отличие от фьючерсных contract_code ("BTC-USDT")."""
+    cache_key = "htx"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get("https://api.huobi.pro/market/tickers", timeout=20, proxies=_get_htx_proxies())
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for t in (data.get("data") or []):
+        symbol = str(t.get("symbol", ""))
+        if symbol.endswith("usdt"):
+            try:
+                prices[symbol[:-4].upper()] = float(t["close"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def fetch_htx_futures_balance(api_key: str, api_secret: str) -> float:
+    """
+    Та же формула, что в margin_alerts._htx_margin_snapshot/funding_alerts.
+    _htx_margin_base, но БЕЗ вычитания profit_unreal — здесь нужен ПОЛНЫЙ
+    текущий капитал счёта (equity УЖЕ включает floating PnL, см. докстринг
+    _htx_cross_account_raw), а не "статическая" маржа без него. Суммируется
+    по всем валютам счёта (на практике почти всегда только USDT).
+    """
+    account = _htx_cross_account_raw(api_key, api_secret)
+    return sum(float(d.get("equity", 0) or 0) for d in account.get("details", []))
+
+
+_HTX_SPOT_HOST = "api.huobi.pro"
+_htx_spot_account_id_cache: dict = {}  # (api_key) -> account_id
+
+
+def _htx_spot_signed_get(path: str, params: dict, api_key: str, api_secret: str) -> dict:
+    """
+    Спот-API HTX — ДРУГОЙ хост (api.huobi.pro, не api.hbdm.com у
+    фьючерсов), но ТА ЖЕ схема подписи (ПОДТВЕРЖДЕНО офиц. документацией:
+    "The API key is shared for all instruments in Huobi including spot,
+    futures, swap, options") — переиспользуется funding_report._htx_sign
+    с явным host, а не копируется заново.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    full_params = dict(params)
+    full_params.update({
+        "AccessKeyId": api_key.strip(),
+        "SignatureMethod": "HmacSHA256",
+        "SignatureVersion": "2",
+        "Timestamp": timestamp,
+    })
+    signature = _htx_sign("GET", path, full_params, api_secret.strip(), host=_HTX_SPOT_HOST)
+    full_params["Signature"] = signature
+
+    resp = requests.get(
+        f"https://{_HTX_SPOT_HOST}{path}", params=full_params, timeout=30, proxies=_get_htx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"HTX spot {path} error: {data}")
+    return data
+
+
+def _htx_spot_account_id(api_key: str, api_secret: str) -> str:
+    """
+    GET /v1/account/accounts — список счетов пользователя (spot/margin/
+    super-margin и т.п.), id нужен для запроса баланса ниже. Кэшируется в
+    памяти процесса на ключ API — id счёта не меняется.
+    """
+    if api_key in _htx_spot_account_id_cache:
+        return _htx_spot_account_id_cache[api_key]
+    data = _htx_spot_signed_get("/v1/account/accounts", {}, api_key, api_secret)
+    for acc in data.get("data") or []:
+        if acc.get("type") == "spot":
+            account_id = str(acc["id"])
+            _htx_spot_account_id_cache[api_key] = account_id
+            return account_id
+    raise RuntimeError(f"HTX spot: аккаунт типа 'spot' не найден среди {data.get('data')}")
+
+
+def fetch_htx_spot_balance(api_key: str, api_secret: str) -> dict:
+    """
+    GET /v1/account/accounts/{id}/balance — список по (currency, type),
+    где type — "trade" (доступно) или "frozen" (в открытых ордерах);
+    суммируются оба, тот же принцип, что и у KuCoin (несколько типов
+    счёта одной и той же валюты не пересекаются, см. fetch_kucoin_
+    spot_balance). Возвращает {ASSET: amount} по ненулевым балансам.
+    """
+    account_id = _htx_spot_account_id(api_key, api_secret)
+    data = _htx_spot_signed_get(f"/v1/account/accounts/{account_id}/balance", {}, api_key, api_secret)
+    out: dict = {}
+    for item in (data.get("data") or {}).get("list", []):
+        try:
+            amount = float(item.get("balance", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            currency = str(item.get("currency", "")).upper()
+            if currency:
+                out[currency] = out.get(currency, 0.0) + amount
+    return out
+
+
 def fetch_dydx_balance(address: str, subaccount_number: str) -> float:
     """
     GET /v4/addresses/{address}/subaccountNumber/{n} — тот же публичный
@@ -1172,6 +1289,14 @@ def fetch_all_balances(secrets: dict) -> dict:
     if "dydx_address" in secrets:
         _try("dydx", lambda: fetch_dydx_balance(secrets["dydx_address"], secrets["dydx_subaccount_number"]))
 
+    if "htx_api_key" in secrets:
+        _try_spot_futures(
+            "htx",
+            lambda: fetch_htx_futures_balance(secrets["htx_api_key"], secrets["htx_api_secret"]),
+            lambda: fetch_htx_spot_balance(secrets["htx_api_key"], secrets["htx_api_secret"]),
+            fetch_htx_ticker_prices,
+        )
+
     wallet_secrets = load_wallet_secrets()
     aave_result = None
     if wallet_secrets:
@@ -1194,6 +1319,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
+    "htx": "HTX",
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",
