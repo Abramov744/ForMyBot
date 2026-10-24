@@ -109,6 +109,8 @@ from funding_report import (
     _mexc_sign,
     _htx_sign,
     _htx_cross_account_raw,
+    _bingx_signed_get,
+    _get_bingx_proxies,
 )
 
 
@@ -1074,6 +1076,81 @@ def fetch_htx_spot_balance(api_key: str, api_secret: str) -> dict:
     return out
 
 
+def fetch_bingx_ticker_prices() -> dict:
+    """
+    GET /openApi/spot/v1/ticker/24hr — ПУБЛИЧНЫЙ (без ключа) эндпоинт BingX,
+    аналог fetch_mexc_ticker_prices/fetch_gate_ticker_prices/fetch_kucoin_
+    ticker_prices/fetch_htx_ticker_prices выше. `symbol` опущен — офиц.
+    документация прямо говорит "Omit symbol to get all trading pairs".
+    Отдельного "простого" тикера последней цены (без 24ч-статистики) под
+    именем "Symbol Price Ticker" в докстринге нет смысла использовать —
+    сторонний репозиторий (BingX-API/api-ai-skills) описывает его ответ
+    как массив последних СДЕЛОК по символу, а не единственную цену, что
+    противоречит названию эндпоинта и наводит на ту же неточность
+    документации, что уже встречалась с X-SOURCE-KEY (см. funding_report.
+    докстринг секции BingX) — 24hr-тикер с полем lastPrice однозначен и
+    официально подтверждён.
+    """
+    cache_key = "bingx"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get(
+        "https://open-api.bingx.com/openApi/spot/v1/ticker/24hr", timeout=20, proxies=_get_bingx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code", 0) != 0:
+        raise RuntimeError(f"BingX ticker/24hr error {data.get('code')}: {data.get('msg')}")
+    prices = {}
+    for t in (data.get("data") or []):
+        symbol = str(t.get("symbol", ""))
+        if symbol.endswith("-USDT"):
+            try:
+                prices[symbol[:-5]] = float(t["lastPrice"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def fetch_bingx_spot_balance(api_key: str, api_secret: str) -> dict:
+    """GET /openApi/spot/v1/account/balance — ПОДТВЕРЖДЕНО офиц.
+    документацией (bingx-api.github.io/docs, Account assets): data.balances[]
+    = {asset, free, locked}. Возвращает {ASSET: free+locked} по ненулевым
+    балансам — тот же принцип, что и у остальных бирж в этом файле."""
+    data = _bingx_signed_get("/openApi/spot/v1/account/balance", {}, api_key, api_secret)
+    out: dict = {}
+    for b in (data.get("data") or {}).get("balances", []):
+        try:
+            amount = float(b.get("free", 0) or 0) + float(b.get("locked", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            asset = b.get("asset")
+            if asset:
+                out[asset] = amount
+    return out
+
+
+def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
+    """
+    BingX пока подключён только как спот-нога (см. README) — фьючерсного
+    счёта здесь нет, в отличие от HTX/MEXC/Gate/KuCoin выше. Цена монет —
+    сначала публичный тикер самой BingX (fetch_bingx_ticker_prices),
+    CoinGecko — fallback (тот же принцип, что у остальных бирж, см.
+    докстринг price_spot_balances_usd про коллизию тикеров).
+    """
+    balances = fetch_bingx_spot_balance(api_key, api_secret)
+    usd, unpriced = price_spot_balances_usd_native(balances, fetch_bingx_ticker_prices())
+    if unpriced:
+        print(f"[balances/bingx] без оценки в USD: {', '.join(unpriced)}")
+    return usd
+
+
 def fetch_dydx_balance(address: str, subaccount_number: str) -> float:
     """
     GET /v4/addresses/{address}/subaccountNumber/{n} — тот же публичный
@@ -1297,6 +1374,11 @@ def fetch_all_balances(secrets: dict) -> dict:
             fetch_htx_ticker_prices,
         )
 
+    if "bingx_api_key" in secrets:
+        # BingX пока только спот-нога (см. README) — без фьючерсного счёта,
+        # поэтому обычный _try (как у dYdX выше), а не _try_spot_futures.
+        _try("bingx", lambda: fetch_bingx_balance(secrets["bingx_api_key"], secrets["bingx_api_secret"]))
+
     wallet_secrets = load_wallet_secrets()
     aave_result = None
     if wallet_secrets:
@@ -1319,7 +1401,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
-    "htx": "HTX",
+    "htx": "HTX", "bingx": "BingX",
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",

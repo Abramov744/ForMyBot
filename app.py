@@ -621,7 +621,7 @@ function fmt(n, digits) {
   return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', mexc: 'MEXC', gate: 'Gate', kucoin: 'KuCoin', dydx: 'dYdX', htx: 'HTX' };
+const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', mexc: 'MEXC', gate: 'Gate', kucoin: 'KuCoin', dydx: 'dYdX', htx: 'HTX', bingx: 'BingX' };
 
 const BYBIT_PART_LABELS = {
   unified: 'Unified', funding: 'Funding', earn: 'Earn',
