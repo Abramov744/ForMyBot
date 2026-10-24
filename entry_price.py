@@ -43,6 +43,7 @@ from funding_report import (
     _get_htx_proxies,
     _kucoin_signed_get,
     _htx_sign,
+    _bingx_signed_get,
     _dydx_subaccount_raw,
     _fetch_in_windows,
     _trim_to_continuous_run,
@@ -679,6 +680,31 @@ def _fetch_htx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: in
     ]
 
 
+def _fetch_bingx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
+    """
+    GET /openApi/spot/v1/trade/myTrades — ПОДТВЕРЖДЕНО офиц. документацией
+    (bingx-api.github.io/docs, раздел Spot Trade): symbol/startTime/endTime/
+    limit без обязательного orderId — то, что нужно для поиска по периоду,
+    а не по конкретному ордеру. symbol — через дефис, в ВЕРХНЕМ регистре
+    ("BTC-USDT", как у KuCoin, см. _SPOT_TRADE_FETCHERS ниже).
+
+    Сторона сделки — булево поле isBuyer (не строка "BUY"/"SELL", как у
+    большинства остальных бирж) — тот же случай, что у MEXC
+    (_fetch_mexc_spot_trades, там isBuyer тоже bool).
+    """
+    api_key = secrets["bingx_api_key"].strip()
+    api_secret = secrets["bingx_api_secret"].strip()
+    data = _bingx_signed_get("/openApi/spot/v1/trade/myTrades", {
+        "symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "1000",
+    }, api_key, api_secret)
+    wanted_is_buyer = (side == "buy")
+    return [
+        {"price": float(t["price"]), "qty": float(t["qty"]), "side": side}
+        for t in (data.get("data") or {}).get("fills", [])
+        if bool(t.get("isBuyer")) == wanted_is_buyer and t.get("price") and t.get("qty")
+    ]
+
+
 # ── Uniswap (любая EVM-сеть) — поиск покупки через историю переводов кошелька ─
 #
 # У Uniswap/блокчейна нет REST-эндпоинта "история моих сделок по паре", как у
@@ -904,6 +930,7 @@ _SPOT_TRADE_FETCHERS = {
     "gate":  (lambda secrets, symbol, s, e, side: _fetch_gate_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}_{quote}"),
     "kucoin": (lambda secrets, symbol, s, e, side: _fetch_kucoin_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
     "htx": (lambda secrets, symbol, s, e, side: _fetch_htx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}".lower()),
+    "bingx": (lambda secrets, symbol, s, e, side: _fetch_bingx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
     # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
     # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
     # _search_spot_trade), а не через этот реестр из (fetch_fn, symbol_fn) на
@@ -920,6 +947,7 @@ _SPOT_EXCHANGE_SECRET_KEY = {
     "gate": "gate_api_key",
     "kucoin": "kucoin_api_key",
     "htx": "htx_api_key",
+    "bingx": "bingx_api_key",
 }
 
 

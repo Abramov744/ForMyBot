@@ -129,6 +129,15 @@ def load_secrets() -> dict:
         result["htx_api_key"]    = htx_api_key
         result["htx_api_secret"] = htx_api_secret
 
+    # BingX — опционально. Та же схема ключей (Access Key + Secret Key), что
+    # у остальных централизованных бирж — см. _bingx_sign. Пока используется
+    # только как спот-нога (entry_price.py), не часть funding-отчётов.
+    bingx_api_key    = os.environ.get("BINGX_API_KEY")
+    bingx_api_secret = os.environ.get("BINGX_API_SECRET")
+    if bingx_api_key and bingx_api_secret:
+        result["bingx_api_key"]    = bingx_api_key
+        result["bingx_api_secret"] = bingx_api_secret
+
     return result
 
 
@@ -1617,6 +1626,74 @@ def fetch_htx(api_key: str, api_secret: str, start_ms: int, end_ms: int) -> list
             "asset": r.get("currency", "USDT"), "time_ms": int(r["created_time"]),
         })
     return records
+
+
+# ── Получение данных с BingX ───────────────────────────────────────────────────
+#
+# Добавляется по шагам (как и было с HTX) — пока только спот-нога
+# (entry_price._fetch_bingx_spot_trades) для автоподбора цены входа/выхода в
+# таблице, не часть funding-отчётов. Схема подписи — классическая
+# Binance-совместимая (HMAC-SHA256 от отсортированной по ASCII query-строки,
+# hex-дайджест, НЕ base64 — ПОДТВЕРЖДЕНО офиц. docs, пример кода на Python
+# прямо в докстринге эндпоинта account/balance: hmac.new(...).hexdigest()),
+# ключ — в заголовке X-BX-APIKEY. Символы — через дефис, в верхнем регистре
+# ("BTC-USDT", как у KuCoin).
+#
+# ВАЖНО: сторонний репозиторий BingX-API/api-ai-skills на GitHub настаивает,
+# что ВСЕ запросы (включая публичные) обязаны нести ещё один заголовок,
+# X-SOURCE-KEY: BX-AI-SKILL — ПРОВЕРЕНО и ОПРОВЕРГНУТО: этот заголовок НЕ
+# упоминается ни разу на официальной странице bingx-api.github.io/docs
+# (ни в общем описании авторизации, ни в примерах кода конкретных
+# эндпоинтов) — это, по всей видимости, собственная метка трафика именно
+# того AI-инструмента, выданная за общее требование API, а не фактическое
+# требование BingX. Намеренно НЕ добавлен.
+
+BINGX_BASE_URL = "https://open-api.bingx.com"
+
+
+def _get_bingx_proxies() -> dict | None:
+    """Прокси для запросов к BingX — тот же паттерн, что и у остальных бирж
+    (_get_mexc_proxies/_get_gate_proxies/_get_kucoin_proxies/_get_htx_proxies
+    выше): сначала BINGX_PROXY, иначе общие HTTPS_PROXY/HTTP_PROXY."""
+    proxy = (
+        os.environ.get("BINGX_PROXY")
+        or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    )
+    if not proxy:
+        return None
+    if not proxy.startswith(("http://", "https://")):
+        proxy = f"http://{proxy}"
+    return {"http": proxy, "https": proxy}
+
+
+def _bingx_sign(api_secret: str, params: dict) -> str:
+    """
+    hex(HMAC-SHA256(secret, query_string)), query_string — params без
+    signature, отсортированные по ASCII-ключу, без URL-кодирования значений
+    (ПОДТВЕРЖДЕНО офиц. docs — пример кода на Python использует
+    "&".join(["%s=%s" % (x, paramsMap[x]) for x in sorted(paramsMap)]) без
+    urlencode). Значения с "[" или "{" (батч-ордеры) здесь не встречаются —
+    эта функция используется только для GET-запросов на чтение.
+    """
+    query_string = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str) -> dict:
+    full_params = {k: v for k, v in params.items() if v is not None}
+    full_params["timestamp"] = str(int(time.time() * 1000))
+    signature = _bingx_sign(api_secret, full_params)
+    query_string = "&".join(f"{k}={full_params[k]}" for k in sorted(full_params))
+    resp = requests.get(
+        f"{BINGX_BASE_URL}{path}?{query_string}&signature={signature}",
+        headers={"X-BX-APIKEY": api_key}, timeout=30, proxies=_get_bingx_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code", 0) != 0:
+        raise RuntimeError(f"BingX {path} error {data.get('code')}: {data.get('msg')}")
+    return data
 
 
 def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> dict:
