@@ -138,6 +138,15 @@ def load_secrets() -> dict:
         result["bingx_api_key"]    = bingx_api_key
         result["bingx_api_secret"] = bingx_api_secret
 
+    # OurBit — опционально. Та же схема ключей, что у остальных
+    # централизованных бирж — см. _ourbit_sign. Пока используется только
+    # как спот-нога (entry_price.py), не часть funding-отчётов.
+    ourbit_api_key    = os.environ.get("OURBIT_API_KEY")
+    ourbit_api_secret = os.environ.get("OURBIT_API_SECRET")
+    if ourbit_api_key and ourbit_api_secret:
+        result["ourbit_api_key"]    = ourbit_api_key
+        result["ourbit_api_secret"] = ourbit_api_secret
+
     return result
 
 
@@ -1694,6 +1703,57 @@ def _bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str) ->
     if data.get("code", 0) != 0:
         raise RuntimeError(f"BingX {path} error {data.get('code')}: {data.get('msg')}")
     return data
+
+
+# ── Получение данных с OurBit ───────────────────────────────────────────────────
+#
+# Добавляется по шагам (как и было с HTX/BingX) — пока только спот-нога
+# (entry_price._fetch_ourbit_spot_trades), не часть funding-отчётов.
+#
+# OurBit — ПОДТВЕРЖДЕНО живыми запросами (24.10.2026), что это клон/
+# white-label MEXC на ОБЩЕМ бэкенде, а не просто внешне похожий сайт:
+#   - GET /api/v3/ping -> {} — идентично MEXC;
+#   - GET /api/v3/time -> {"serverTime": ...} — идентичный формат;
+#   - GET /api/v3/account без ключа -> {"code":400,"msg":"api key
+#     required"} — ПОБАЙТОВО совпадает с реальным ответом api.mexc.com на
+#     тот же запрос (сверено напрямую, не предположение) — такое текстовое
+#     совпадение сообщения об ошибке крайне маловероятно для независимой
+#     реализации, это общий бэкенд, не просто Binance-совместимый клон.
+# Отсюда — используется ТА ЖЕ схема подписи, что и у MEXC-спота
+# (entry_price._mexc_spot_sign): hex(HMAC-SHA256(secret, query_string)),
+# query_string — НЕ отсортированная (urlencode параметров в заданном
+# порядке, как они собраны, та же логика, что и у Binance — подписывается
+# ровно та строка, что отправляется, без требования ASCII-сортировки).
+#
+# ВАЖНО, ОСТАЁТСЯ НЕПРОВЕРЕННЫМ: заголовок с самим API-ключом. Публично
+# протестировать его невозможно (приватный подписанный запрос нельзя
+# проверить анонимно), поэтому используется ТА ЖЕ "X-MEXC-APIKEY", что и у
+# MEXC — это следует из того же вывода про общий бэкенд (имя заголовка
+# задаётся бэкендом, а не фронтендом/брендингом сайта), но первый реальный
+# вызов (поиск спот-сделки по OurBit) всё равно стоит явно сверить.
+
+OURBIT_BASE_URL = "https://api.ourbit.com"
+
+
+def _get_ourbit_proxies() -> dict | None:
+    """Прокси для запросов к OurBit — тот же паттерн, что и у остальных бирж
+    выше: сначала OURBIT_PROXY, иначе общие HTTPS_PROXY/HTTP_PROXY."""
+    proxy = (
+        os.environ.get("OURBIT_PROXY")
+        or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    )
+    if not proxy:
+        return None
+    if not proxy.startswith(("http://", "https://")):
+        proxy = f"http://{proxy}"
+    return {"http": proxy, "https": proxy}
+
+
+def _ourbit_sign(api_secret: str, query_string: str) -> str:
+    """hex(HMAC-SHA256(secret, query_string)) — идентично entry_price.
+    _mexc_spot_sign, см. докстринг секции выше про общий бэкенд с MEXC."""
+    return hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) -> dict:

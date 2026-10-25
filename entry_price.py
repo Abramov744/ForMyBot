@@ -44,6 +44,9 @@ from funding_report import (
     _kucoin_signed_get,
     _htx_sign,
     _bingx_signed_get,
+    _ourbit_sign,
+    _get_ourbit_proxies,
+    OURBIT_BASE_URL,
     _dydx_subaccount_raw,
     _fetch_in_windows,
     _trim_to_continuous_run,
@@ -705,6 +708,50 @@ def _fetch_bingx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
     ]
 
 
+def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
+    """
+    GET /api/v3/myTrades — OurBit ПОДТВЕРЖДЕНО (живыми запросами 24.10.2026,
+    см. докстринг секции OurBit в funding_report.py) работает на общем
+    бэкенде с MEXC: идентичные /api/v3/ping, /api/v3/time и ПОБАЙТОВО
+    совпадающий текст ошибки /api/v3/account без ключа. Поэтому — та же
+    схема запроса, что у _fetch_mexc_spot_trades (symbol слитно, без
+    разделителя, "BTCUSDT"; подпись entry_price._mexc_spot_sign-style, см.
+    funding_report._ourbit_sign; та же разборка ошибки code/msg раньше
+    raise_for_status(), чтобы не терять содержательное сообщение).
+
+    ОГОВОРКА (см. funding_report.py): заголовок ключа ("X-MEXC-APIKEY")
+    — единственная деталь, которую нельзя проверить анонимно (приватный
+    подписанный запрос), взят по аналогии с MEXC — первый реальный вызов
+    стоит явно сверить.
+    """
+    api_key = secrets["ourbit_api_key"].strip()
+    api_secret = secrets["ourbit_api_secret"].strip()
+    params_list = [
+        ("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)),
+        ("limit", "1000"), ("recvWindow", "10000"), ("timestamp", str(int(time.time() * 1000))),
+    ]
+    query_string = urllib.parse.urlencode(params_list)
+    sig = _ourbit_sign(api_secret, query_string)
+    headers = {"X-MEXC-APIKEY": api_key}
+    resp = requests.get(
+        f"{OURBIT_BASE_URL}/api/v3/myTrades?{query_string}&signature={sig}",
+        headers=headers, timeout=30, proxies=_get_ourbit_proxies(),
+    )
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise
+    if isinstance(data, dict) and data.get("code"):
+        raise RuntimeError(f"OurBit myTrades error {data.get('code')}: {data.get('msg')}")
+    resp.raise_for_status()
+    wanted_is_buyer = (side == "buy")
+    return [
+        {"price": float(t["price"]), "qty": float(t["qty"]), "side": side}
+        for t in data if bool(t.get("isBuyer")) == wanted_is_buyer
+    ]
+
+
 # ── Uniswap (любая EVM-сеть) — поиск покупки через историю переводов кошелька ─
 #
 # У Uniswap/блокчейна нет REST-эндпоинта "история моих сделок по паре", как у
@@ -931,6 +978,7 @@ _SPOT_TRADE_FETCHERS = {
     "kucoin": (lambda secrets, symbol, s, e, side: _fetch_kucoin_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
     "htx": (lambda secrets, symbol, s, e, side: _fetch_htx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}".lower()),
     "bingx": (lambda secrets, symbol, s, e, side: _fetch_bingx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
+    "ourbit": (lambda secrets, symbol, s, e, side: _fetch_ourbit_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
     # Uniswap сюда намеренно не входит — сканируется отдельно ОДИН раз на все
     # котировки сразу через _fetch_uniswap_spot_trades_all_quotes (см.
     # _search_spot_trade), а не через этот реестр из (fetch_fn, symbol_fn) на
@@ -948,6 +996,7 @@ _SPOT_EXCHANGE_SECRET_KEY = {
     "kucoin": "kucoin_api_key",
     "htx": "htx_api_key",
     "bingx": "bingx_api_key",
+    "ourbit": "ourbit_api_key",
 }
 
 
