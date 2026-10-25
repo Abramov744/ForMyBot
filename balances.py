@@ -1202,8 +1202,17 @@ def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
         f"{OURBIT_BASE_URL}/api/v3/account?{query_string}&signature={sig}",
         headers=headers, timeout=30, proxies=_get_ourbit_proxies(),
     )
+    # Сначала разбираем тело ответа и только потом raise_for_status() —
+    # иначе при 400 теряется содержательное code/msg (та же логика, что
+    # в entry_price._fetch_ourbit_spot_trades).
+    try:
+        data = resp.json()
+    except ValueError:
+        resp.raise_for_status()
+        raise
+    if isinstance(data, dict) and data.get("code") and "balances" not in data:
+        raise RuntimeError(f"OurBit spot account error {data.get('code')}: {data.get('msg')}")
     resp.raise_for_status()
-    data = resp.json()
     if "balances" not in data:
         raise RuntimeError(f"OurBit spot account error: {data}")
 
