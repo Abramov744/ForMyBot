@@ -111,6 +111,9 @@ from funding_report import (
     _htx_cross_account_raw,
     _bingx_signed_get,
     _get_bingx_proxies,
+    _ourbit_sign,
+    _get_ourbit_proxies,
+    OURBIT_BASE_URL,
 )
 
 
@@ -1151,6 +1154,77 @@ def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
     return usd
 
 
+def fetch_ourbit_ticker_prices() -> dict:
+    """GET /api/v3/ticker/price — публичный эндпоинт, идентичный MEXC (см.
+    докстринг секции OurBit в funding_report.py про общий бэкенд) —
+    прямой аналог fetch_mexc_ticker_prices выше, другой базовый URL."""
+    cache_key = "ourbit"
+    now = time.time()
+    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
+        return _exchange_ticker_cache[cache_key]
+
+    resp = requests.get(f"{OURBIT_BASE_URL}/api/v3/ticker/price", timeout=20, proxies=_get_ourbit_proxies())
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for t in (data if isinstance(data, list) else []):
+        symbol = str(t.get("symbol", ""))
+        if symbol.endswith("USDT"):
+            try:
+                prices[symbol[:-4]] = float(t["price"])
+            except (TypeError, ValueError, KeyError):
+                continue
+    if prices:
+        _exchange_ticker_cache[cache_key] = prices
+        _exchange_ticker_cache_ts[cache_key] = now
+    return prices
+
+
+def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
+    """
+    GET /api/v3/account — та же схема подписи и тот же заголовок ключа,
+    что у fetch_mexc_spot_balance выше (см. докстринг секции OurBit в
+    funding_report.py про общий бэкенд): query_string подписывается как
+    есть (timestamp+recvWindow, без сортировки), signature = HMAC-SHA256
+    (funding_report._ourbit_sign), ключ — в заголовке X-MEXC-APIKEY (та же
+    непроверенная деталь, что и у _fetch_ourbit_spot_trades в
+    entry_price.py — первый реальный вызов стоит явно сверить).
+
+    Возвращает {ASSET: free+locked} по всем ненулевым балансам.
+    """
+    api_key, api_secret = api_key.strip(), api_secret.strip()
+    timestamp = str(int(time.time() * 1000))
+    query_string = f"timestamp={timestamp}&recvWindow=5000"
+    sig = _ourbit_sign(api_secret, query_string)
+    headers = {"X-MEXC-APIKEY": api_key}
+
+    resp = requests.get(
+        f"{OURBIT_BASE_URL}/api/v3/account?{query_string}&signature={sig}",
+        headers=headers, timeout=30, proxies=_get_ourbit_proxies(),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "balances" not in data:
+        raise RuntimeError(f"OurBit spot account error: {data}")
+
+    out = {}
+    for b in data["balances"]:
+        amount = float(b.get("free", 0) or 0) + float(b.get("locked", 0) or 0)
+        if amount > 0:
+            out[b["asset"]] = amount
+    return out
+
+
+def fetch_ourbit_balance(api_key: str, api_secret: str) -> float:
+    """OurBit пока подключён только как спот-нога (см. README) —
+    фьючерсного счёта здесь нет, тот же случай, что у BingX выше."""
+    balances = fetch_ourbit_spot_balance(api_key, api_secret)
+    usd, unpriced = price_spot_balances_usd_native(balances, fetch_ourbit_ticker_prices())
+    if unpriced:
+        print(f"[balances/ourbit] без оценки в USD: {', '.join(unpriced)}")
+    return usd
+
+
 def fetch_dydx_balance(address: str, subaccount_number: str) -> float:
     """
     GET /v4/addresses/{address}/subaccountNumber/{n} — тот же публичный
@@ -1379,6 +1453,10 @@ def fetch_all_balances(secrets: dict) -> dict:
         # поэтому обычный _try (как у dYdX выше), а не _try_spot_futures.
         _try("bingx", lambda: fetch_bingx_balance(secrets["bingx_api_key"], secrets["bingx_api_secret"]))
 
+    if "ourbit_api_key" in secrets:
+        # OurBit пока только спот-нога (см. README) — тот же случай, что BingX.
+        _try("ourbit", lambda: fetch_ourbit_balance(secrets["ourbit_api_key"], secrets["ourbit_api_secret"]))
+
     wallet_secrets = load_wallet_secrets()
     aave_result = None
     if wallet_secrets:
@@ -1401,7 +1479,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
     "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
-    "htx": "HTX", "bingx": "BingX",
+    "htx": "HTX", "bingx": "BingX", "ourbit": "OurBit",
 }
 _BYBIT_PART_LABELS = {
     "unified": "Unified", "funding": "Funding", "earn": "Earn",

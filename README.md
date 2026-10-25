@@ -1257,14 +1257,20 @@ query_string))`, query_string НЕ отсортирован (urlencode пара�
   `_fetch_mexc_spot_trades` (`symbol`/`startTime`/`endTime`/`limit`/
   `recvWindow`). Символ — слитно, без разделителя, в ВЕРХНЕМ регистре
   (`"BTCUSDT"`, как у MEXC/Bybit). Сторона сделки — булево поле `isBuyer`
-  (не строка `"BUY"`/`"SELL"`) — тот же случай, что у MEXC/BingX.
+  (не строка `"BUY"`/`"SELL"`) — тот же случай, что у MEXC/BingX;
+- **сводный баланс** (`balances.py`, `/balances` и `/balance` в Telegram) —
+  только спот (`fetch_ourbit_spot_balance`, `GET /api/v3/account`, та же
+  схема подписи и тот же заголовок ключа, что у `fetch_mexc_spot_balance`
+  — обычный `_try`, как у BingX, без `_try_spot_futures`, фьючерсного
+  счёта у OurBit в проекте пока нет). Цена монет — сначала публичный
+  `GET /api/v3/ticker/price` (идентичный MEXC, прямой аналог
+  `fetch_mexc_ticker_prices`), CoinGecko — fallback.
 
 ПОКА НЕ реализовано (появится по мере следующих запросов, тем же способом,
 что и у dYdX/HTX/BingX):
 - funding-отчёты, автозапись шорта/столбец P/алерты — предполагают
   OurBit как фьючерсную ногу, что пока не запрошено;
-- `/rates`;
-- сводный баланс (`balances.py`).
+- `/rates`.
 
 ## Алерты о закрытии позиции
 
