@@ -719,10 +719,11 @@ def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
     funding_report._ourbit_sign; та же разборка ошибки code/msg раньше
     raise_for_status(), чтобы не терять содержательное сообщение).
 
-    ОГОВОРКА (см. funding_report.py): заголовок ключа ("X-MEXC-APIKEY")
-    — единственная деталь, которую нельзя проверить анонимно (приватный
-    подписанный запрос), взят по аналогии с MEXC — первый реальный вызов
-    стоит явно сверить.
+    ПРОВЕРЕНО 25.10.2026 по официальной документации
+    https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок ключа
+    называется X-OURBIT-APIKEY (а не X-MEXC-APIKEY, как предполагалось по
+    аналогии с общим бэкендом MEXC — именно это и было причиной реальных
+    404/400 от прода при первом включении биржи).
     """
     api_key = secrets["ourbit_api_key"].strip()
     api_secret = secrets["ourbit_api_secret"].strip()
@@ -732,7 +733,7 @@ def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
     ]
     query_string = urllib.parse.urlencode(params_list)
     sig = _ourbit_sign(api_secret, query_string)
-    headers = {"X-MEXC-APIKEY": api_key}
+    headers = {"X-OURBIT-APIKEY": api_key}
     resp = requests.get(
         f"{OURBIT_BASE_URL}/api/v3/myTrades?{query_string}&signature={sig}",
         headers=headers, timeout=30, proxies=_get_ourbit_proxies(),

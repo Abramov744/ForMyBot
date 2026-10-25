@@ -1186,9 +1186,11 @@ def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
     что у fetch_mexc_spot_balance выше (см. докстринг секции OurBit в
     funding_report.py про общий бэкенд): query_string подписывается как
     есть (timestamp+recvWindow, без сортировки), signature = HMAC-SHA256
-    (funding_report._ourbit_sign), ключ — в заголовке X-MEXC-APIKEY (та же
-    непроверенная деталь, что и у _fetch_ourbit_spot_trades в
-    entry_price.py — первый реальный вызов стоит явно сверить).
+    (funding_report._ourbit_sign), ключ — в заголовке X-OURBIT-APIKEY.
+    ПРОВЕРЕНО 25.10.2026 по официальной документации
+    https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок
+    отличается от MEXC (X-MEXC-APIKEY), это и было причиной "api key
+    required" при первом реальном вызове /balance в проде.
 
     Возвращает {ASSET: free+locked} по всем ненулевым балансам.
     """
@@ -1196,7 +1198,7 @@ def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
     timestamp = str(int(time.time() * 1000))
     query_string = f"timestamp={timestamp}&recvWindow=5000"
     sig = _ourbit_sign(api_secret, query_string)
-    headers = {"X-MEXC-APIKEY": api_key}
+    headers = {"X-OURBIT-APIKEY": api_key}
 
     resp = requests.get(
         f"{OURBIT_BASE_URL}/api/v3/account?{query_string}&signature={sig}",
