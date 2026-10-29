@@ -70,7 +70,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 import aster_interval_history
-from balances import _mexc_account_assets_raw, _gate_futures_account_raw
+from balances import _mexc_account_assets_raw, _gate_futures_account_raw, _aster_signed_get
 from entry_price import _fetch_mexc_contract_size
 from liquidation_alerts import (
     _bybit_liquidation_positions,
@@ -99,6 +99,7 @@ from funding_report import (
     fetch_htx_open_symbols,
     HTX_BASE_URL,
     _cached_raw_positions,
+    _aster_positions_raw,
     _lighter_positions_raw,
     _lighter_account_raw,
     _mexc_positions_raw,
@@ -855,6 +856,56 @@ def _htx_margin_pnl_positions(secrets: dict) -> list:
     return out
 
 
+def _aster_margin_base(secrets: dict) -> float:
+    """
+    Поддерживаемая маржа фьючерсного счёта Aster — GET /fapi/v3/balance,
+    поле "balance" (кошелёк), которое, в отличие от equity у HTX/dYdX, УЖЕ
+    НЕ включает floating PnL (см. docstring balances.fetch_aster_balance —
+    там PnL явно ДОБАВЛЯЕТСЯ отдельным запросом поверх "balance", именно
+    потому что без него баланс не совпадал с реальным при открытых
+    позициях). Поэтому, в отличие от HTX (margin_base = equity -
+    profit_unreal), здесь ничего вычитать не нужно — тот же смысл
+    margin_base, что у MEXC/Gate/Lighter (весь реальный капитал счёта, без
+    учёта нереализованного PnL), просто у Aster это уже готовое поле.
+    Суммируется по всем валютам счёта (на практике почти всегда только
+    USDT) — переиспользуется тот же сырой фетчер (_aster_signed_get), что
+    и в balances.py, через импорт, не копируется.
+    """
+    wallet = _cached_raw_positions("aster:balance", lambda: _aster_signed_get(
+        "/fapi/v3/balance", secrets["user"], secrets["signer"], secrets["signer_private_key"],
+    ))
+    return sum(float(a.get("balance", 0) or 0) for a in wallet if a.get("asset") == "USDT")
+
+
+def _aster_margin_pnl_positions(secrets: dict) -> list:
+    """
+    entry/mark — тот же сырой ответ позиций, что и в
+    liquidation_alerts._aster_liquidation_positions (та же кэшированная
+    "aster" через _cached_raw_positions, доп. запроса нет), unRealizedProfit
+    — готовый долларовый PnL позиции прямо в том же ответе (как у Gate/
+    Lighter/dYdX/HTX — не нужно домножать на contract_size, как у MEXC;
+    поле подтверждено в balances.fetch_aster_balance на том же эндпоинте).
+    """
+    items = _cached_raw_positions("aster", lambda: _aster_positions_raw(
+        secrets["user"], secrets["signer"], secrets["signer_private_key"],
+    ))
+    out = []
+    for p in items:
+        amt = float(p.get("positionAmt", 0) or 0)
+        if amt >= 0:
+            continue
+        entry, mark = p.get("entryPrice"), p.get("markPrice")
+        if not entry or not mark:
+            continue
+        out.append({
+            "symbol": p["symbol"],
+            "entry_price": float(entry),
+            "mark_price": float(mark),
+            "pnl_dollar": float(p.get("unRealizedProfit", 0) or 0),
+        })
+    return out
+
+
 # Цена входа/текущая/ЛИКВИДАЦИИ для всех семи бирж — те же position-
 # фетчеры, что уже написаны и проверены для liquidation_alerts.py
 # (переиспользуются через импорт, не копируются заново). Нужны даже для
@@ -886,6 +937,7 @@ _MARGIN_PNL_FETCHERS = {
     "lighter": (_lighter_margin_pnl_positions, _lighter_margin_base),
     "dydx": (_dydx_margin_pnl_positions, _dydx_margin_base),
     "htx": (_htx_margin_pnl_positions, _htx_margin_base),
+    "aster": (_aster_margin_pnl_positions, _aster_margin_base),
 }
 
 
@@ -910,15 +962,15 @@ def build_predicted_rates_report(secrets: dict) -> str:
     для MEXC/Gate/Lighter, у которых margin-pnl-фетчеры возвращают PnL, но
     не цену ликвидации).
 
-    Для MEXC, Gate и Lighter (явная просьба пользователя — сначала MEXC,
-    затем "сделай всё то же самое" для Gate и Lighter) это НЕ % от цены
-    входа, а % от ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см. _MARGIN_PNL_FETCHERS
-    ниже: при плече небольшое движение цены может быть значительным
-    процентом от маржи, и голый "% от цены" этого не отражает. Для
-    Bybit/Aster/KuCoin — по-прежнему % от цены входа, через те же
+    Для MEXC, Gate, Lighter, dYdX, HTX и Aster (явная просьба пользователя
+    — сначала MEXC, затем "сделай всё то же самое" для остальных) это НЕ %
+    от цены входа, а % от ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см.
+    _MARGIN_PNL_FETCHERS ниже: при плече небольшое движение цены может
+    быть значительным процентом от маржи, и голый "% от цены" этого не
+    отражает. Для Bybit/KuCoin — по-прежнему % от цены входа, через те же
     position-фетчеры, что уже написаны и проверены для liquidation_alerts.py
     (см. _PRICE_FETCHERS ниже) — переиспользуются через импорт, не
-    копируются заново. Работает для всех шести бирж.
+    копируются заново.
     """
     lines = ["🔮 Прогнозная ставка funding по открытым позициям (на следующую выплату)"]
     open_positions, failed_exchanges = get_open_positions(secrets)
