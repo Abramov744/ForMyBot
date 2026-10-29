@@ -254,6 +254,45 @@ def _mexc_position_entry(secrets: dict, symbol: str) -> dict | None:
     return None
 
 
+_gate_contract_size_cache: dict = {}
+
+
+def _fetch_gate_contract_multiplier(contract: str, settle: str = "usdt") -> float:
+    """Сколько монет в ОДНОМ контракте Gate Futures — тот же случай, что и
+    у MEXC/HTX выше (_fetch_mexc_contract_size/_fetch_htx_contract_size):
+    "size" позиции отдаётся в количестве КОНТРАКТОВ, а не в монетах, свой
+    множитель ("quanto_multiplier") у каждого символа — например, у
+    SIREN_USDT он равен 100. Без этого домножения qty в
+    short_position_tracker/entry_price получался заниженным в
+    quanto_multiplier раз (реальный баг: шорт SIREN 150 контрактов читался
+    как 150 монет вместо настоящих 15000, из-за чего не совпадал с объёмом
+    покупки на споте — обнаружено 29.10.2026).
+
+    Публичный эндпоинт (без авторизации), GET /api/v4/futures/{settle}/
+    contracts/{contract}. Кэшируется в памяти процесса — контрактные
+    спецификации почти никогда не меняются. При любой неожиданности в
+    формате ответа — множитель 1 (старое поведение) и предупреждение в
+    лог, тот же приём, что и у MEXC/HTX."""
+    if contract in _gate_contract_size_cache:
+        return _gate_contract_size_cache[contract]
+    multiplier = 1.0
+    try:
+        resp = requests.get(
+            f"https://api.gateio.ws/api/v4/futures/{settle}/contracts/{contract}",
+            timeout=15, proxies=_get_gate_proxies(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict) or data.get("quanto_multiplier") is None:
+            raise RuntimeError(f"неожиданный формат ответа: {data}")
+        multiplier = float(data["quanto_multiplier"])
+    except Exception as e:
+        print(f"[entry_price/gate] Не удалось получить quanto_multiplier для {contract}, использую 1 "
+              f"(объём позиции может быть занижен/завышен, если у контракта множитель ≠ 1): {e}")
+    _gate_contract_size_cache[contract] = multiplier
+    return multiplier
+
+
 def _gate_position_entry(secrets: dict, symbol: str, settle: str = "usdt") -> dict | None:
     base_url = "https://api.gateio.ws"
     url_path = f"/api/v4/futures/{settle}/positions"
@@ -269,9 +308,10 @@ def _gate_position_entry(secrets: dict, symbol: str, settle: str = "usdt") -> di
         raise RuntimeError(f"Gate positions error {data.get('label')}: {data.get('message')}")
     for p in data if isinstance(data, list) else []:
         if p.get("contract") == symbol and float(p.get("size", 0)) != 0:
+            multiplier = _fetch_gate_contract_multiplier(symbol, settle)
             return {
                 "price": float(p["entry_price"]),
-                "qty": abs(float(p["size"])),
+                "qty": abs(float(p["size"])) * multiplier,
                 "entry_time_ms": None,
                 "time_is_exact": False,
             }
