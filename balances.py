@@ -1069,10 +1069,9 @@ def fetch_ourbit_ticker_prices() -> dict:
 
 def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
     """
-    GET /api/v3/account — та же схема подписи и тот же заголовок ключа,
-    с подписью через funding_report._ourbit_sign: query_string подписывается как
-    есть (timestamp+recvWindow, без сортировки), signature = HMAC-SHA256
-    (funding_report._ourbit_sign), ключ — в заголовке X-OURBIT-APIKEY.
+    GET /api/v3/account — query_string (timestamp+recvWindow) подписывается
+    через funding_report._ourbit_sign без сортировки параметров; ключ
+    передаётся в заголовке X-OURBIT-APIKEY.
     ПРОВЕРЕНО 25.10.2026 по официальной документации
     https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок
     отличается от стандартного заголовка Binance API, это и было причиной "api key
