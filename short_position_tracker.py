@@ -174,9 +174,8 @@ def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
         size = float(p.get("size", 0) or 0)
         if size < 0:  # отрицательный size == шорт (см. докстринг модуля)
             price = p.get("entry_price")
-            # size — в контрактах, не в монетах — без домножения на quanto_multiplier
-            # объём шорта
-            # получался в разы заниженным и не совпадал с покупкой на
+            # size — в контрактах, не в монетах. Без домножения на quanto_multiplier
+            # объём шорта получался в разы заниженным и не совпадал с покупкой на
             # споте (реальный баг: SIREN_USDT, множитель 100 — 29.10.2026).
             multiplier = _fetch_gate_contract_multiplier(p["contract"], settle)
             out.append({
