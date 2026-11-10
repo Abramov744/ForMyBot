@@ -16,16 +16,16 @@ PnL, который отдаётся отдельным полем unrealised_pn
   margin_base = total
   unrealized  = unrealised_pnl
 
-LIGHTER — тоже одно готовое поле, как и у Gate: collateral (ПОДТВЕРЖДЕНО
-офиц. docs SDK elliottech/lighter-python, docs/Account.md, проверено
-06.10.2026) — "обеспечение" на уровне аккаунта БЕЗ учёта floating PnL
-открытых позиций (тот же смысл, что и total у Gate). unrealized считается суммой поля unrealized_pnl по всем
-открытым позициям аккаунта (AccountPosition.unrealized_pnl, тот же
-источник, что уже использует balances.fetch_lighter_balance):
-  margin_base = collateral
+LIGHTER — collateral на уровне аккаунта покрывает cross-margin, но НЕ
+включает отдельное обеспечение isolated-позиций. По актуальной документации
+Lighter Total Account Value = Collateral + Unrealized PnL; для isolated-
+позиций их Allocated Margin — отдельное обеспечение, которое также нужно
+учитывать. Поэтому:
+  margin_base = collateral + sum(allocated_margin для margin_mode == 1)
   unrealized  = sum(position.unrealized_pnl)
-ВАЖНО: эта формула НЕ проверена против реального счёта пользователя с открытой позицией — поля взяты из офиц. SDK docs, но отдельной сверки с боевым аккаунтом не было. Первый реальный алерт по
-Lighter стоит явно сверить с суммами на экране самого приложения Lighter.
+Коды margin_mode подтверждены офиц. документацией: 0 = cross, 1 = isolated.
+Без добавления allocated_margin бот показывал только остаток cross collateral
+и мог занижать маржу на сотни USDC.
 
 DYDX (v4) — margin_base = equity (поле саб-аккаунта, см. _dydx_margin_
 snapshot ниже), unrealized = сумма unrealizedPnl по открытым позициям.
@@ -104,22 +104,27 @@ def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
 def _lighter_margin_snapshot(secrets: dict) -> list:
     """
     Список {"currency", "margin_base", "unrealized"} для счёта Lighter —
-    margin_base = collateral (аккаунт), unrealized = сумма unrealized_pnl
-    по всем открытым позициям (см. докстринг модуля про Lighter и про
-    непроверенность этой формулы на реальном счёте). Валюта всегда USDC —
+    margin_base = collateral аккаунта + allocated_margin всех isolated-
+    позиций (margin_mode == 1), unrealized = сумма unrealized_pnl по всем
+    открытым позициям. Cross collateral и isolated allocated margin —
+    отдельные компоненты обеспечения; их нельзя заменять друг другом.
+    Валюта всегда USDC —
     Lighter торгуется с расчётами в USDC (тот же факт, что уже используется
     в funding_report.fetch_lighter).
     """
     accounts = _cached_raw_positions("lighter:account", lambda: _lighter_account_raw(
         secrets["lighter_account_index"], secrets["lighter_auth_token"],
     ))
-    margin_base = sum(float(acc.get("collateral", 0) or 0) for acc in accounts)
+    margin_base = 0.0
+    unrealized = 0.0
+    for acc in accounts:
+        margin_base += float(acc.get("collateral", 0) or 0)
+        for pos in acc.get("positions", []):
+            if int(pos.get("margin_mode", 0) or 0) == 1:
+                margin_base += float(pos.get("allocated_margin", 0) or 0)
+            unrealized += float(pos.get("unrealized_pnl", 0) or 0)
     if margin_base <= 0:
         return []
-    unrealized = sum(
-        float(pos.get("unrealized_pnl", 0) or 0)
-        for acc in accounts for pos in acc.get("positions", [])
-    )
     return [{"currency": "USDC", "margin_base": margin_base, "unrealized": unrealized}]
 
 
