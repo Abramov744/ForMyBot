@@ -22,7 +22,7 @@ $PORT. bot_worker.py и bot_poll.py при этом не удалены и по-
 отключить, не трогая сам Telegram-бот.
 
 Обязательные переменные окружения — как и раньше (ASTER_*, TELEGRAM_*,
-опционально BYBIT_*/LIGHTER_*/MEXC_*/GATE_*/KUCOIN_*, см. funding_report.load_secrets),
+опционально BYBIT_*/LIGHTER_*/GATE_*/KUCOIN_*, см. funding_report.load_secrets),
 плюс новые для веб-калькулятора:
   WEB_APP_USERNAME              — логин для Basic Auth (по умолчанию "admin")
   WEB_APP_PASSWORD              — пароль для Basic Auth. Если не задан —
@@ -621,7 +621,7 @@ function fmt(n, digits) {
   return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', mexc: 'MEXC', gate: 'Gate', kucoin: 'KuCoin', dydx: 'dYdX', htx: 'HTX', bingx: 'BingX', ourbit: 'OurBit' };
+const EXCHANGE_LABELS = { aster: 'Aster', bybit: 'Bybit', lighter: 'Lighter', gate: 'Gate', kucoin: 'KuCoin', dydx: 'dYdX', htx: 'HTX', bingx: 'BingX', ourbit: 'OurBit' };
 
 const BYBIT_PART_LABELS = {
   unified: 'Unified', funding: 'Funding', earn: 'Earn',
