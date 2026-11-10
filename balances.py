@@ -31,10 +31,10 @@
     что использует Binance Futures API, форком которого является Aster;
     без PnL баланс не совпадал с реальным при открытых позициях). Споta у
     Aster нет вовсе, см. README.
-  - Lighter — collateral (обеспечение) + сумма unrealized_pnl по всем
-    открытым позициям — по документации Lighter Total Account Value =
-    Collateral + Unrealized PnL, а готового поля с суммой в API нет, считаем
-    сами (см. fetch_lighter_balance).
+  - Lighter — collateral аккаунта + allocated_margin изолированных
+    позиций + сумма unrealized_pnl по всем открытым позициям — по
+    документации Lighter изолированное обеспечение учитывается отдельно
+    (см. fetch_lighter_balance).
   - dYdX    — equity сабаккаунта (публичный Indexer API, без ключа, по
     адресу кошелька) — в отличие от Lighter выше, это поле УЖЕ включает
     нереализованный PnL открытых позиций, прибавлять отдельно не нужно
@@ -847,6 +847,8 @@ def fetch_lighter_balance(account_index: str) -> float:
             pass
         for pos in acc.get("positions", []):
             try:
+                if int(pos.get("margin_mode", 0) or 0) == 1:
+                    total += float(pos.get("allocated_margin", 0) or 0)
                 total += float(pos.get("unrealized_pnl", 0) or 0)
             except (TypeError, ValueError):
                 continue
