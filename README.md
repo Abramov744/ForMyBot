@@ -473,10 +473,11 @@ VIP 0/tier 0, опубликовано на kucoin.com/vip/privilege/fee), ка�
   PnL открытых позиций (`/fapi/v3/positionRisk`, поле `unRealizedProfit`,
   как у Binance Futures API, форком которого является Aster). Спота у
   Aster нет вовсе.
-- **Lighter** — `collateral` (обеспечение) **+** сумма `unrealized_pnl` по
-  всем открытым позициям — по документации Lighter Total Account Value =
-  Collateral + Unrealized PnL, готового поля с суммой в API нет. Спота у
-  Lighter нет вовсе.
+- **Lighter** — `collateral` аккаунта **+** `allocated_margin` только
+  isolated-позиций (`margin_mode == 1`) **+** сумма `unrealized_pnl`
+  всех открытых позиций. Документация отдельно указывает, что allocated
+  margin isolated-позиции является отдельным collateral и учитывается в
+  Total Account Value. Спота у Lighter нет вовсе.
 
   Для всех трёх бирж (Gate/Aster/Lighter) раньше учитывался только сам
   кошелёк/collateral, без PnL открытых позиций — из-за этого баланс
@@ -626,14 +627,12 @@ order_margin+available, не зависит от unrealised_pnl). Долларо
    🟢 PnL: +50.00 (+10.0% от маржи) — цена: 0.045 (ликвидация 0.08)
 ```
 
-Для **Lighter**: `margin_base = collateral` (аккаунт, не зависит от
-unrealized_pnl, тот же смысл, что и total у Gate). Долларовый PnL, как и у Gate, отдаётся прямо в ответе
-позиции (поле `unrealized_pnl`, тот же источник, что уже использует
-`balances.fetch_lighter_balance`). **ВАЖНО**: в отличие от Gate, эта
-формула не проверена против реального счёта с открытой позицией — поля
-взяты из офиц. docs SDK (`elliottech/lighter-python`, проверено
-06.10.2026), но собственной проверки по диагностическому логу сырых полей
-(как для других бирж) для Lighter не делалось:
+Для **Lighter**: `margin_base = collateral + sum(allocated_margin isolated)`
+(`margin_mode == 1`), без floating PnL. Это важно: account-level
+`collateral` не включает отдельное обеспечение isolated-позиций.
+Долларовый PnL берётся из `unrealized_pnl` всех открытых позиций.
+Режимы подтверждены официальной документацией: `0 = cross`,
+`1 = isolated`.
 
 ```
 🔴 ANSEM: -0.0100% за выплату (годовых -87.6%) — через 1ч, funding раз в 1ч
@@ -772,21 +771,19 @@ unrealized  = unrealised_pnl
 Маржа: 500 USDT → нереализованный PNL: -400 USDT
 ```
 
-**LIGHTER** — тоже одно готовое поле, как у Gate:
+**LIGHTER** — account-level collateral плюс отдельное обеспечение
+isolated-позиций:
 
 ```
-margin_base = collateral
+margin_base = collateral + sum(allocated_margin where margin_mode == 1)
 unrealized  = sum(position.unrealized_pnl)
 ```
 
-`collateral` (ПОДТВЕРЖДЕНО офиц. docs SDK `elliottech/lighter-python`,
-`docs/Account.md`, проверено 06.10.2026) — обеспечение на уровне аккаунта
-БЕЗ учёта floating PnL, аналогично `total` у Gate. `unrealized` считается суммой поля
-`unrealized_pnl` по всем открытым позициям (тот же источник, что уже
-использует `balances.fetch_lighter_balance`). **ВАЖНО**: в отличие от
-Gate, эта формула НЕ проверена против реального счёта пользователя с
-открытой позицией (отдельной сверки с боевым аккаунтом не было) — первый реальный алерт стоит явно сверить с
-суммами на экране приложения Lighter:
+У Lighter `margin_mode == 0` означает cross, `1` — isolated.
+Account-level `collateral` не покрывает отдельный allocated margin
+изолированных позиций; его пропуск приводил к занижению маржи. Значение
+`allocated_margin` берётся только для isolated-позиций, чтобы не задвоить
+cross collateral.
 
 ```
 🚨 Lighter (USDC): нереализованный убыток достиг 78% от маржи на счёте
