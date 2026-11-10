@@ -181,8 +181,7 @@ def _coingecko_symbol_to_id(symbol: str) -> str | None:
     """
     Тикер → coingecko-id. Раньше это был только SYMBOL_TO_COINGECKO_ID
     (~24 самых ходовых монет) — любая монета не из этого списка молча
-    выпадала из суммы баланса (это и оказалось причиной, почему часть баланса
-    "не вся сумма учтена": на споте держится что-то за пределами курируемого
+    выпадала из суммы баланса (это и оказалось причиной недосчёта: часть спот-баланса на споте держится что-то за пределами курируемого
     списка). Теперь при промахе по курируемому списку дополнительно ищем по
     ПОЛНОМУ списку монет CoinGecko (/coins/list, кэш на сутки — список тикеров
     почти не меняется). У CoinGecko тикеры не уникальны (сотни монет с
@@ -295,8 +294,7 @@ def fetch_gate_ticker_prices() -> dict:
 def price_spot_balances_usd_native(balances: dict, exchange_prices: dict) -> tuple[float, list]:
     """
     Как price_spot_balances_usd, но СНАЧАЛА пробует цену по паре ASSET/USDT
-    С САМОЙ БИРЖИ (exchange_prices — см. 
-    fetch_gate_ticker_prices), и только для того, что не нашлось там —
+    С САМОЙ БИРЖИ (exchange_prices — см. fetch_gate_ticker_prices), и только для того, что не нашлось там —
     CoinGecko как fallback. Однозначная пара на самой бирже, где реально
     куплена монета, не может перепутаться с чужой монетой под тем же
     тикером — в отличие от общего поиска по CoinGecko (см. докстринг
@@ -1038,7 +1036,7 @@ def fetch_bingx_spot_balance(api_key: str, api_secret: str) -> dict:
 def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
     """
     BingX пока подключён только как спот-нога (см. README) — фьючерсного
-    счёта здесь нет, в отличие от HTX/биржи/Gate/KuCoin выше. Цена монет —
+    счёта здесь нет, в отличие от HTX/Gate/KuCoin выше. Цена монет —
     сначала публичный тикер самой BingX (fetch_bingx_ticker_prices),
     CoinGecko — fallback (тот же принцип, что у остальных бирж, см.
     докстринг price_spot_balances_usd про коллизию тикеров).
@@ -1259,7 +1257,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     def _try_spot_futures(name, futures_fn, spot_fn, ticker_prices_fn=None):
         """
-        Для биржи/Gate: futures + оценка спота в USD.
+        Для Gate: futures + оценка спота в USD.
 
         ticker_prices_fn (если задан) — публичный тикер цен самой биржи
         (fetch_gate_ticker_prices), используется
