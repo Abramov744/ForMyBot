@@ -29,8 +29,7 @@ EDGE-TRIGGERED, как и funding-алерты (funding_alerts.check_funding_ale
 пришлёт алерт.
 
 ВАЖНО (тот же класс бага, что уже был реальным на этом коде — см.
-funding_alerts.get_open_positions/sltp_alerts.py, ложный алерт "MEXC
-BTW_USDT закрыта"): временный сетевой/API-сбой при запросе позиций на
+funding_alerts.get_open_positions/sltp_alerts.py, ложный алерт о закрытии позиции): временный сетевой/API-сбой при запросе позиций на
 КОНКРЕТНОЙ бирже не должен читаться как "открытых позиций на ней больше
 нет" — иначе единичный сбой стирал бы state для всех символов этой биржи,
 и при восстановлении API уже сработавшая (но ещё не сброшенная) тревога
@@ -56,14 +55,8 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     — тоже оба поля прямо в ответе.
   - KuCoin — GET /api/v1/positions: markPrice, liquidationPrice — тоже оба
     поля прямо в ответе.
-  - MEXC   — GET /api/v1/private/position/open_positions отдаёт
-    liquidatePrice, но НЕ отдаёт текущую цену — она берётся отдельным
-    ПУБЛИЧНЫМ (без ключей) запросом GET /api/v1/contract/fair_price/
-    {symbol} (поле fairPrice), по одному на каждый открытый на MEXC
-    символ (подтверждено по офиц. docs — mexc.com/api-docs/futures/
-    market-endpoints/get-fair-price).
   - Lighter — ТЕПЕРЬ ВКЛЮЧЁН (явная просьба пользователя, "настрой Lighter
-    так же, как MEXC и Gate"). Раньше считалось, что поле цены ликвидации
+    так же, как и Gate"). Раньше считалось, что поле цены ликвидации
     нигде не документировано — это было верно на момент той проверки, но
     офиц. SDK (elliottech/lighter-python, docs/AccountPosition.md,
     дословно проверено 06.10.2026) с тех пор получил поле
@@ -116,9 +109,8 @@ import requests
 from funding_report import (
     _cached_raw_positions,
     _aster_positions_raw, _bybit_positions_raw, _gate_positions_raw,
-    _kucoin_positions_raw, _mexc_positions_raw, _lighter_positions_raw,
+    _kucoin_positions_raw, _lighter_positions_raw,
     _htx_positions_raw,
-    _get_mexc_proxies,
     fetch_lighter_markets, fetch_lighter_mark_prices,
     _dydx_subaccount_raw, _dydx_market_info, _dydx_mark_price,
     load_secrets, send_telegram_broadcast,
@@ -128,7 +120,7 @@ LIQUIDATION_CHECK_INTERVAL_MINUTES = float(os.environ.get("LIQUIDATION_CHECK_INT
 LIQUIDATION_ALERT_THRESHOLD = float(os.environ.get("LIQUIDATION_ALERT_THRESHOLD", "0.70"))
 
 _LABELS = {
-    "aster": "Aster", "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate",
+    "aster": "Aster", "bybit": "Bybit", "gate": "Gate",
     "kucoin": "KuCoin", "lighter": "Lighter", "dydx": "dYdX", "htx": "HTX",
 }
 
@@ -198,40 +190,6 @@ def _kucoin_liquidation_positions(secrets: dict) -> list:
     return out
 
 
-def _mexc_fair_price(symbol: str) -> float:
-    resp = requests.get(
-        f"https://api.mexc.com/api/v1/contract/fair_price/{symbol}",
-        timeout=15, proxies=_get_mexc_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC fair_price error {data.get('code')}: {data.get('message') or data}")
-    return float(data["data"]["fairPrice"])
-
-
-def _mexc_liquidation_positions(secrets: dict) -> list:
-    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(
-        secrets["mexc_api_key"], secrets["mexc_api_secret"],
-    ))
-    out = []
-    for p in items:
-        if str(p.get("positionType")) == "1" or float(p.get("holdVol", 0) or 0) <= 0:
-            continue  # positionType 1 == long
-        entry = p.get("openAvgPrice") or p.get("holdAvgPrice")
-        liq = p.get("liquidatePrice")
-        if not entry or not liq:
-            continue
-        symbol = p["symbol"]
-        try:
-            mark = _mexc_fair_price(symbol)
-        except Exception as e:
-            print(f"[liquidation/mexc] Не удалось получить текущую цену {symbol}: {e}")
-            continue
-        out.append({"symbol": symbol, "entry_price": float(entry), "liq_price": float(liq), "mark_price": mark})
-    return out
-
-
 def _lighter_liquidation_positions(secrets: dict) -> list:
     """
     entry_price/liq_price — поля avg_entry_price/liquidation_price того же
@@ -278,7 +236,7 @@ def _dydx_liquidation_positions(secrets: dict) -> list:
     """
     liq_price вычисляется по официальной формуле dYdX v4 (Cross Liquidation
     Price, см. докстринг модуля) — Indexer не отдаёт его готовым полем ни
-    для одной позиции, в отличие от всех остальных пяти бирж.
+    для одной позиции, в отличие от остальных шести бирж.
     """
     subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
         secrets["dydx_address"], secrets["dydx_subaccount_number"],
@@ -362,7 +320,6 @@ _LIQUIDATION_POSITION_FETCHERS = {
     "aster": (_aster_liquidation_positions, "user"),
     "gate": (_gate_liquidation_positions, "gate_api_key"),
     "kucoin": (_kucoin_liquidation_positions, "kucoin_api_key"),
-    "mexc": (_mexc_liquidation_positions, "mexc_api_key"),
     "lighter": (_lighter_liquidation_positions, "lighter_account_index"),
     "dydx": (_dydx_liquidation_positions, "dydx_address"),
     "htx": (_htx_liquidation_positions, "htx_api_key"),

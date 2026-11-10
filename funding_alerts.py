@@ -22,7 +22,7 @@
 в этот момент уже отрицательная — это осознанный компромисс ради простоты).
 
 ВАЖНО про источники прогнозной ставки — не все биржи одинаково честны:
-  - Aster, Bybit, MEXC — эндпоинт отдаёт именно ставку, которая будет
+  - Aster, Bybit — эндпоинт отдаёт именно ставку, которая будет
     применена к СЛЕДУЮЩЕЙ выплате (подтверждено документацией/полем
     nextFundingTime/nextSettleTime рядом с этим же значением).
   - Gate — есть отдельное поле funding_rate_indicative именно для этого
@@ -42,7 +42,7 @@ Telegram-боте (см. bot_poll.py), не только для фонового
 выплат вместе со ставкой (третий элемент кортежа), и annualize() считает
 APR = ставка_за_выплату × (24 / интервал_в_часах) × 365. Источник интервала
 у каждой биржи свой (см. комментарии над каждым _fetch_*_predicted_rate):
-  - Bybit, MEXC, Gate — отдают интервал прямо в том же ответе, что и саму
+  - Bybit, Gate — отдают интервал прямо в том же ответе, что и саму
     ставку (fundingIntervalHour / collectCycle / funding_interval) —
     ничего дополнительно запрашивать не нужно.
   - Aster — интервал не в premiumIndex, а в отдельном публичном (без
@@ -55,7 +55,7 @@ APR = ставка_за_выплату × (24 / интервал_в_часах) 
     уровне "раз в час" для вообще всех рынков (не варьируется по символам,
     задокументировано в docs.lighter.xyz/perpetual-futures/funding) —
     поэтому просто константа, без похода в API за этим значением.
-Для Aster/Bybit/MEXC/Gate, если по какой-то причине поле интервала не
+Для Aster/Bybit/Gate, если по какой-то причине поле интервала не
 пришло в ответе, используется задокументированный дефолт биржи (8ч почти
 везде) — это единственное разумное поведение при отсутствии данных, но
 из-за этого APR в таком случае может быть немного неточным именно для
@@ -70,18 +70,15 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 import aster_interval_history
-from balances import _mexc_account_assets_raw, _gate_futures_account_raw, _aster_signed_get
-from entry_price import _fetch_mexc_contract_size
+from balances import _gate_futures_account_raw, _aster_signed_get
 from liquidation_alerts import (
     _bybit_liquidation_positions,
     _aster_liquidation_positions,
     _kucoin_liquidation_positions,
     _gate_liquidation_positions,
-    _mexc_liquidation_positions,
     _lighter_liquidation_positions,
     _dydx_liquidation_positions,
     _htx_liquidation_positions,
-    _mexc_fair_price,
 )
 from funding_report import (
     MSK,
@@ -92,7 +89,6 @@ from funding_report import (
     fetch_lighter_open_symbols,
     fetch_lighter_markets,
     fetch_lighter_mark_prices,
-    fetch_mexc_open_symbols,
     fetch_gate_open_symbols,
     fetch_kucoin_open_symbols,
     fetch_dydx_open_symbols,
@@ -102,7 +98,6 @@ from funding_report import (
     _aster_positions_raw,
     _lighter_positions_raw,
     _lighter_account_raw,
-    _mexc_positions_raw,
     _gate_positions_raw,
     _htx_positions_raw,
     _htx_cross_account_raw,
@@ -111,7 +106,6 @@ from funding_report import (
     _dydx_mark_price,
     DYDX_INDEXER_BASE_URL,
     _get_proxies,
-    _get_mexc_proxies,
     _get_gate_proxies,
     _get_kucoin_proxies,
     _get_dydx_proxies,
@@ -124,7 +118,7 @@ FUNDING_ALERT_THRESHOLD = float(os.environ.get("FUNDING_ALERT_THRESHOLD", "0.0")
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
+"gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
     "htx": "HTX",
 }
 
@@ -132,7 +126,6 @@ EXCHANGE_LABELS = {
 # отдала его явно в ответе — см. докстринг модуля, раздел "ГОДОВАЯ СТАВКА".
 ASTER_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
-MEXC_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 GATE_DEFAULT_FUNDING_INTERVAL_HOURS = 8.0
 # KuCoin отдаёт granularity (интервал) в каждом ответе — используется как
 # дефолт только если поле неожиданно отсутствует (не должно происходить по
@@ -162,12 +155,12 @@ def get_open_positions(secrets: dict) -> tuple[dict, set]:
     позиций на бирже действительно нет" (биржа просто не попадала в
     result). На практике это привело к реальному багу: sltp_alerts.py
     сравнивает список открытых позиций с предыдущим проходом, чтобы
-    обнаружить закрытие — один разовый сетевой сбой на, скажем, MEXC
-    заставлял результат выглядеть как "на MEXC открытых позиций теперь 0",
-    что sltp_alerts.py читал как "ВСЕ открытые на MEXC позиции только что
+    обнаружить закрытие — один разовый сетевой сбой на, скажем, Gate
+    заставлял результат выглядеть как "на Gate открытых позиций теперь 0",
+    что sltp_alerts.py читал как "ВСЕ открытые на Gate позиции только что
     закрылись" — ложный алерт о закрытии в Telegram И ложная запись даты
     закрытия в Google Sheet для позиции, которая на самом деле всё ещё
-    открыта (см. историю бага — реальный случай с MEXC BTW_USDT). Теперь
+    открыта (см. историю бага — реальный случай с Gate BTW_USDT). Теперь
     вызывающий код (см. sltp_alerts.check_closed_positions) может явно
     пропустить сравнение для биржи, чьё текущее состояние на самом деле
     неизвестно, а не спутать это с "позиций нет".
@@ -200,14 +193,6 @@ def get_open_positions(secrets: dict) -> tuple[dict, set]:
         except Exception as e:
             print(f"[alerts/lighter] Не удалось получить открытые позиции: {e}")
             failed.add("lighter")
-
-    if "mexc_api_key" in secrets:
-        try:
-            open_times = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            result["mexc"] = sorted(open_times.keys())
-        except Exception as e:
-            print(f"[alerts/mexc] Не удалось получить открытые позиции: {e}")
-            failed.add("mexc")
 
     if "gate_api_key" in secrets:
         try:
@@ -333,25 +318,6 @@ def _fetch_bybit_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
     return float(item["fundingRate"]), next_ms, interval_hours
 
 
-def _fetch_mexc_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
-    proxies = _get_mexc_proxies()
-    resp = requests.get(
-        f"https://api.mexc.com/api/v1/contract/funding_rate/{symbol}",
-        timeout=15, proxies=proxies,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC funding_rate error {data.get('code')}: {data.get('message') or data}")
-    d = data.get("data") or {}
-    next_ms = int(d["nextSettleTime"]) if d.get("nextSettleTime") else None
-    # collectCycle — интервал в часах прямо в том же ответе (см. докстринг модуля).
-    interval_hours = (
-        float(d["collectCycle"]) if d.get("collectCycle") else MEXC_DEFAULT_FUNDING_INTERVAL_HOURS
-    )
-    return float(d["fundingRate"]), next_ms, interval_hours
-
-
 def _fetch_gate_predicted_rate(symbol: str, settle: str = "usdt") -> tuple[float, int | None, float]:
     proxies = _get_gate_proxies()
     resp = requests.get(
@@ -460,7 +426,6 @@ def _fetch_htx_predicted_rate(symbol: str) -> tuple[float, int | None, float]:
 _PREDICTED_RATE_FETCHERS = {
     "aster": _fetch_aster_predicted_rate,
     "bybit": _fetch_bybit_predicted_rate,
-    "mexc": _fetch_mexc_predicted_rate,
     "gate": _fetch_gate_predicted_rate,
     "lighter": _fetch_lighter_predicted_rate,
     "kucoin": _fetch_kucoin_predicted_rate,
@@ -584,10 +549,10 @@ def alert_loop(secrets: dict | None = None) -> None:
 def _lighter_margin_base(secrets: dict) -> float:
     """
     Поддерживаемая маржа счёта Lighter — тот же смысл (весь реальный
-    капитал счёта, НЕ считая floating PnL), что и у MEXC/Gate, см.
+    капитал счёта, НЕ считая floating PnL), что и у Gate, см.
     margin_alerts.py. Для Lighter это одно готовое поле аккаунта —
     collateral (ПОДТВЕРЖДЕНО офиц. docs SDK, см. funding_report.
-    _lighter_account_raw) — не нужно ничего складывать, как у MEXC.
+    _lighter_account_raw) — не нужно ничего складывать, как у Gate.
     """
     accounts = _cached_raw_positions("lighter:account", lambda: _lighter_account_raw(
         secrets["lighter_account_index"], secrets["lighter_auth_token"],
@@ -602,7 +567,7 @@ def _lighter_margin_pnl_positions(secrets: dict) -> list:
     и Gate, Lighter отдаёт долларовый PnL позиции ПРЯМО в ответе (поле
     unrealized_pnl, тот же самый, что уже используется в balances.
     fetch_lighter_balance), не нужно вычислять через qty*price_diff, как
-    для MEXC.
+    для Gate.
     """
     markets = fetch_lighter_markets()
     mark_prices = fetch_lighter_mark_prices()
@@ -637,65 +602,6 @@ def _lighter_margin_pnl_positions(secrets: dict) -> list:
     return out
 
 
-def _mexc_margin_base(secrets: dict) -> float:
-    """
-    Поддерживаемая маржа фьючерсного счёта MEXC — та же формула, что и в
-    margin_alerts.py (проверена на реальных сырых данных счёта
-    пользователя, см. докстринг margin_alerts.py): margin_base =
-    cashBalance + positionMargin — оба поля из ответа account/assets, НЕ
-    зависящие от unrealized PnL (это весь реальный капитал на фьюч-счёте:
-    свободные деньги + маржа, уже заложенная под открытую позицию).
-    Суммируется по всем валютам счёта (на практике почти всегда только
-    USDT, см. README) — отдельный сырой фетчер _mexc_account_assets_raw
-    переиспользуется через импорт, не копируется.
-    """
-    raw = _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-    return sum(
-        float(a.get("cashBalance", 0) or 0) + float(a.get("positionMargin", 0) or 0)
-        for a in raw
-    )
-
-
-def _mexc_margin_pnl_positions(secrets: dict) -> list:
-    """
-    Для MEXC — entry/mark как и в _mexc_liquidation_positions, но
-    ДОПОЛНИТЕЛЬНО реальный ДОЛЛАРОВЫЙ нереализованный PnL позиции
-    (pnl_dollar), чтобы в /rates показывать его как % от маржи счёта, а не
-    % от цены входа (явная просьба пользователя: с плечом небольшое
-    движение цены может быть большим процентом от маржи, и наоборот —
-    голый "% от цены" этого не отражает).
-
-    holdVol у MEXC — количество КОНТРАКТОВ, не монет, поэтому для
-    долларового PnL нужно домножить на contractSize конкретного символа
-    (entry_price._fetch_mexc_contract_size — тот же хелпер, что уже
-    используется в short_position_tracker для перевода holdVol в монеты).
-    Позиция — шорт (у бота только шорты, см. CLAUDE.md), поэтому прибыль,
-    когда цена ниже входа: pnl_dollar = qty_coins * (entry - mark).
-    """
-    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(
-        secrets["mexc_api_key"], secrets["mexc_api_secret"],
-    ))
-    out = []
-    for p in items:
-        if str(p.get("positionType")) == "1" or float(p.get("holdVol", 0) or 0) <= 0:
-            continue  # positionType 1 == long (см. докстринг liquidation_alerts.py)
-        entry = p.get("openAvgPrice") or p.get("holdAvgPrice")
-        if not entry:
-            continue
-        symbol = p["symbol"]
-        try:
-            mark = _mexc_fair_price(symbol)
-        except Exception as e:
-            print(f"[rates/mexc] Не удалось получить текущую цену {symbol}: {e}")
-            continue
-        contract_size = _fetch_mexc_contract_size(symbol)
-        qty_coins = float(p["holdVol"]) * contract_size
-        entry = float(entry)
-        pnl_dollar = qty_coins * (entry - mark)
-        out.append({"symbol": symbol, "entry_price": entry, "mark_price": mark, "pnl_dollar": pnl_dollar})
-    return out
-
-
 def _gate_margin_base(secrets: dict, settle: str = "usdt") -> float:
     """
     Поддерживаемая маржа фьючерсного счёта Gate — та же формула, что и в
@@ -711,10 +617,10 @@ def _gate_margin_base(secrets: dict, settle: str = "usdt") -> float:
 def _gate_margin_pnl_positions(secrets: dict, settle: str = "usdt") -> list:
     """
     Для Gate — entry/mark как и в _gate_liquidation_positions, но
-    ДОПОЛНИТЕЛЬНО unrealised_pnl — Gate, в отличие от MEXC, отдаёт
+    ДОПОЛНИТЕЛЬНО unrealised_pnl — Gate, в отличие от Gate, отдаёт
     долларовый PnL позиции ПРЯМО в ответе positions (поле unrealised_pnl,
     подтверждено офиц. докам), поэтому не нужно домножать qty на разницу
-    цен самостоятельно — проще и надёжнее, чем для MEXC.
+    цен самостоятельно — проще и надёжнее, чем для Gate.
     """
     items = _cached_raw_positions(f"gate:{settle}", lambda: _gate_positions_raw(
         secrets["gate_api_key"], secrets["gate_api_secret"], settle,
@@ -775,7 +681,7 @@ _PREDICTED_RATE_FETCHERS["dydx"] = _fetch_dydx_predicted_rate
 def _dydx_margin_base(secrets: dict) -> float:
     """
     margin_base = equity (саб-аккаунт dYdX) — та же формула и то же
-    отличие от MEXC/Gate/Lighter (equity УЖЕ включает floating PnL), что
+    отличие от Gate/Lighter (equity УЖЕ включает floating PnL), что
     описано в margin_alerts.py и README, раздел «dYdX v4».
     """
     subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
@@ -835,7 +741,7 @@ def _htx_margin_pnl_positions(secrets: dict) -> list:
     liquidation_alerts._htx_liquidation_positions (та же кэшированная
     "htx" через _cached_raw_positions, доп. запроса нет), profit_unreal —
     готовый долларовый PnL позиции прямо в том же ответе (как у Gate/
-    Lighter/dYdX — не нужно домножать на contract_size, как у MEXC).
+    Lighter/dYdX — не нужно домножать на contract_size, как у Gate).
     """
     items = _cached_raw_positions("htx", lambda: _htx_positions_raw(
         secrets["htx_api_key"], secrets["htx_api_secret"],
@@ -865,7 +771,7 @@ def _aster_margin_base(secrets: dict) -> float:
     потому что без него баланс не совпадал с реальным при открытых
     позициях). Поэтому, в отличие от HTX (margin_base = equity -
     profit_unreal), здесь ничего вычитать не нужно — тот же смысл
-    margin_base, что у MEXC/Gate/Lighter (весь реальный капитал счёта, без
+    margin_base, что у Gate/Lighter (весь реальный капитал счёта, без
     учёта нереализованного PnL), просто у Aster это уже готовое поле.
     Суммируется по всем валютам счёта (на практике почти всегда только
     USDT) — переиспользуется тот же сырой фетчер (_aster_signed_get), что
@@ -883,7 +789,7 @@ def _aster_margin_pnl_positions(secrets: dict) -> list:
     liquidation_alerts._aster_liquidation_positions (та же кэшированная
     "aster" через _cached_raw_positions, доп. запроса нет), unRealizedProfit
     — готовый долларовый PnL позиции прямо в том же ответе (как у Gate/
-    Lighter/dYdX/HTX — не нужно домножать на contract_size, как у MEXC;
+    Lighter/dYdX/HTX — не нужно домножать на contract_size, как у Gate;
     поле подтверждено в balances.fetch_aster_balance на том же эндпоинте).
     """
     items = _cached_raw_positions("aster", lambda: _aster_positions_raw(
@@ -909,7 +815,7 @@ def _aster_margin_pnl_positions(secrets: dict) -> list:
 # Цена входа/текущая/ЛИКВИДАЦИИ для всех семи бирж — те же position-
 # фетчеры, что уже написаны и проверены для liquidation_alerts.py
 # (переиспользуются через импорт, не копируются заново). Нужны даже для
-# MEXC/Gate/Lighter/dYdX (которые дальше используют _MARGIN_PNL_FETCHERS
+# Gate/Lighter/dYdX (которые дальше используют _MARGIN_PNL_FETCHERS
 # для PnL/% от маржи) — оттуда liq_price не приходит, а цену ликвидации в
 # скобках теперь показываем для всех (явная просьба пользователя — вместо
 # цены входа). Для dYdX liq_price не поле ответа API, а вычисляется по
@@ -919,20 +825,17 @@ _PRICE_FETCHERS = {
     "aster": _aster_liquidation_positions,
     "gate": _gate_liquidation_positions,
     "kucoin": _kucoin_liquidation_positions,
-    "mexc": _mexc_liquidation_positions,
     "lighter": _lighter_liquidation_positions,
     "dydx": _dydx_liquidation_positions,
     "htx": _htx_liquidation_positions,
 }
 
 # Биржи, для которых /rates показывает % от поддерживаемой МАРЖИ СЧЁТА
-# вместо % от цены входа (явная просьба пользователя: сначала MEXC, затем
-# Gate и Lighter — "сделай всё то же самое"). Каждая запись —
+# вместо % от цены входа (отдельные fetcher-функции для каждой биржи). Каждая запись —
 # (pnl_positions_fetcher, margin_base_fetcher); структура рассчитана на
 # дальнейшее расширение на другие биржи без переделки build_predicted_
 # rates_report.
 _MARGIN_PNL_FETCHERS = {
-    "mexc": (_mexc_margin_pnl_positions, _mexc_margin_base),
     "gate": (_gate_margin_pnl_positions, _gate_margin_base),
     "lighter": (_lighter_margin_pnl_positions, _lighter_margin_base),
     "dydx": (_dydx_margin_pnl_positions, _dydx_margin_base),
@@ -957,13 +860,13 @@ def build_predicted_rates_report(secrets: dict) -> str:
     пользователем явно): цена ВЫШЕ входа — минус и 🔴 (убыток по шорту),
     цена НИЖЕ входа — плюс и 🟢. В скобках рядом с ценой — ЦЕНА ЛИКВИДАЦИИ
     (явная просьба пользователя заменить ею цену входа, которая показывалась
-    там раньше), для всех шести бирж, через те же position-фетчеры, что
+    там раньше), для всех семи подключённых бирж, через те же position-фетчеры, что
     проверены для liquidation_alerts.py (_PRICE_FETCHERS ниже — нужны даже
-    для MEXC/Gate/Lighter, у которых margin-pnl-фетчеры возвращают PnL, но
+    для Gate/Lighter, у которых margin-pnl-фетчеры возвращают PnL, но
     не цену ликвидации).
 
-    Для MEXC, Gate, Lighter, dYdX, HTX и Aster (явная просьба пользователя
-    — сначала MEXC, затем "сделай всё то же самое" для остальных) это НЕ %
+    Для Gate, Lighter, dYdX, HTX и Aster (явная просьба пользователя
+    — отдельные реализации для каждой поддерживаемой биржи) это НЕ %
     от цены входа, а % от ПОДДЕРЖИВАЕМОЙ МАРЖИ счёта — см.
     _MARGIN_PNL_FETCHERS ниже: при плече небольшое движение цены может
     быть значительным процентом от маржи, и голый "% от цены" этого не
@@ -995,7 +898,7 @@ def build_predicted_rates_report(secrets: dict) -> str:
         # Цена входа/текущая — одним запросом на всю биржу (не по одному на
         # символ), тот же список позиций, что уже пришлось бы получать
         # отдельно; ошибка здесь не должна ронять сами ставки ниже — просто
-        # строки останутся без цены. Для MEXC/Gate/Lighter — отдельная ветка:
+        # строки останутся без цены. Для Gate/Lighter — отдельная ветка:
         # вместо % от цены показываем % от маржи счёта (явная просьба
         # пользователя, см. _MARGIN_PNL_FETCHERS).
         prices_by_symbol = {}
@@ -1014,7 +917,7 @@ def build_predicted_rates_report(secrets: dict) -> str:
             # Цены ликвидации в ответе margin-pnl-фетчеров нет (см. их
             # докстринги) — отдельный запрос через тот же _PRICE_FETCHERS,
             # что и для остальных бирж (явная просьба пользователя — цена
-            # ликвидации в скобках вместо цены входа, для всех шести бирж).
+            # ликвидации в скобках вместо цены входа, для всех семи подключённых бирж).
             liq_fetcher = _PRICE_FETCHERS.get(exchange)
             if liq_fetcher:
                 try:
@@ -1067,7 +970,7 @@ def build_predicted_rates_report(secrets: dict) -> str:
                 # явная просьба пользователя: при плече небольшое
                 # движение цены — это куда больший % от маржи, и голый
                 # "% от цены" этого не показывает. Знак уже учтён в
-                # pnl_dollar (см. _mexc_margin_pnl_positions/
+                # pnl_dollar (см. _gate_margin_pnl_positions/
                 # _gate_margin_pnl_positions/_dydx_margin_pnl_positions).
                 margin_pct = pnl_dollar / margin_base * 100
                 price_emoji = "🟢" if margin_pct >= 0 else "🔴"
@@ -1088,7 +991,7 @@ def build_predicted_rates_report(secrets: dict) -> str:
             # зеркалим относительно голого "цена выросла/упала": цена
             # ВЫШЕ входа -> процент со знаком МИНУС и 🔴 (минус для
             # шорта), цена НИЖЕ входа -> ПЛЮС и 🟢. Согласовано с
-            # пользователем явно. Также fallback для MEXC/Gate/Lighter/
+            # пользователем явно. Также fallback для Gate/Lighter/
             # dYdX, если не удалось получить маржу счёта (см. выше) —
             # лучше показать % от цены, чем вообще ничего. Сам процент
             # по-прежнему считается от цены входа (не менялось), но цена

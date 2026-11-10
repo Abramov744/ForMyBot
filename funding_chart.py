@@ -42,7 +42,7 @@
     у dYdX — тоже поле rate (GET /v4/fundingPayments, см. докстринг
     funding_report.fetch_dydx) — чистая рыночная ставка, как у Lighter, знак
     тоже не переворачивается.
-  - Aster, MEXC, Gate — их записи о начислениях (income / funding_records /
+  - Aster, Gate — их записи о начислениях (income / funding_records /
     account_book) содержат только СУММУ в валюте, не сам процент ставки,
     поэтому для них отдельно (но так же без каких-либо ключей — это
     публичные рыночные данные) запрашивается история ставок funding по
@@ -89,13 +89,12 @@ import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 
 import aster_interval_history
-from funding_report import MSK, _get_mexc_proxies, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
+from funding_report import MSK, _get_gate_proxies, CONTINUOUS_FUNDING_GAP_HOURS
 from funding_alerts import (
     get_predicted_rate,
     annualize,
     ASTER_DEFAULT_FUNDING_INTERVAL_HOURS,
     BYBIT_DEFAULT_FUNDING_INTERVAL_HOURS,
-    MEXC_DEFAULT_FUNDING_INTERVAL_HOURS,
     GATE_DEFAULT_FUNDING_INTERVAL_HOURS,
     LIGHTER_FUNDING_INTERVAL_HOURS,
     DYDX_FUNDING_INTERVAL_HOURS,
@@ -103,7 +102,7 @@ from funding_alerts import (
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "dydx": "dYdX",
+"gate": "Gate", "dydx": "dYdX",
 }
 # Кислотная неоновая палитра — тёмный фон + свечение линий, см. build_positions_apr_chart.
 # Базовый цвет биржи — используется для ПЕРВОЙ (по алфавиту символа) открытой
@@ -113,7 +112,6 @@ EXCHANGE_COLORS = {
     "aster":   "#00f0ff",  # кислотный циан
     "bybit":   "#faff00",  # кислотный жёлтый
     "lighter": "#ff00e6",  # кислотный маджента
-    "mexc":    "#39ff14",  # кислотный зелёный
     "gate":    "#ff3d3d",  # кислотный красный
     # dYdX сознательно НЕ добавлен сюда — все 8 имеющихся цветов (5 выше +
     # EXTRA_SERIES_COLORS) подобраны и проверены скриптом dataviz-скилла на
@@ -169,7 +167,7 @@ MAX_TICKS_AT_FULL_RESOLUTION = 60
 MAX_CHART_LOOKBACK_DAYS = 30
 
 
-# ── Публичная история ставок funding — Aster, MEXC, Gate ─────────────────────
+# ── Публичная история ставок funding — Aster, Gate ─────────────────────
 # (без ключей: это рыночные данные биржи, не привязанные к аккаунту)
 
 def _fetch_aster_rate_history(symbol: str, start_ms: int, end_ms: int) -> list:
@@ -200,51 +198,6 @@ def _fetch_aster_rate_history(symbol: str, start_ms: int, end_ms: int) -> list:
     return all_points
 
 
-def _fetch_mexc_rate_history(symbol: str, start_ms: int, end_ms: int) -> list:
-    """
-    [(settleTime_ms, rate, interval_hours), ...] — публичный
-    GET /api/v1/contract/funding_rate/history. Интервал (collectCycle,
-    часы) приходит в каждой записи — в отличие от Aster/Gate, отдельно
-    запрашивать не нужно. Постранично, новые записи на первой странице —
-    останавливаемся, как только встретили запись старше start_ms.
-    """
-    all_points: list = []
-    page_num = 1
-    page_size = 100
-    proxies = _get_mexc_proxies()
-    while True:
-        resp = requests.get(
-            "https://api.mexc.com/api/v1/contract/funding_rate/history",
-            params={"symbol": symbol, "page_num": page_num, "page_size": page_size},
-            timeout=15, proxies=proxies,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("success", False):
-            raise RuntimeError(f"MEXC funding_rate/history error {data.get('code')}: {data.get('message') or data}")
-        payload = data.get("data") or {}
-        items = payload.get("resultList", [])
-        if not items:
-            break
-
-        reached_start = False
-        for item in items:
-            t = int(item["settleTime"])
-            if t < start_ms:
-                reached_start = True
-                continue
-            if t > end_ms:
-                continue
-            interval_hours = float(item.get("collectCycle") or MEXC_DEFAULT_FUNDING_INTERVAL_HOURS)
-            all_points.append((t, float(item["fundingRate"]), interval_hours))
-
-        total_page = payload.get("totalPage", 1)
-        if reached_start or page_num >= total_page:
-            break
-        page_num += 1
-    return all_points
-
-
 def _fetch_gate_rate_history(symbol: str, start_ms: int, end_ms: int, settle: str = "usdt") -> list:
     """
     [(time_ms, rate), ...] — публичный GET /futures/{settle}/funding_rate.
@@ -252,7 +205,7 @@ def _fetch_gate_rate_history(symbol: str, start_ms: int, end_ms: int, settle: st
     "r" (ставка) и "t" (unix-время в секундах). Не проверено вживую (у
     сессии Claude нет доступа к api.gateio.ws) — если формат вдруг другой,
     записи просто пропускаются (не роняют остальной график), как уже было
-    с MEXC contractSize — см. funding-bot-handoff.md.
+    с неподтверждённый множитель контракта — см. funding-bot-handoff.md.
     """
     proxies = _get_gate_proxies()
     resp = requests.get(
@@ -291,7 +244,7 @@ def _bybit_series_from_records(records: list) -> dict:
     ЗНАК: в истории транзакций (/v5/account/transaction-log, type=SETTLEMENT)
     Bybit указывает feeRate со знаком списания по счёту (минус — когда по
     этому начислению аккаунт заплатил), а не со знаком рыночной ставки
-    funding, в отличие от остальных бирж в этом модуле (Aster/MEXC/Gate/
+    funding, в отличие от остальных бирж в этом модуле (Aster/Gate/
     Lighter — там сохраняется знак самой рыночной ставки: рынок в плюсе —
     лонги платят шортам, независимо от того, на какой вы стороне). Из-за
     этого при построении графика знак Bybit оказывался зеркальным
@@ -353,7 +306,7 @@ def _collect_series(open_results: dict) -> dict:
 
     История дальше MAX_CHART_LOOKBACK_DAYS дней назад не собирается вовсе
     (не только не показывается, а даже не запрашивается лишним запросом к
-    бирже для Aster/MEXC/Gate) — см. докстринг константы.
+    бирже для Aster/Gate) — см. докстринг константы.
     """
     series: dict = {}
     now_ms = int(time.time() * 1000)
@@ -387,8 +340,8 @@ def _collect_series(open_results: dict) -> dict:
                 if points:
                     series[("dydx", symbol)] = [(t, r, DYDX_FUNDING_INTERVAL_HOURS) for t, r in points]
 
-        elif exchange in ("aster", "mexc", "gate"):
-            time_field = {"aster": "time", "mexc": "settleTime", "gate": "time"}[exchange]
+        elif exchange in ("aster", "gate"):
+            time_field = {"aster": "time", "gate": "time"}[exchange]
             time_in_seconds = exchange == "gate"
 
             by_symbol_times: dict = defaultdict(list)
@@ -420,8 +373,6 @@ def _collect_series(open_results: dict) -> dict:
                             (t, r, aster_interval_history.interval_at(hist, t, ASTER_DEFAULT_FUNDING_INTERVAL_HOURS))
                             for t, r in raw_points
                         ]
-                    elif exchange == "mexc":
-                        points = _fetch_mexc_rate_history(symbol, start_ms, now_ms)
                     else:  # gate
                         raw_points = _fetch_gate_rate_history(symbol, start_ms, now_ms)
                         try:
@@ -601,7 +552,6 @@ _PERIOD_INCOME_FIELDS = {
     "aster":   ("income",  "time",             "ms"),
     "bybit":   ("funding", "transactionTime",  "ms"),
     "lighter": ("change",  "timestamp",        "s"),
-    "mexc":    ("funding", "settleTime",       "ms"),
     "gate":    ("change",  "time",             "s"),
     "kucoin":  ("funding", "timePoint",        "ms"),
 }

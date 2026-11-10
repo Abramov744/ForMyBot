@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Ежечасное отслеживание НОВЫХ открытых шорт-позиций по всем 6 биржам
-(Aster/Bybit/KuCoin/Lighter/MEXC/Gate) и автозапись в Google Sheet, когда
+Ежечасное отслеживание НОВЫХ открытых шорт-позиций по всем поддерживаемым биржам
+(Aster/Bybit/KuCoin/Lighter/Gate/dYdX/HTX) и автозапись в Google Sheet, когда
 на споте (на любой из подключённых спот-бирж + Uniswap, если настроен)
 найдена покупка той же монеты на тот же объём — автоматизирует ручной
 ввод B (монета в формате "МОНЕТА(spot/perp)") и D (дата и время открытия
@@ -26,7 +26,7 @@
     калькуляторе, здесь просто ещё и извлекаются в список открытых
     шортов, а не только при точечном запросе по одному символу);
   - M — название спот-биржи(-бирж), где нашлась встречная покупка, в
-    формате "Биржа spot" (например, "MEXC spot") — spot_result["exchanges"]
+    формате "Биржа spot" (например, "Gate spot") — spot_result["exchanges"]
     из entry_price._search_spot_entry уже содержит список всех бирж, чьи
     сделки вошли в VWAP по X; если их несколько — через запятую.
   Если цену определить не удалось (поле отсутствует в ответе биржи) —
@@ -45,10 +45,8 @@ in-memory состояние потерялось бы и либо пропус�
 рестарт без дублей и без пропусков.
 
 СТОРОНА ПОЗИЦИИ (шорт vs лонг) — по знаку объёма/полю side, ПОДТВЕРЖДЕНО
-по официальным источникам для пяти бирж из шести:
+по официальным источникам для поддерживаемых бирж:
   - Bybit  — поле side == "Sell" (офиц. v5 API).
-  - MEXC   — поле positionType: "1" — long, иначе — short (офиц. SDK ccxt,
-    mexc.py: rawSide == '1' -> 'long' иначе 'short').
   - Gate   — знак поля size: < 0 — шорт (офиц. документация Gate API v4 —
     "Positive number means long, negative number means short").
   - Aster  — знак поля positionAmt: < 0 — шорт (та же конвенция Binance
@@ -92,7 +90,6 @@ from entry_price import (
     WINDOW_MINUTES_EXACT,
     WINDOW_MINUTES_APPROX,
     _base_asset,
-    _fetch_mexc_contract_size,
     _fetch_htx_contract_size,
     _fetch_gate_contract_multiplier,
     _infer_open_time_via_funding,
@@ -106,7 +103,6 @@ from funding_report import (
     _gate_positions_raw,
     _kucoin_positions_raw,
     _lighter_positions_raw,
-    _mexc_positions_raw,
     _dydx_subaccount_raw,
     _htx_positions_raw,
     fetch_lighter_markets,
@@ -133,7 +129,7 @@ QTY_TOLERANCE = 0.01
 # funding_chart — там нет kucoin/uniswap, потому что они не участвуют в
 # фандинг-отчётах/алертах, только в поиске спот-цены.
 _SPOT_EXCHANGE_LABELS = {
-    "bybit": "Bybit", "mexc": "MEXC", "gate": "Gate",
+    "bybit": "Bybit", "gate": "Gate",
     "kucoin": "KuCoin", "uniswap": "Uniswap",
 }
 
@@ -169,25 +165,6 @@ def _fetch_bybit_open_shorts(secrets: dict) -> list:
     ]
 
 
-def _fetch_mexc_open_shorts(secrets: dict) -> list:
-    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(
-        secrets["mexc_api_key"], secrets["mexc_api_secret"],
-    ))
-    out = []
-    for p in items:
-        if str(p.get("positionType")) == "1" or float(p.get("holdVol", 0)) <= 0:
-            continue  # positionType 1 == long (см. докстринг модуля)
-        contract_size = _fetch_mexc_contract_size(p["symbol"])  # holdVol — в контрактах, не в монетах
-        price = p.get("openAvgPrice") or p.get("holdAvgPrice")
-        out.append({
-            "symbol": p["symbol"], "qty": float(p["holdVol"]) * contract_size,
-            "entry_time_ms": int(p["createTime"]) if p.get("createTime") else None,
-            "time_is_exact": True,
-            "price": float(price) if price else None,
-        })
-    return out
-
-
 def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
     items = _cached_raw_positions(f"gate:{settle}", lambda: _gate_positions_raw(
         secrets["gate_api_key"], secrets["gate_api_secret"], settle,
@@ -197,9 +174,8 @@ def _fetch_gate_open_shorts(secrets: dict, settle: str = "usdt") -> list:
         size = float(p.get("size", 0) or 0)
         if size < 0:  # отрицательный size == шорт (см. докстринг модуля)
             price = p.get("entry_price")
-            # size — в контрактах, не в монетах (тот же случай, что у MEXC
-            # выше) — без домножения на quanto_multiplier объём шорта
-            # получался в разы заниженным и не совпадал с покупкой на
+            # size — в контрактах, не в монетах. Без домножения на quanto_multiplier
+            # объём шорта получался в разы заниженным и не совпадал с покупкой на
             # споте (реальный баг: SIREN_USDT, множитель 100 — 29.10.2026).
             multiplier = _fetch_gate_contract_multiplier(p["contract"], settle)
             out.append({
@@ -292,8 +268,8 @@ def _fetch_htx_open_shorts(secrets: dict) -> list:
     API, здесь ЕСТЬ created_time (точное время открытия). direction ==
     "sell" — шорт (та же конвенция, что и раньше, см. докстринг модуля про
     остальные биржи), поле не переименовано миграцией. volume — в
-    КОНТРАКТАХ, не в монетах (тот же случай, что у MEXC holdVol) —
-    домножается на contract_size, иначе объём не совпал бы со спот-
+    КОНТРАКТАХ, не в монетах — домножается на contract_size, иначе объём
+    не совпал бы со спот-
     покупкой при сверке (_qty_matches). Цена входа — open_avg_price (было
     cost_open в старом API). НЕ ПРОВЕРЕНО на реальном ответе API (нет
     доступа к аккаунту из этой среды разработки).
@@ -339,7 +315,6 @@ def _fetch_kucoin_open_shorts(secrets: dict) -> list:
 _OPEN_SHORTS_FETCHERS = {
     "aster": (_fetch_aster_open_shorts, "user"),
     "bybit": (_fetch_bybit_open_shorts, "bybit_api_key"),
-    "mexc": (_fetch_mexc_open_shorts, "mexc_api_key"),
     "gate": (_fetch_gate_open_shorts, "gate_api_key"),
     "lighter": (_fetch_lighter_open_shorts, "lighter_account_index"),
     "kucoin": (_fetch_kucoin_open_shorts, "kucoin_api_key"),

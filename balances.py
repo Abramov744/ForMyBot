@@ -16,8 +16,6 @@
     степени уверенности: Unified/Funding/Earn проверены, крипто-займы —
     подтверждены реальным ответом API). Spot Grid Bot сознательно НЕ
     мониторится — см. ниже.
-  - MEXC   — отдельно фьючерсный (тот же API, что и funding_report.fetch_mexc)
-    и спот-баланс (другая подпись запроса, см. fetch_mexc_spot_balance).
   - Gate   — отдельно фьючерсный (кошелёк + нереализованный PnL открытых
     позиций, поле unrealised_pnl — тот же случай, что и у Aster/Lighter
     ниже) и спот-баланс, обе подписи запросов — тот же HMAC-SHA512-
@@ -25,7 +23,7 @@
   - KuCoin — отдельно фьючерсный (GET /api/v1/account-overview по каждой
     валюте маржи — USDT/USDC/XBT, единого "всё сразу" эндпоинта нет) и
     спот-баланс (GET /api/v1/accounts без фильтра — сразу все счета:
-    main/trade/margin). В отличие от Aster/Bybit/Lighter/MEXC/Gate НЕ часть
+    main/trade/margin). В отличие от Aster/Bybit/Lighter/Gate НЕ часть
     funding-стратегии — используется только здесь, для сводного баланса
     (см. fetch_kucoin_*_balance).
   - Aster  — баланс кошелька + нереализованный PnL открытых позиций
@@ -45,7 +43,7 @@
     через view-функцию Pool.getUserAccountData(address).
 
 Rabby wallet (сканирование ERC-20/нативных балансов по всем EVM-сетям через
-Etherscan), Fluid, Spot Grid Bot на Bybit и MEXC Loans сознательно НЕ
+Etherscan), Fluid и Spot Grid Bot на Bybit сознательно НЕ
 мониторятся:
   - Rabby wallet — полный скан ~60 сетей на каждый вызов был слишком
     медленным (десятки секунд) и на реальном аккаунте ронял отправку в
@@ -69,14 +67,7 @@ Etherscan), Fluid, Spot Grid Bot на Bybit и MEXC Loans сознательно
     сессионной авторизацией), а не вопрос конкретной галочки в правах ключа.
     Раньше здесь была попытка автоматизации (см. git-историю) — убрана как
     бесперспективная, а не оставлена наполовину рабочей.
-  - MEXC Loans (залоговое кредитование: BTC в залог, займ в USDT, с LTV и
-    ликвидацией — НЕ обычный `margin/loan` для маржинальной торговли, это
-    другой продукт) — публичного API не нашлось нигде: ни в официальной
-    документации MEXC, ни в `ccxt` (самая полная сторонняя библиотека,
-    знает только про margin/loan). Раз даже намёка на эндпоинт нет —
-    решили не гадать путь вслепую (тот же вывод, что и с Grid Bot на
-    Bybit выше, только там хотя бы эндпоинты угадывались, просто были
-    недоступны для сторонних ключей). для не-стейблкоинов на споте берётся с бесплатного
+ для не-стейблкоинов на споте берётся с бесплатного
 публичного CoinGecko API (без ключа, с кэшем на 5 минут) — единственный
 источник цен в проекте без отдельного API-ключа под аккаунт пользователя,
 поэтому ошибки/лимиты этого API НЕ должны ронять остальную часть отчёта: при
@@ -102,11 +93,9 @@ from funding_report import (
     _dydx_subaccount_raw,
     _gate_sign,
     _get_gate_proxies,
-    _get_mexc_proxies,
     _get_proxies,
     _get_htx_proxies,
     _kucoin_signed_get,
-    _mexc_sign,
     _htx_sign,
     _htx_cross_account_raw,
     _bingx_signed_get,
@@ -185,8 +174,7 @@ def _coingecko_symbol_to_id(symbol: str) -> str | None:
     """
     Тикер → coingecko-id. Раньше это был только SYMBOL_TO_COINGECKO_ID
     (~24 самых ходовых монет) — любая монета не из этого списка молча
-    выпадала из суммы баланса (это и оказалось причиной, почему у MEXC
-    "не все суммы учтены": на споте держится что-то за пределами курируемого
+    выпадала из суммы баланса (это и оказалось причиной недосчёта: часть спот-баланса на споте держится что-то за пределами курируемого
     списка). Теперь при промахе по курируемому списку дополнительно ищем по
     ПОЛНОМУ списку монет CoinGecko (/coins/list, кэш на сутки — список тикеров
     почти не меняется). У CoinGecko тикеры не уникальны (сотни монет с
@@ -222,12 +210,12 @@ def price_spot_balances_usd(balances: dict) -> tuple[float, list]:
     _coingecko_symbol_to_id/_coingecko_simple_prices.
 
     ВАЖНО (найдено на реальном аккаунте): у CoinGecko тикеры НЕ уникальны, и
-    для малоизвестных/биржевых токенов (например MEXC-листинги вроде BTW,
+    для малоизвестных/биржевых токенов (например редкие биржевые токены вроде BTW,
     GUA) поиск по тикеру в общем списке CoinGecko может зацепить СОВСЕМ
     ДРУГУЮ монету с тем же тикером — результат не "монета не оценена"
     (это было бы безопасно и видно), а СИЛЬНО ЗАНИЖЕННАЯ (или любая другая
     неверная) цена без каких-либо признаков ошибки. Поэтому там, где у
-    самой биржи есть публичный тикер по паре ASSET/USDT (сейчас — MEXC, см.
+    самой биржи есть публичный тикер по паре ASSET/USDT (например Gate, см.
     price_spot_balances_usd_native ниже), эта функция используется ТОЛЬКО
     как fallback для того, что не нашлось у биржи напрямую — так коллизия
     тикеров у CoinGecko почти не встречается на практике (обычно ей
@@ -271,38 +259,9 @@ _exchange_ticker_cache_ts: dict = {}
 EXCHANGE_TICKER_CACHE_TTL_S = 60      # цены на бирже меняются быстро, но и не нужно точнее раза в минуту
 
 
-def fetch_mexc_ticker_prices() -> dict:
-    """
-    GET /api/v3/ticker/price — публичный (без ключа) эндпоинт MEXC, отдаёт
-    последнюю цену сразу по ВСЕМ спот-парам. Возвращает {base_asset:
-    price_usdt} только по парам вида {ASSET}USDT — см. докстринг
-    price_spot_balances_usd про то, почему это надёжнее общего поиска по
-    тикеру в CoinGecko для малоизвестных монет."""
-    cache_key = "mexc"
-    now = time.time()
-    if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
-        return _exchange_ticker_cache[cache_key]
-
-    resp = requests.get("https://api.mexc.com/api/v3/ticker/price", timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    prices = {}
-    for t in (data if isinstance(data, list) else []):
-        symbol = str(t.get("symbol", ""))
-        if symbol.endswith("USDT"):
-            try:
-                prices[symbol[:-4]] = float(t["price"])
-            except (TypeError, ValueError, KeyError):
-                continue
-    if prices:
-        _exchange_ticker_cache[cache_key] = prices
-        _exchange_ticker_cache_ts[cache_key] = now
-    return prices
-
-
 def fetch_gate_ticker_prices() -> dict:
     """GET /api/v4/spot/tickers — публичный эндпоинт Gate, аналог
-    fetch_mexc_ticker_prices выше, для пар вида {ASSET}_USDT."""
+    публичный тикер Gate, для пар вида {ASSET}_USDT."""
     cache_key = "gate"
     now = time.time()
     if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
@@ -328,12 +287,11 @@ def fetch_gate_ticker_prices() -> dict:
 def price_spot_balances_usd_native(balances: dict, exchange_prices: dict) -> tuple[float, list]:
     """
     Как price_spot_balances_usd, но СНАЧАЛА пробует цену по паре ASSET/USDT
-    С САМОЙ БИРЖИ (exchange_prices — см. fetch_mexc_ticker_prices/
-    fetch_gate_ticker_prices), и только для того, что не нашлось там —
+    С САМОЙ БИРЖИ (exchange_prices — см. fetch_gate_ticker_prices), и только для того, что не нашлось там —
     CoinGecko как fallback. Однозначная пара на самой бирже, где реально
     куплена монета, не может перепутаться с чужой монетой под тем же
     тикером — в отличие от общего поиска по CoinGecko (см. докстринг
-    price_spot_balances_usd про реальный случай с BTW/GUA на MEXC, где
+    price_spot_balances_usd про коллизии тикеров, где
     именно так цена оказалась в разы заниженной без единой ошибки).
     """
     total = 0.0
@@ -643,77 +601,6 @@ def fetch_bybit_balance(api_key: str, api_secret: str) -> dict:
     return {"total": total, "parts": parts}
 
 
-def _mexc_account_assets_raw(api_key: str, api_secret: str) -> list:
-    """
-    Сырой data из GET /api/v1/private/account/assets (контрактный/фьючерсный
-    API MEXC, тот же эндпоинт и подпись, что и funding_report.fetch_mexc) —
-    общий источник для fetch_mexc_futures_balance ниже и margin_alerts.py
-    (там нужны equity И unrealized по отдельности, не только их сумма).
-    По каждой валюте счёта (аккаунт USDT-маржинальный, см. README — на
-    практике почти всегда только запись USDT): currency, equity (офиц. "Total
-    equity"), cashBalance (офиц. "Withdrawable balance"), unrealized и др.
-    """
-    base_url = "https://api.mexc.com"
-    api_key, api_secret = api_key.strip(), api_secret.strip()
-    timestamp = str(int(time.time() * 1000))
-    sig = _mexc_sign(api_key, api_secret, timestamp, [])
-    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-
-    resp = requests.get(
-        f"{base_url}/api/v1/private/account/assets",
-        headers=headers, timeout=30, proxies=_get_mexc_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC account/assets error {data.get('code')}: {data.get('message') or data}")
-    return data.get("data") or []
-
-
-def fetch_mexc_futures_balance(api_key: str, api_secret: str) -> float:
-    """Суммирует поле equity по всем валютам счёта — см. _mexc_account_assets_raw."""
-    return sum(float(a.get("equity", 0) or 0) for a in _mexc_account_assets_raw(api_key, api_secret))
-
-
-def fetch_mexc_spot_balance(api_key: str, api_secret: str) -> dict:
-    """
-    GET /api/v3/account — СПОТ-API MEXC, у него ДРУГАЯ схема подписи, чем у
-    фьючерсного (см. funding_report._mexc_sign и комментарий там же про
-    разницу схем): query_string подписывается как есть (timestamp+recvWindow,
-    без сортировки параметров по алфавиту), signature = HMAC-SHA256(secret,
-    query_string), передаётся в query, ключ — в заголовке X-MEXC-APIKEY.
-
-    НЕ ПРОВЕРЕНО на реальном аккаунте (в отличие от остальных функций этого
-    файла, которые переиспользуют уже боевые схемы подписи из
-    funding_report.py) — перед тем как полагаться на число, сверьте с
-    балансом в приложении MEXC хотя бы один раз.
-
-    Возвращает {ASSET: free+locked} по всем ненулевым балансам.
-    """
-    base_url = "https://api.mexc.com"
-    api_key, api_secret = api_key.strip(), api_secret.strip()
-    timestamp = str(int(time.time() * 1000))
-    query_string = f"timestamp={timestamp}&recvWindow=5000"
-    sig = hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers = {"X-MEXC-APIKEY": api_key}
-
-    resp = requests.get(
-        f"{base_url}/api/v3/account?{query_string}&signature={sig}",
-        headers=headers, timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "balances" not in data:
-        raise RuntimeError(f"MEXC spot account error: {data}")
-
-    out = {}
-    for b in data["balances"]:
-        amount = float(b.get("free", 0) or 0) + float(b.get("locked", 0) or 0)
-        if amount > 0:
-            out[b["asset"]] = amount
-    return out
-
-
 def _gate_futures_account_raw(api_key: str, api_secret: str, settle: str = "usdt") -> dict:
     """
     Сырой ответ GET /api/v4/futures/{settle}/accounts — общий источник для
@@ -779,10 +666,10 @@ def fetch_gate_spot_balance(api_key: str, api_secret: str) -> dict:
 
 def fetch_kucoin_ticker_prices() -> dict:
     """GET /api/v1/market/allTickers — публичный (без ключа) эндпоинт KuCoin,
-    аналог fetch_mexc_ticker_prices/fetch_gate_ticker_prices выше (см. их
+    аналог fetch_gate_ticker_prices выше (см. их
     докстринги про то, зачем нужна цена именно с самой биржи, а не только
     через CoinGecko). У KuCoin символы через дефис ({BASE}-USDT), не слитно
-    (MEXC) и не через подчёркивание (Gate)."""
+    (в отличие от Gate, где символы разделяются подчёркиванием)."""
     cache_key = "kucoin"
     now = time.time()
     if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
@@ -969,7 +856,7 @@ def fetch_lighter_balance(account_index: str) -> float:
 def fetch_htx_ticker_prices() -> dict:
     """GET /market/tickers — публичный (без ключа) эндпоинт спот-рынка HTX,
     отдаёт последнюю цену сразу по ВСЕМ спот-парам, аналог
-    fetch_mexc_ticker_prices/fetch_gate_ticker_prices/fetch_kucoin_ticker_prices
+    fetch_gate_ticker_prices/fetch_kucoin_ticker_prices
     выше. У HTX спот-символы — слитно и в нижнем регистре ("btcusdt"), в
     отличие от фьючерсных contract_code ("BTC-USDT")."""
     cache_key = "htx"
@@ -1082,7 +969,7 @@ def fetch_htx_spot_balance(api_key: str, api_secret: str) -> dict:
 def fetch_bingx_ticker_prices() -> dict:
     """
     GET /openApi/spot/v1/ticker/24hr — ПУБЛИЧНЫЙ (без ключа) эндпоинт BingX,
-    аналог fetch_mexc_ticker_prices/fetch_gate_ticker_prices/fetch_kucoin_
+    аналог fetch_gate_ticker_prices/fetch_kucoin_
     ticker_prices/fetch_htx_ticker_prices выше. `symbol` опущен — офиц.
     документация прямо говорит "Omit symbol to get all trading pairs".
     Отдельного "простого" тикера последней цены (без 24ч-статистики) под
@@ -1142,7 +1029,7 @@ def fetch_bingx_spot_balance(api_key: str, api_secret: str) -> dict:
 def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
     """
     BingX пока подключён только как спот-нога (см. README) — фьючерсного
-    счёта здесь нет, в отличие от HTX/MEXC/Gate/KuCoin выше. Цена монет —
+    счёта здесь нет, в отличие от HTX/Gate/KuCoin выше. Цена монет —
     сначала публичный тикер самой BingX (fetch_bingx_ticker_prices),
     CoinGecko — fallback (тот же принцип, что у остальных бирж, см.
     докстринг price_spot_balances_usd про коллизию тикеров).
@@ -1155,9 +1042,9 @@ def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
 
 
 def fetch_ourbit_ticker_prices() -> dict:
-    """GET /api/v3/ticker/price — публичный эндпоинт, идентичный MEXC (см.
-    докстринг секции OurBit в funding_report.py про общий бэкенд) —
-    прямой аналог fetch_mexc_ticker_prices выше, другой базовый URL."""
+    """GET /api/v3/ticker/price — публичный эндпоинт, в формате Binance Spot API (см.
+    описание Binance-совместимого Spot API OurBit в funding_report.py) —
+    прямой аналог биржевой тикер выше, другой базовый URL."""
     cache_key = "ourbit"
     now = time.time()
     if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
@@ -1182,14 +1069,12 @@ def fetch_ourbit_ticker_prices() -> dict:
 
 def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
     """
-    GET /api/v3/account — та же схема подписи и тот же заголовок ключа,
-    что у fetch_mexc_spot_balance выше (см. докстринг секции OurBit в
-    funding_report.py про общий бэкенд): query_string подписывается как
-    есть (timestamp+recvWindow, без сортировки), signature = HMAC-SHA256
-    (funding_report._ourbit_sign), ключ — в заголовке X-OURBIT-APIKEY.
+    GET /api/v3/account — query_string (timestamp+recvWindow) подписывается
+    через funding_report._ourbit_sign без сортировки параметров; ключ
+    передаётся в заголовке X-OURBIT-APIKEY.
     ПРОВЕРЕНО 25.10.2026 по официальной документации
     https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок
-    отличается от MEXC (X-MEXC-APIKEY), это и было причиной "api key
+    отличается от стандартного заголовка Binance API, это и было причиной "api key
     required" при первом реальном вызове /balance в проде.
 
     Возвращает {ASSET: free+locked} по всем ненулевым балансам.
@@ -1363,14 +1248,14 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     def _try_spot_futures(name, futures_fn, spot_fn, ticker_prices_fn=None):
         """
-        Для MEXC/Gate: futures + оценка спота в USD.
+        Для Gate: futures + оценка спота в USD.
 
         ticker_prices_fn (если задан) — публичный тикер цен самой биржи
-        (fetch_mexc_ticker_prices/fetch_gate_ticker_prices), используется
+        (fetch_gate_ticker_prices), используется
         В ПЕРВУЮ очередь через price_spot_balances_usd_native: на реальном
         аккаунте выяснилось, что оценка через общий поиск тикера в CoinGecko
         может зацепить ЧУЖУЮ монету под тем же тикером (малоизвестные
-        MEXC-листинги BTW/GUA — цена в разы заниженная, без единой ошибки,
+        биржевые токены BTW/GUA — цена в разы заниженная, без единой ошибки,
         просто совпадение тикера с другой монетой) — цена с самой биржи,
         где эта монета реально куплена, такой проблемы не имеет.
 
@@ -1419,14 +1304,6 @@ def fetch_all_balances(secrets: dict) -> dict:
     if "lighter_account_index" in secrets:
         _try("lighter", lambda: fetch_lighter_balance(secrets["lighter_account_index"]))
 
-    if "mexc_api_key" in secrets:
-        _try_spot_futures(
-            "mexc",
-            lambda: fetch_mexc_futures_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
-            lambda: fetch_mexc_spot_balance(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
-            fetch_mexc_ticker_prices,
-        )
-
     if "gate_api_key" in secrets:
         _try_spot_futures(
             "gate",
@@ -1437,7 +1314,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 
     if "kucoin_api_key" in secrets:
         # KuCoin используется только для сводного баланса (в отличие от
-        # Aster/Bybit/Lighter/MEXC/Gate он не часть funding-стратегии и не
+        # Aster/Bybit/Lighter/Gate он не часть funding-стратегии и не
         # опрашивается funding_report.py/calculator.py/funding_alerts.py) —
         # секреты для него всё равно приходят из общего load_secrets(), как
         # и у остальных бирж.
@@ -1489,7 +1366,7 @@ def fetch_all_balances(secrets: dict) -> dict:
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
+"gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX",
     "htx": "HTX", "bingx": "BingX", "ourbit": "OurBit",
 }
 _BYBIT_PART_LABELS = {

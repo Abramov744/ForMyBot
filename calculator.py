@@ -29,9 +29,9 @@ taker-ставки без VIP-скидок на момент написания)
 from collections import defaultdict
 
 from funding_report import (
-    fetch_aster, fetch_bybit, fetch_lighter, fetch_mexc, fetch_gate, fetch_kucoin, fetch_dydx, fetch_htx,
+    fetch_aster, fetch_bybit, fetch_lighter, fetch_gate, fetch_kucoin, fetch_dydx, fetch_htx,
     fetch_aster_open_symbols, fetch_bybit_open_symbols, fetch_lighter_open_symbols,
-    fetch_mexc_open_symbols, fetch_gate_open_symbols, fetch_kucoin_open_symbols,
+    fetch_gate_open_symbols, fetch_kucoin_open_symbols,
     fetch_dydx_open_symbols, fetch_htx_open_symbols,
     _fetch_in_windows, _EXCHANGE_WINDOW_DAYS, _trim_to_continuous_run,
 )
@@ -42,7 +42,7 @@ from funding_report import (
 # тоже попадёт в выборку по символу. bot_poll/funding_report для отчёта
 # "по открытым позициям" (fetch_all_time_open_positions) от этого защищён —
 # он обрезает историю каждого символа до момента, когда ТЕКУЩАЯ позиция
-# была открыта (точно — по createTime/transactionTime у Bybit/MEXC,
+# была открыта (точно — по createTime/transactionTime у Bybit,
 # приближённо — по непрерывности начислений у Aster/Gate/Lighter, см.
 # _trim_to_continuous_run). Раньше калькулятор такой обрезки не делал вовсе
 # и просто суммировал все funding-записи по символу за весь период, который
@@ -54,10 +54,9 @@ from funding_report import (
 # открытым позициям — чтобы оба места считали одинаково.
 _EXACT_OPEN_TIME_FIELDS = {
     "bybit": "transactionTime",
-    "mexc": "settleTime",
     "kucoin": "timePoint",
     # dYdX, в отличие от Aster/Lighter/Gate, отдаёт ТОЧНОЕ время открытия
-    # позиции (createdAt) — попадает в ту же категорию, что Bybit/MEXC/
+    # позиции (createdAt) — попадает в ту же категорию, что Bybit/
     # KuCoin, а не в _CONTINUOUS_OPEN_TIME_FIELDS ниже. "time_ms" — поле,
     # которое fetch_dydx сама добавляет в каждую запись (см. её докстринг
     # в funding_report.py), уже в мс, как и у остальных трёх здесь.
@@ -84,12 +83,11 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
     try:
         if exchange in _EXACT_OPEN_TIME_FIELDS:
             # lambda-диспетчер (не просто {биржа: функция} + отдельная пара
-            # полей секретов, как раньше) — у KuCoin, в отличие от Bybit/MEXC,
+            # полей секретов, как раньше) — у KuCoin, в отличие от Bybit,
             # ТРИ значения ключа (ещё и passphrase), под один общий шаблон
             # вызова уже не уложить.
             fetch_open = {
                 "bybit": lambda: fetch_bybit_open_symbols(secrets["bybit_api_key"], secrets["bybit_api_secret"]),
-                "mexc": lambda: fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"]),
                 "kucoin": lambda: fetch_kucoin_open_symbols(
                     secrets["kucoin_api_key"], secrets["kucoin_api_secret"], secrets["kucoin_api_passphrase"],
                 ),
@@ -99,7 +97,7 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
                 "htx": lambda: fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"]),
             }.get(exchange)
             required_key = {
-                "bybit": "bybit_api_key", "mexc": "mexc_api_key", "kucoin": "kucoin_api_key",
+    "bybit": "bybit_api_key", "kucoin": "kucoin_api_key",
                 "dydx": "dydx_address", "htx": "htx_api_key",
             }[exchange]
             if required_key not in secrets or fetch_open is None:
@@ -140,7 +138,7 @@ def _trim_to_current_open_position(secrets: dict, exchange: str, symbol: str, re
 
 EXCHANGE_LABELS = {
     "aster": "Aster", "bybit": "Bybit", "lighter": "Lighter",
-    "mexc": "MEXC", "gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX", "htx": "HTX",
+"gate": "Gate", "kucoin": "KuCoin", "dydx": "dYdX", "htx": "HTX",
 }
 
 # income_field/symbol_field/asset_field — те же имена полей, что и в
@@ -152,7 +150,6 @@ EXCHANGE_FIELDS = {
     "aster":   {"income": "income",  "symbol": "symbol", "asset": "asset"},
     "bybit":   {"income": "funding", "symbol": "symbol", "asset": "currency"},
     "lighter": {"income": "change",  "symbol": "symbol", "asset": "asset"},
-    "mexc":    {"income": "funding", "symbol": "symbol", "asset": "asset"},
     "gate":    {"income": "change",  "symbol": "symbol", "asset": "asset"},
     "kucoin":  {"income": "funding", "symbol": "symbol", "asset": "settleCurrency"},
     # "symbol"/"asset" — синтетические поля, которые fetch_dydx сама
@@ -169,7 +166,6 @@ EXCHANGE_FIELDS = {
 DEFAULT_FUTURES_TAKER_FEE_PCT = {
     "aster": 0.04,
     "bybit": 0.055,
-    "mexc": 0.02,
     "gate": 0.05,
     "lighter": 0.0,
     # 0.06% — опубликованная ставка VIP 0/tier 0 (kucoin.com/vip/privilege/fee).
@@ -211,10 +207,6 @@ def fetch_funding_history(secrets: dict, exchange: str, start_ms: int, end_ms: i
         if "lighter_account_index" not in secrets:
             raise CalculatorError("Lighter не подключён (нет секретов)")
         fn = lambda s, e: fetch_lighter(secrets["lighter_account_index"], secrets["lighter_auth_token"], s, e)
-    elif exchange == "mexc":
-        if "mexc_api_key" not in secrets:
-            raise CalculatorError("MEXC не подключён (нет секретов)")
-        fn = lambda s, e: fetch_mexc(secrets["mexc_api_key"], secrets["mexc_api_secret"], s, e)
     elif exchange == "gate":
         if "gate_api_key" not in secrets:
             raise CalculatorError("Gate не подключён (нет секретов)")
@@ -325,14 +317,6 @@ def list_open_symbols(secrets: dict) -> dict:
         except Exception as e:
             print(f"[calculator] Lighter open symbols error: {e}")
 
-    if "mexc_api_key" in secrets:
-        try:
-            result["mexc"] = sorted(fetch_mexc_open_symbols(
-                secrets["mexc_api_key"], secrets["mexc_api_secret"],
-            ).keys())
-        except Exception as e:
-            print(f"[calculator] MEXC open symbols error: {e}")
-
     if "gate_api_key" in secrets:
         try:
             result["gate"] = sorted(fetch_gate_open_symbols(
@@ -376,8 +360,6 @@ def list_connected_exchanges(secrets: dict) -> list:
         keys.append("bybit")
     if "lighter_account_index" in secrets:
         keys.append("lighter")
-    if "mexc_api_key" in secrets:
-        keys.append("mexc")
     if "gate_api_key" in secrets:
         keys.append("gate")
     if "kucoin_api_key" in secrets:
