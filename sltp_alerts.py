@@ -39,7 +39,7 @@ check_closed_positions ниже). Раньше эти два случая не �
 чего единичный сетевой сбой на одной бирже выглядел как одновременное
 закрытие ВСЕХ открытых на ней позиций — ложный алерт в Telegram и ложная
 запись даты закрытия в Google Sheet для всё ещё открытой связки (реальный
-случай на живом аккаунте: MEXC BTW_USDT).
+случай на живом аккаунте: Gate BTW_USDT).
 
 УТОЧНЕНИЕ ПРИЧИНЫ (SL/TP) — не одинаковое для всех пяти, и это осознанно:
   - Bybit — надёжно: GET /v5/execution/list отдаёт поле stopOrderType прямо
@@ -66,13 +66,13 @@ check_closed_positions ниже). Раньше эти два случая не �
     неточность документации HTX, что уже встречалась (mark_price в
     /v5/trade/position/opens, см. README) — запрос всё равно
     подписывается по общей v5-схеме.
-  - MEXC, Gate, Lighter — причина НЕ уточняется в этой версии (см. историю
+  - Gate, Lighter — причина НЕ уточняется в этой версии (см. историю
     решения ниже), но сам факт закрытия по-прежнему алертится — просто без
     пометки SL/TP:
-      * MEXC — условные (Plan) ордера живут в отдельном API, официальный
+      * Gate — условные (Plan) ордера живут в отдельном API, официальный
         формат ответа истории исполненных план-ордеров не задокументирован
         достаточно точно, чтобы писать код не вслепую (в отличие от,
-        скажем, MEXC funding_rate/history, который проверен по документации
+        скажем, Gate funding_rate/history, который проверен по документации
         построчно).
       * Gate — есть price_triggered_orders со статусом finished, но внутри
         одной finished-записи нет прямого поля "это был TP" / "это был SL"
@@ -98,8 +98,8 @@ from datetime import datetime, timezone
 import requests
 
 from funding_report import (
-    _get_proxies, _bybit_sign, _aster_sign, _mexc_sign, _gate_sign,
-    _get_mexc_proxies, _get_gate_proxies, _get_dydx_proxies, DYDX_INDEXER_BASE_URL,
+    _get_proxies, _bybit_sign, _aster_sign, _gate_sign,
+    _get_gate_proxies, _get_dydx_proxies, DYDX_INDEXER_BASE_URL,
     LIGHTER_BASE_URL, fetch_lighter_markets,
     _htx_signed_get,
     load_secrets, send_telegram_broadcast,
@@ -298,7 +298,7 @@ def _htx_close_reason(secrets: dict, symbol: str) -> tuple | None:
 
 
 # Только биржи, где сигнал SL/TP задокументирован прямо и однозначно —
-# см. докстринг модуля про MEXC/Gate/Lighter.
+# см. докстринг модуля про Gate/Lighter.
 _CLOSE_REASON_FETCHERS = {
     "bybit": _bybit_close_reason,
     "aster": _aster_close_reason,
@@ -339,7 +339,7 @@ def _vwap(qty_price_pairs) -> float | None:
 #     задокументировано официально.
 #   - Aster — поле side ("BUY"/"SELL") в каждом ордере, тот же
 #     Binance-совместимый формат, что и остальные поля этого эндпоинта.
-#   - MEXC, Gate — НЕ фильтруется: у MEXC сторона сделки — числовой код 1-4
+#   - Gate — НЕ фильтруется: у Gate сторона сделки — числовой код 1-4
 #     (открытие/закрытие лонга/шорта), однозначного маппинга кодов 2/4 в
 #     официальной документации не нашлось; у Gate в ответе my_trades нет
 #     явного поля стороны (см. докстринг _gate_close_price). Поэтому для
@@ -407,40 +407,6 @@ def _aster_close_price(secrets: dict, symbol: str) -> float | None:
     return _vwap([(float(o["executedQty"]), float(o["avgPrice"])) for o in closes])
 
 
-def _mexc_close_price(secrets: dict, symbol: str) -> float | None:
-    """
-    GET /api/v1/private/order/list/order_deals/v3 — история исполненных
-    сделок (deals) по символу. Путь и поля ответа (price, vol, timestamp)
-    ПОДТВЕРЖДЕНЫ по офиц. SDK ccxt (ccxt/mexc.py: fetchMyTrades для
-    контрактных рынков вызывает contractPrivateGetOrderListOrderDealsV3 —
-    этот же путь; parseTrade читает оттуда price/vol/timestamp/side и т.д.).
-    Сторону сделки НЕ фильтруем — см. докстринг раздела выше.
-    """
-    base_url = "https://api.mexc.com"
-    api_key = secrets["mexc_api_key"].strip()
-    api_secret = secrets["mexc_api_secret"].strip()
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - int(SLTP_LOOKBACK_MINUTES * 60 * 1000)
-    timestamp = str(now_ms)
-    params_list = [
-        ("symbol", symbol), ("page_num", "1"), ("page_size", "50"),
-        ("start_time", str(start_ms)), ("end_time", str(now_ms)),
-    ]
-    sig = _mexc_sign(api_key, api_secret, timestamp, params_list)
-    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-    query_string = urllib.parse.urlencode(sorted(params_list, key=lambda kv: kv[0]))
-    resp = requests.get(
-        f"{base_url}/api/v1/private/order/list/order_deals/v3?{query_string}",
-        headers=headers, timeout=15, proxies=_get_mexc_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC order_deals error {data.get('code')}: {data.get('message') or data}")
-    deals = [d for d in (data.get("data") or []) if d.get("price") and d.get("vol")]
-    return _vwap([(float(d["vol"]), float(d["price"])) for d in deals])
-
-
 def _gate_close_price(secrets: dict, symbol: str, settle: str = "usdt") -> float | None:
     """
     GET /api/v4/futures/{settle}/my_trades — история исполненных сделок по
@@ -480,7 +446,7 @@ def _dydx_close_price(secrets: dict, symbol: str) -> float | None:
     """
     GET /v4/fills — явное поле side ("BUY"/"SELL", ПОДТВЕРЖДЕНО живым
     запросом к Indexer) прямо в каждом исполнении, та же надёжная
-    ситуация, что у Bybit/Aster (не как у MEXC/Gate, где сторону не
+    ситуация, что у Bybit/Aster (не как у Gate/Gate, где сторону не
     фильтруем, см. докстринг раздела выше) — закрытие шорта = покупка,
     фильтруем side == "BUY".
 
@@ -652,7 +618,6 @@ def _htx_close_price(secrets: dict, symbol: str) -> float | None:
 _CLOSE_PRICE_FETCHERS = {
     "bybit": _bybit_close_price,
     "aster": _aster_close_price,
-    "mexc": _mexc_close_price,
     "gate": _gate_close_price,
     "dydx": _dydx_close_price,
     "lighter": _lighter_close_price,
@@ -685,7 +650,7 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
     обычным/ручным), алерт всё равно уходит — просто без пометки причины.
     Возвращает новое состояние для следующей итерации.
 
-    ВАЖНО (реальный баг, найденный на живом аккаунте — ложный алерт "MEXC
+    ВАЖНО (реальный баг, найденный на живом аккаунте — ложный алерт "Gate
     BTW_USDT закрыта" и ложная запись даты закрытия в Google Sheet для
     связки, которая на самом деле оставалась открытой): get_open_positions
     возвращает ВТОРЫМ элементом failed_exchanges — биржи, у которых запрос
@@ -708,7 +673,7 @@ def check_closed_positions(secrets: dict, prev_open: dict) -> dict:
               f"API не должен приниматься за закрытие всех позиций на бирже).")
 
     # Проходим по объединению бирж из обоих состояний, а не только по
-    # _CLOSE_REASON_FETCHERS — иначе MEXC/Gate/Lighter вообще выпали бы
+    # _CLOSE_REASON_FETCHERS — иначе Gate/Lighter вообще выпали бы
     # из отслеживания закрытий.
     for exchange in set(prev_open) | set(current_open):
         if exchange in failed_exchanges:
