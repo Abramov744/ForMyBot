@@ -552,9 +552,9 @@ Trading Bot API (`POST /v5/botsummary/list-all-bots`,
 - `fetch_aster_balance` — поле `unRealizedProfit` подтверждено по
   документации Binance Futures API (форк которого — Aster), но не сверено
   на реальном ответе именно Aster;
-- `fetch_lighter_balance` — имена полей (`collateral`/`unrealized_pnl`)
-  подтверждены по официальной документации SDK Lighter
-  (elliottech/lighter-python), но не сверены на реальном ответе API.
+- `fetch_lighter_balance` — поля `collateral`, `allocated_margin`,
+  `margin_mode` и `unrealized_pnl` описаны в актуальной схеме API Lighter;
+  фактический ответ пользовательского аккаунта в среде разработки недоступен.
 - `fetch_kucoin_spot_balance`/`fetch_kucoin_futures_balance` — новее
   остальных, ни разу не сверены с реальным аккаунтом KuCoin. Формулы и
   имена полей подтверждены по офиц. SDK `ccxt` и офиц. Go SDK
