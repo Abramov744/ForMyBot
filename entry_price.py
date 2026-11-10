@@ -63,18 +63,9 @@ WINDOW_MINUTES_APPROX = 360    # Aster/Gate/Lighter — время оценен�
 # пропустится (см. _search_spot_entry) — это не ошибка, ищем в порядке приоритета.
 QUOTE_CANDIDATES = ["USDT", "USDC", "WETH"]
 
-# Один и тот же актив на разных биржах иногда торгуется под РАЗНЫМИ
-# тикерами (обычно из-за конфликта имени с уже занятым на этой конкретной
-# бирже тикером) — сопоставить их автоматически неоткуда, это не выводится
-# из API ни одной биржи. Реальный случай (подтверждено пользователем,
-# 14.09.2026): шорт на Lighter под тикером "AI", встречная спот-покупка
-# того же актива — на биржи, но там он называется "AIINU", поэтому
-# _search_spot_entry искал на биржи пару "AIUSDT" и ничего не находил
-# (short_position_tracker так и не создавал строку — покупка на споте
-# "не найдена", хотя по факту была). Ключ — (биржа, база_актива на других
-# биржах), значение — реальный тикер этого актива именно на этой бирже.
-# Пополняется по мере обнаружения новых случаев — не пытаться угадывать
-# заранее.
+# Дополнительные соответствия тикеров между биржами, если они будут
+# подтверждены реальными сделками. Ключ — (биржа, базовый актив), значение —
+# фактический тикер на этой бирже.
 BASE_ASSET_ALIASES = {}
 
 
@@ -609,9 +600,8 @@ def _fetch_bingx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
     а не по конкретному ордеру. symbol — через дефис, в ВЕРХНЕМ регистре
     ("BTC-USDT", как у KuCoin, см. _SPOT_TRADE_FETCHERS ниже).
 
-    Сторона сделки — булево поле isBuyer (не строка "BUY"/"SELL", как у
-    большинства остальных бирж) — тот же случай, что у биржи
-    (_fetch_bybit_spot_trades, там isBuyer тоже bool).
+    Сторона сделки — булево поле isBuyer (не строка "BUY"/"SELL") —
+    такой же формат используется в OurBit (_fetch_ourbit_spot_trades).
     """
     api_key = secrets["bingx_api_key"].strip()
     api_secret = secrets["bingx_api_secret"].strip()
@@ -628,20 +618,13 @@ def _fetch_bingx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
 
 def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
     """
-    GET /api/v3/myTrades — OurBit ПОДТВЕРЖДЕНО (живыми запросами 24.10.2026,
-    см. докстринг секции OurBit в funding_report.py) работает на общем
-    бэкенде с биржи: идентичные /api/v3/ping, /api/v3/time и ПОБАЙТОВО
-    совпадающий текст ошибки /api/v3/account без ключа. Поэтому — та же
-    схема запроса, что у _fetch_bybit_spot_trades (symbol слитно, без
-    разделителя, "BTCUSDT"; подпись entry_price.Binance-совместимая, см.
-    funding_report._ourbit_sign; та же разборка ошибки code/msg раньше
-    raise_for_status(), чтобы не терять содержательное сообщение).
+    GET /api/v3/myTrades — спотовая история сделок OurBit. Формат запроса
+    совместим с Binance Spot API: символ слитно ("BTCUSDT"), параметры
+    symbol/startTime/endTime/limit/recvWindow/timestamp. Query-строка
+    подписывается HMAC-SHA256 через funding_report._ourbit_sign.
 
-    ПРОВЕРЕНО 25.10.2026 по официальной документации
-    https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок ключа
-    называется X-OURBIT-APIKEY (а не X-биржи-APIKEY, как предполагалось по
-    аналогии с общим бэкендом биржи — именно это и было причиной реальных
-    404/400 от прода при первом включении биржи).
+    По официальной документации OurBit ключ передаётся в заголовке
+    X-OURBIT-APIKEY. Ответ содержит сторону сделки в булевом поле isBuyer.
     """
     api_key = secrets["ourbit_api_key"].strip()
     api_secret = secrets["ourbit_api_secret"].strip()
