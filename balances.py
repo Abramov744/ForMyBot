@@ -31,10 +31,10 @@
     что использует Binance Futures API, форком которого является Aster;
     без PnL баланс не совпадал с реальным при открытых позициях). Споta у
     Aster нет вовсе, см. README.
-  - Lighter — collateral (обеспечение) + сумма unrealized_pnl по всем
-    открытым позициям — по документации Lighter Total Account Value =
-    Collateral + Unrealized PnL, а готового поля с суммой в API нет, считаем
-    сами (см. fetch_lighter_balance).
+  - Lighter — collateral аккаунта + allocated_margin изолированных
+    позиций + сумма unrealized_pnl по всем открытым позициям — по
+    документации Lighter изолированное обеспечение учитывается отдельно
+    (см. fetch_lighter_balance).
   - dYdX    — equity сабаккаунта (публичный Indexer API, без ключа, по
     адресу кошелька) — в отличие от Lighter выше, это поле УЖЕ включает
     нереализованный PnL открытых позиций, прибавлять отдельно не нужно
@@ -816,18 +816,12 @@ def fetch_lighter_balance(account_index: str) -> float:
     тот же эндпоинт, что и funding_report.fetch_lighter_open_symbols
     использует для списка позиций.
 
-    ПОДТВЕРЖДЕНО по официальной документации полей SDK (elliottech/lighter-
-    python, docs/Account.md и docs/AccountPosition.md, дословный список
-    полей на 29.08.2026): на уровне аккаунта есть только collateral —
-    обеспечение БЕЗ учёта результата по открытым позициям, готового поля
-    "итог с учётом PnL" в API нет. При этом по документации Lighter (Total
-    Account Value = Collateral + Unrealized PnL) полный баланс — это
-    collateral ПЛЮС unrealized_pnl каждой открытой позиции (поле
-    AccountPosition.unrealized_pnl) — раньше считался только collateral,
-    поэтому PnL открытых позиций не попадал в баланс. Реальный ответ Lighter
-    напрямую не проверялся (доступа к его API из этой среды разработки не
-    было) — имена полей взяты из офиц. SDK, но однократно сверить с
-    приложением Lighter после деплоя всё равно стоит.
+    По документации Lighter Total Account Value = Collateral + Unrealized
+    PnL. Для isolated-позиций allocated_margin — отдельное обеспечение,
+    которое учитывается как collateral; поэтому складываем account-level
+    collateral, allocated_margin только позиций с margin_mode == 1 и
+    unrealized_pnl всех открытых позиций. Эти поля описаны в актуальной
+    схеме GET /api/v1/account (Account / AccountPosition).
     """
     resp = requests.get(
         f"{LIGHTER_BASE_URL}/api/v1/account",
@@ -847,6 +841,8 @@ def fetch_lighter_balance(account_index: str) -> float:
             pass
         for pos in acc.get("positions", []):
             try:
+                if int(pos.get("margin_mode", 0) or 0) == 1:
+                    total += float(pos.get("allocated_margin", 0) or 0)
                 total += float(pos.get("unrealized_pnl", 0) or 0)
             except (TypeError, ValueError):
                 continue

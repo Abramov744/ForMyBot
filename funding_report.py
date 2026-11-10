@@ -18,6 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 import requests
+import websocket
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
@@ -586,6 +587,45 @@ def _lighter_account_raw(account_index: str, auth_token: str) -> list:
         raise RuntimeError(f"Lighter account error: {data}")
 
     return data.get("accounts", [data]) if "accounts" not in data else data["accounts"]
+
+
+def _lighter_user_stats_raw(account_index: str, auth_token: str) -> dict:
+    """
+    Получает authoritative account stats из приватного WebSocket-канала
+    user_stats/{account_index}. REST account.collateral не отражает весь
+    collateral при isolated margin; stats.collateral — агрегированное значение,
+    которое Lighter публикует именно для collateral/margin usage.
+    """
+    ws_url = LIGHTER_BASE_URL.replace("https://", "wss://", 1) + "/stream"
+    ws = websocket.create_connection(ws_url, timeout=15)
+    try:
+        ws.send(json.dumps({
+            "type": "subscribe",
+            "channel": f"user_stats/{account_index}",
+            "auth": auth_token.strip(),
+        }))
+        deadline = time.monotonic() + 15
+        for _ in range(20):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ws.settimeout(remaining)
+            raw = ws.recv()
+            if not raw:
+                continue
+            message = json.loads(raw)
+            if message.get("error"):
+                raise RuntimeError(f"Lighter user_stats error: {message['error']}")
+            if message.get("channel") == f"user_stats:{account_index}" or message.get("type") in (
+                "subscribed/user_stats", "update/user_stats",
+            ):
+                stats = message.get("stats")
+                if not isinstance(stats, dict) or stats.get("collateral") in (None, ""):
+                    raise RuntimeError(f"Lighter user_stats response has no collateral: {message}")
+                return stats
+        raise TimeoutError(f"Lighter user_stats timeout for account {account_index}")
+    finally:
+        ws.close()
 
 
 def _lighter_positions_raw(account_index: str, auth_token: str) -> list:

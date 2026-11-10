@@ -473,10 +473,11 @@ VIP 0/tier 0, опубликовано на kucoin.com/vip/privilege/fee), ка�
   PnL открытых позиций (`/fapi/v3/positionRisk`, поле `unRealizedProfit`,
   как у Binance Futures API, форком которого является Aster). Спота у
   Aster нет вовсе.
-- **Lighter** — `collateral` (обеспечение) **+** сумма `unrealized_pnl` по
-  всем открытым позициям — по документации Lighter Total Account Value =
-  Collateral + Unrealized PnL, готового поля с суммой в API нет. Спота у
-  Lighter нет вовсе.
+- **Lighter** — `collateral` аккаунта **+** `allocated_margin` только
+  isolated-позиций (`margin_mode == 1`) **+** сумма `unrealized_pnl`
+  всех открытых позиций. Документация отдельно указывает, что allocated
+  margin isolated-позиции является отдельным collateral и учитывается в
+  Total Account Value. Спота у Lighter нет вовсе.
 
   Для всех трёх бирж (Gate/Aster/Lighter) раньше учитывался только сам
   кошелёк/collateral, без PnL открытых позиций — из-за этого баланс
@@ -551,9 +552,9 @@ Trading Bot API (`POST /v5/botsummary/list-all-bots`,
 - `fetch_aster_balance` — поле `unRealizedProfit` подтверждено по
   документации Binance Futures API (форк которого — Aster), но не сверено
   на реальном ответе именно Aster;
-- `fetch_lighter_balance` — имена полей (`collateral`/`unrealized_pnl`)
-  подтверждены по официальной документации SDK Lighter
-  (elliottech/lighter-python), но не сверены на реальном ответе API.
+- `fetch_lighter_balance` — поля `collateral`, `allocated_margin`,
+  `margin_mode` и `unrealized_pnl` описаны в актуальной схеме API Lighter;
+  фактический ответ пользовательского аккаунта в среде разработки недоступен.
 - `fetch_kucoin_spot_balance`/`fetch_kucoin_futures_balance` — новее
   остальных, ни разу не сверены с реальным аккаунтом KuCoin. Формулы и
   имена полей подтверждены по офиц. SDK `ccxt` и офиц. Go SDK
@@ -626,14 +627,11 @@ order_margin+available, не зависит от unrealised_pnl). Долларо
    🟢 PnL: +50.00 (+10.0% от маржи) — цена: 0.045 (ликвидация 0.08)
 ```
 
-Для **Lighter**: `margin_base = collateral` (аккаунт, не зависит от
-unrealized_pnl, тот же смысл, что и total у Gate). Долларовый PnL, как и у Gate, отдаётся прямо в ответе
-позиции (поле `unrealized_pnl`, тот же источник, что уже использует
-`balances.fetch_lighter_balance`). **ВАЖНО**: в отличие от Gate, эта
-формула не проверена против реального счёта с открытой позицией — поля
-взяты из офиц. docs SDK (`elliottech/lighter-python`, проверено
-06.10.2026), но собственной проверки по диагностическому логу сырых полей
-(как для других бирж) для Lighter не делалось:
+Для **Lighter**: `margin_base` берётся из `stats.collateral` официального
+WebSocket-канала `user_stats/{account_index}`. Это агрегированное поле
+для collateral/margin usage и учитывает isolated margin; не нужно вручную
+складывать `collateral` и `allocated_margin` из REST-позиций. PnL берётся
+из `unrealized_pnl` всех открытых позиций.
 
 ```
 🔴 ANSEM: -0.0100% за выплату (годовых -87.6%) — через 1ч, funding раз в 1ч
@@ -772,21 +770,18 @@ unrealized  = unrealised_pnl
 Маржа: 500 USDT → нереализованный PNL: -400 USDT
 ```
 
-**LIGHTER** — тоже одно готовое поле, как у Gate:
+**LIGHTER** — маржа берётся из агрегированного поля
+`stats.collateral` приватного WebSocket-канала
+`user_stats/{account_index}`:
 
 ```
-margin_base = collateral
+margin_base = user_stats.stats.collateral
 unrealized  = sum(position.unrealized_pnl)
 ```
 
-`collateral` (ПОДТВЕРЖДЕНО офиц. docs SDK `elliottech/lighter-python`,
-`docs/Account.md`, проверено 06.10.2026) — обеспечение на уровне аккаунта
-БЕЗ учёта floating PnL, аналогично `total` у Gate. `unrealized` считается суммой поля
-`unrealized_pnl` по всем открытым позициям (тот же источник, что уже
-использует `balances.fetch_lighter_balance`). **ВАЖНО**: в отличие от
-Gate, эта формула НЕ проверена против реального счёта пользователя с
-открытой позицией (отдельной сверки с боевым аккаунтом не было) — первый реальный алерт стоит явно сверить с
-суммами на экране приложения Lighter:
+Lighter документирует Account Stats как источник collateral, leverage и
+margin usage. Это надёжнее, чем собирать значение вручную из REST-полей
+`collateral` и `allocated_margin`, которые легко задвоить.
 
 ```
 🚨 Lighter (USDC): нереализованный убыток достиг 78% от маржи на счёте

@@ -3,3 +3,4 @@ requests
 Flask
 gspread
 matplotlib
+websocket-client

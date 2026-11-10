@@ -16,16 +16,14 @@ PnL, который отдаётся отдельным полем unrealised_pn
   margin_base = total
   unrealized  = unrealised_pnl
 
-LIGHTER — тоже одно готовое поле, как и у Gate: collateral (ПОДТВЕРЖДЕНО
-офиц. docs SDK elliottech/lighter-python, docs/Account.md, проверено
-06.10.2026) — "обеспечение" на уровне аккаунта БЕЗ учёта floating PnL
-открытых позиций (тот же смысл, что и total у Gate). unrealized считается суммой поля unrealized_pnl по всем
-открытым позициям аккаунта (AccountPosition.unrealized_pnl, тот же
-источник, что уже использует balances.fetch_lighter_balance):
-  margin_base = collateral
+LIGHTER — для маржи используется агрегированное поле collateral из
+официального WebSocket-канала user_stats/{account_index}. В отличие от
+REST account.collateral, этот account-stats канал предназначен именно для
+показателей collateral, leverage и margin usage, включая isolated margin.
+  margin_base = user_stats.stats.collateral
   unrealized  = sum(position.unrealized_pnl)
-ВАЖНО: эта формула НЕ проверена против реального счёта пользователя с открытой позицией — поля взяты из офиц. SDK docs, но отдельной сверки с боевым аккаунтом не было. Первый реальный алерт по
-Lighter стоит явно сверить с суммами на экране самого приложения Lighter.
+Так не приходится вручную складывать account collateral и allocated_margin
+и рисковать задвоить isolated collateral.
 
 DYDX (v4) — margin_base = equity (поле саб-аккаунта, см. _dydx_margin_
 snapshot ниже), unrealized = сумма unrealizedPnl по открытым позициям.
@@ -72,7 +70,8 @@ import time
 from balances import _gate_futures_account_raw
 from funding_report import (
     load_secrets, send_telegram_broadcast, _cached_raw_positions,
-    _lighter_account_raw, _dydx_subaccount_raw, _htx_cross_account_raw,
+    _lighter_user_stats_raw, _lighter_positions_raw,
+    _dydx_subaccount_raw, _htx_cross_account_raw,
 )
 
 MARGIN_CHECK_INTERVAL_MINUTES = float(os.environ.get("MARGIN_CHECK_INTERVAL_MINUTES", "5"))
@@ -104,22 +103,22 @@ def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
 def _lighter_margin_snapshot(secrets: dict) -> list:
     """
     Список {"currency", "margin_base", "unrealized"} для счёта Lighter —
-    margin_base = collateral (аккаунт), unrealized = сумма unrealized_pnl
-    по всем открытым позициям (см. докстринг модуля про Lighter и про
-    непроверенность этой формулы на реальном счёте). Валюта всегда USDC —
+    margin_base = агрегированное stats.collateral из канала user_stats,
+    unrealized = сумма unrealized_pnl по всем открытым позициям.
+    Валюта всегда USDC —
     Lighter торгуется с расчётами в USDC (тот же факт, что уже используется
     в funding_report.fetch_lighter).
     """
-    accounts = _cached_raw_positions("lighter:account", lambda: _lighter_account_raw(
+    stats = _cached_raw_positions("lighter:user_stats", lambda: _lighter_user_stats_raw(
         secrets["lighter_account_index"], secrets["lighter_auth_token"],
     ))
-    margin_base = sum(float(acc.get("collateral", 0) or 0) for acc in accounts)
+    positions = _cached_raw_positions("lighter", lambda: _lighter_positions_raw(
+        secrets["lighter_account_index"], secrets["lighter_auth_token"],
+    ))
+    margin_base = float(stats.get("collateral", 0) or 0)
+    unrealized = sum(float(pos.get("unrealized_pnl", 0) or 0) for pos in positions)
     if margin_base <= 0:
         return []
-    unrealized = sum(
-        float(pos.get("unrealized_pnl", 0) or 0)
-        for acc in accounts for pos in acc.get("positions", [])
-    )
     return [{"currency": "USDC", "margin_base": margin_base, "unrealized": unrealized}]
 
 

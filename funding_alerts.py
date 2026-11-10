@@ -97,7 +97,7 @@ from funding_report import (
     _cached_raw_positions,
     _aster_positions_raw,
     _lighter_positions_raw,
-    _lighter_account_raw,
+    _lighter_user_stats_raw,
     _gate_positions_raw,
     _htx_positions_raw,
     _htx_cross_account_raw,
@@ -550,14 +550,14 @@ def _lighter_margin_base(secrets: dict) -> float:
     """
     Поддерживаемая маржа счёта Lighter — тот же смысл (весь реальный
     капитал счёта, НЕ считая floating PnL), что и у Gate, см.
-    margin_alerts.py. Для Lighter это одно готовое поле аккаунта —
-    collateral (ПОДТВЕРЖДЕНО офиц. docs SDK, см. funding_report.
-    _lighter_account_raw) — не нужно ничего складывать, как у Gate.
+    margin_alerts.py. Берётся из официального WebSocket-канала
+    user_stats/{account_index}, который отдаёт агрегированное collateral
+    для расчёта margin usage, включая isolated margin.
     """
-    accounts = _cached_raw_positions("lighter:account", lambda: _lighter_account_raw(
+    stats = _cached_raw_positions("lighter:user_stats", lambda: _lighter_user_stats_raw(
         secrets["lighter_account_index"], secrets["lighter_auth_token"],
     ))
-    return sum(float(acc.get("collateral", 0) or 0) for acc in accounts)
+    return float(stats.get("collateral", 0) or 0)
 
 
 def _lighter_margin_pnl_positions(secrets: dict) -> list:
