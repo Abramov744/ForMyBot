@@ -2,7 +2,7 @@
 """
 Алерт о приближении НЕРЕАЛИЗОВАННОГО УБЫТКА к порогу от поддерживаемой
 маржи на фьючерсном счёте биржи — согласовано с пользователем явно (порог
-70%, формула и её источник — ниже). MEXC, Gate и Lighter (явная просьба —
+70%, формула и её источник — ниже). Gate, Gate и Lighter (явная просьба —
 "сделай всё то же самое" сначала по Gate, потом по Lighter).
 
 ФОРМУЛА (согласована с пользователем явно — после ДВУХ неверных попыток,
@@ -33,28 +33,28 @@ GATE — та же идея, аналогичные поля того же от�
 position_margin + order_margin + available — то есть total уже САМ есть
 margin_base (сумма всех трёх компонентов капитала счёта, без unrealized
 PnL, который отдаётся отдельным полем unrealised_pnl) — никакого
-дополнительного сложения полей не требуется, в отличие от MEXC:
+дополнительного сложения полей не требуется, в отличие от Gate:
   margin_base = total
   unrealized  = unrealised_pnl
 
 LIGHTER — тоже одно готовое поле, как и у Gate: collateral (ПОДТВЕРЖДЕНО
 офиц. docs SDK elliottech/lighter-python, docs/Account.md, проверено
 06.10.2026) — "обеспечение" на уровне аккаунта БЕЗ учёта floating PnL
-открытых позиций (тот же смысл, что cashBalance+positionMargin у MEXC и
+открытых позиций (тот же смысл, что cashBalance+positionMargin у Gate и
 total у Gate). unrealized считается суммой поля unrealized_pnl по всем
 открытым позициям аккаунта (AccountPosition.unrealized_pnl, тот же
 источник, что уже использует balances.fetch_lighter_balance):
   margin_base = collateral
   unrealized  = sum(position.unrealized_pnl)
-ВАЖНО: в отличие от MEXC/Gate, эта формула НЕ проверена против реального
+ВАЖНО: в отличие от Gate, эта формула НЕ проверена против реального
 счёта пользователя с открытой позицией — поля взяты из офиц. SDK docs, но
-собственного эндпоинта тестовой проверки, как был для MEXC (диагностический
+собственного эндпоинта тестовой проверки, как был для Gate (диагностический
 лог сырых полей), для Lighter не делалось. Первый реальный алерт по
 Lighter стоит явно сверить с суммами на экране самого приложения Lighter.
 
 DYDX (v4) — margin_base = equity (поле саб-аккаунта, см. _dydx_margin_
 snapshot ниже), unrealized = сумма unrealizedPnl по открытым позициям.
-В ОТЛИЧИЕ от MEXC/Gate/Lighter, equity у dYdX УЖЕ включает floating PnL
+В ОТЛИЧИЕ от Gate/Lighter, equity у dYdX УЖЕ включает floating PnL
 (Indexer не отдаёт отдельного поля "капитал без PnL") — порог 70%
 здесь означает "убыток съел 70% текущего equity", а не "70% от статичного
 капитала без PnL", как у остальных трёх бирж. Цены ликвидации для dYdX
@@ -94,7 +94,7 @@ liquidation_alerts.py, одна запись на биржу.
 import os
 import time
 
-from balances import _mexc_account_assets_raw, _gate_futures_account_raw
+from balances import _gate_futures_account_raw
 from funding_report import (
     load_secrets, send_telegram_broadcast, _cached_raw_positions,
     _lighter_account_raw, _dydx_subaccount_raw, _htx_cross_account_raw,
@@ -103,31 +103,7 @@ from funding_report import (
 MARGIN_CHECK_INTERVAL_MINUTES = float(os.environ.get("MARGIN_CHECK_INTERVAL_MINUTES", "5"))
 MARGIN_ALERT_THRESHOLD = float(os.environ.get("MARGIN_ALERT_THRESHOLD", "0.70"))
 
-_LABELS = {"mexc": "MEXC", "gate": "Gate", "lighter": "Lighter", "dydx": "dYdX", "htx": "HTX"}
-
-
-def _mexc_margin_snapshot(secrets: dict) -> list:
-    """
-    Список {"currency", "margin_base", "unrealized"} по каждой валюте
-    фьючерсного счёта MEXC — margin_base = cashBalance + positionMargin
-    (см. докстринг модуля про формулу, проверенную на реальных данных).
-    Валюты с нулевым margin_base (нет ни свободных денег, ни маржи под
-    позицией) пропускаются — там нет смысла гонять их через state.
-    """
-    raw = _mexc_account_assets_raw(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-    out = []
-    for a in raw:
-        cash_balance = float(a.get("cashBalance", 0) or 0)
-        position_margin = float(a.get("positionMargin", 0) or 0)
-        margin_base = cash_balance + position_margin
-        if margin_base <= 0:
-            continue
-        out.append({
-            "currency": a.get("currency", "?"),
-            "margin_base": margin_base,
-            "unrealized": float(a.get("unrealized", 0) or 0),
-        })
-    return out
+_LABELS = {"gate": "Gate", "lighter": "Lighter", "dydx": "dYdX", "htx": "HTX"}
 
 
 def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
@@ -136,7 +112,7 @@ def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
     Gate (settle-валюта, на практике почти всегда только usdt, см. README)
     — margin_base = total (уже сам сумма position_margin+order_margin+
     available, см. докстринг модуля), unrealized = unrealised_pnl. В
-    отличие от MEXC — единственный аккаунт на settle-валюту, а не список
+    отличие от Gate — единственный аккаунт на settle-валюту, а не список
     по всем валютам, поэтому здесь список из 0 или 1 элемента.
     """
     data = _gate_futures_account_raw(secrets["gate_api_key"], secrets["gate_api_secret"], settle)
@@ -176,7 +152,7 @@ def _dydx_margin_snapshot(secrets: dict) -> list:
     """
     margin_base = equity (поле саб-аккаунта dYdX — весь капитал счёта,
     включая floating PnL, см. комментарий над funding_report.
-    _dydx_subaccount_raw; ЭТО ОТЛИЧАЕТСЯ от MEXC/Gate/Lighter, где
+    _dydx_subaccount_raw; ЭТО ОТЛИЧАЕТСЯ от Gate/Lighter, где
     margin_base сознательно НЕ включает unrealized PnL — у dYdX
     отдельного "капитал без floating PnL" поля в ответе Indexer нет,
     equity — единственная прямая метрика "сколько реально на счету", и
@@ -237,7 +213,6 @@ def _htx_margin_snapshot(secrets: dict) -> list:
 
 
 _MARGIN_FETCHERS = {
-    "mexc": (_mexc_margin_snapshot, "mexc_api_key"),
     "gate": (_gate_margin_snapshot, "gate_api_key"),
     "lighter": (_lighter_margin_snapshot, "lighter_account_index"),
     "dydx": (_dydx_margin_snapshot, "dydx_address"),
