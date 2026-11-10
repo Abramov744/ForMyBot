@@ -103,10 +103,8 @@ def _gate_margin_snapshot(secrets: dict, settle: str = "usdt") -> list:
 def _lighter_margin_snapshot(secrets: dict) -> list:
     """
     Список {"currency", "margin_base", "unrealized"} для счёта Lighter —
-    margin_base = collateral аккаунта + allocated_margin всех isolated-
-    позиций (margin_mode == 1), unrealized = сумма unrealized_pnl по всем
-    открытым позициям. Cross collateral и isolated allocated margin —
-    отдельные компоненты обеспечения; их нельзя заменять друг другом.
+    margin_base = агрегированное stats.collateral из канала user_stats,
+    unrealized = сумма unrealized_pnl по всем открытым позициям.
     Валюта всегда USDC —
     Lighter торгуется с расчётами в USDC (тот же факт, что уже используется
     в funding_report.fetch_lighter).
