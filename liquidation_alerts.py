@@ -236,7 +236,7 @@ def _dydx_liquidation_positions(secrets: dict) -> list:
     """
     liq_price вычисляется по официальной формуле dYdX v4 (Cross Liquidation
     Price, см. докстринг модуля) — Indexer не отдаёт его готовым полем ни
-    для одной позиции, в отличие от всех остальных пяти бирж.
+    для одной позиции, в отличие от остальных шести бирж.
     """
     subaccount = _cached_raw_positions("dydx", lambda: _dydx_subaccount_raw(
         secrets["dydx_address"], secrets["dydx_subaccount_number"],
