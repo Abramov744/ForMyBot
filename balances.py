@@ -67,14 +67,7 @@ Etherscan), Fluid и Spot Grid Bot на Bybit сознательно НЕ
     сессионной авторизацией), а не вопрос конкретной галочки в правах ключа.
     Раньше здесь была попытка автоматизации (см. git-историю) — убрана как
     бесперспективная, а не оставлена наполовину рабочей.
-  - биржи Loans (залоговое кредитование: BTC в залог, займ в USDT, с LTV и
-    ликвидацией — НЕ обычный `margin/loan` для маржинальной торговли, это
-    другой продукт) — публичного API не нашлось нигде: ни в официальной
-    документации биржи, ни в `ccxt` (самая полная сторонняя библиотека,
-    знает только про margin/loan). Раз даже намёка на эндпоинт нет —
-    решили не гадать путь вслепую (тот же вывод, что и с Grid Bot на
-    Bybit выше, только там хотя бы эндпоинты угадывались, просто были
-    недоступны для сторонних ключей). для не-стейблкоинов на споте берётся с бесплатного
+ для не-стейблкоинов на споте берётся с бесплатного
 публичного CoinGecko API (без ключа, с кэшем на 5 минут) — единственный
 источник цен в проекте без отдельного API-ключа под аккаунт пользователя,
 поэтому ошибки/лимиты этого API НЕ должны ронять остальную часть отчёта: при
@@ -268,7 +261,7 @@ EXCHANGE_TICKER_CACHE_TTL_S = 60      # цены на бирже меняютс�
 
 def fetch_gate_ticker_prices() -> dict:
     """GET /api/v4/spot/tickers — публичный эндпоинт Gate, аналог
-    биржевой тикер выше, для пар вида {ASSET}_USDT."""
+    публичный тикер Gate, для пар вида {ASSET}_USDT."""
     cache_key = "gate"
     now = time.time()
     if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
@@ -676,7 +669,7 @@ def fetch_kucoin_ticker_prices() -> dict:
     аналог fetch_gate_ticker_prices выше (см. их
     докстринги про то, зачем нужна цена именно с самой биржи, а не только
     через CoinGecko). У KuCoin символы через дефис ({BASE}-USDT), не слитно
-    (Gate) — с подчёркиванием."""
+    (в отличие от Gate, где символы разделяются подчёркиванием)."""
     cache_key = "kucoin"
     now = time.time()
     if cache_key in _exchange_ticker_cache and now - _exchange_ticker_cache_ts[cache_key] < EXCHANGE_TICKER_CACHE_TTL_S:
@@ -1050,7 +1043,7 @@ def fetch_bingx_balance(api_key: str, api_secret: str) -> float:
 
 def fetch_ourbit_ticker_prices() -> dict:
     """GET /api/v3/ticker/price — публичный эндпоинт, в формате Binance Spot API (см.
-    докстринг секции OurBit в funding_report.py про общий бэкенд) —
+    описание Binance-совместимого Spot API OurBit в funding_report.py) —
     прямой аналог биржевой тикер выше, другой базовый URL."""
     cache_key = "ourbit"
     now = time.time()
@@ -1077,8 +1070,7 @@ def fetch_ourbit_ticker_prices() -> dict:
 def fetch_ourbit_spot_balance(api_key: str, api_secret: str) -> dict:
     """
     GET /api/v3/account — та же схема подписи и тот же заголовок ключа,
-    что у получения спот-баланса выше (см. докстринг секции OurBit в
-    funding_report.py про общий бэкенд): query_string подписывается как
+    с подписью через funding_report._ourbit_sign: query_string подписывается как
     есть (timestamp+recvWindow, без сортировки), signature = HMAC-SHA256
     (funding_report._ourbit_sign), ключ — в заголовке X-OURBIT-APIKEY.
     ПРОВЕРЕНО 25.10.2026 по официальной документации
