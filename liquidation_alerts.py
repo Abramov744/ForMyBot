@@ -29,8 +29,7 @@ EDGE-TRIGGERED, как и funding-алерты (funding_alerts.check_funding_ale
 пришлёт алерт.
 
 ВАЖНО (тот же класс бага, что уже был реальным на этом коде — см.
-funding_alerts.get_open_positions/sltp_alerts.py, ложный алерт "
-BTW_USDT закрыта"): временный сетевой/API-сбой при запросе позиций на
+funding_alerts.get_open_positions/sltp_alerts.py, ложный алерт о закрытии позиции): временный сетевой/API-сбой при запросе позиций на
 КОНКРЕТНОЙ бирже не должен читаться как "открытых позиций на ней больше
 нет" — иначе единичный сбой стирал бы state для всех символов этой биржи,
 и при восстановлении API уже сработавшая (но ещё не сброшенная) тревога
@@ -56,14 +55,8 @@ funding_report._cached_raw_positions (короткий TTL-кэш, см. её д
     — тоже оба поля прямо в ответе.
   - KuCoin — GET /api/v1/positions: markPrice, liquidationPrice — тоже оба
     поля прямо в ответе.
-  -    — GET /api/v1/private/position/open_positions отдаёт
-    liquidatePrice, но НЕ отдаёт текущую цену — она берётся отдельным
-    ПУБЛИЧНЫМ (без ключей) запросом GET /api/v1/contract/fair_price/
-    {symbol} (поле fairPrice), по одному на каждый открытый на 
-    символ (подтверждено по офиц. docs — 
-    market-endpoints/get-fair-price).
   - Lighter — ТЕПЕРЬ ВКЛЮЧЁН (явная просьба пользователя, "настрой Lighter
-    так же, как  и Gate"). Раньше считалось, что поле цены ликвидации
+    так же, как и Gate"). Раньше считалось, что поле цены ликвидации
     нигде не документировано — это было верно на момент той проверки, но
     офиц. SDK (elliottech/lighter-python, docs/AccountPosition.md,
     дословно проверено 06.10.2026) с тех пор получил поле
