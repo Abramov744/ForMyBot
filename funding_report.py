@@ -604,7 +604,12 @@ def _lighter_user_stats_raw(account_index: str, auth_token: str) -> dict:
             "channel": f"user_stats/{account_index}",
             "auth": auth_token.strip(),
         }))
+        deadline = time.monotonic() + 15
         for _ in range(20):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ws.settimeout(remaining)
             raw = ws.recv()
             if not raw:
                 continue
