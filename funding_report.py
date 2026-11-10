@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Funding Fee Daily Report — Aster + Bybit + Lighter + MEXC + Gate → Telegram
+Funding Fee Daily Report — Aster + Bybit + Lighter + Gate → Telegram
 Период: предыдущие календарные сутки по МСК (00:00–00:00 МСК).
 Запуск: ежедневно в 04:00 UTC (07:00 МСК).
 """
@@ -70,13 +70,6 @@ def load_secrets() -> dict:
     if lighter_account_index and lighter_auth_token:
         result["lighter_account_index"] = lighter_account_index
         result["lighter_auth_token"]    = lighter_auth_token
-
-    # MEXC — опционально
-    mexc_api_key    = os.environ.get("MEXC_API_KEY")
-    mexc_api_secret = os.environ.get("MEXC_API_SECRET")
-    if mexc_api_key and mexc_api_secret:
-        result["mexc_api_key"]    = mexc_api_key
-        result["mexc_api_secret"] = mexc_api_secret
 
     # Gate — опционально
     gate_api_key    = os.environ.get("GATE_API_KEY")
@@ -577,7 +570,7 @@ def _lighter_account_raw(account_index: str, auth_token: str) -> list:
     collateral/available_balance — ПОДТВЕРЖДЕНО по офиц. docs SDK
     (elliottech/lighter-python, docs/Account.md, дословный список полей на
     06.10.2026): collateral — обеспечение БЕЗ учёта floating PnL открытых
-    позиций (тот же смысл, что cashBalance+positionMargin у MEXC и total у
+    позиций (тот же смысл, что cashBalance+positionMargin у Gate и total у
     Gate — весь реальный капитал счёта, не считая PnL), available_balance —
     свободная (не занятая под позиции) часть этого обеспечения.
     """
@@ -660,7 +653,7 @@ DYDX_INDEXER_BASE_URL = "https://indexer.dydx.trade"
 def _get_dydx_proxies() -> dict | None:
     """
     Прокси для запросов к dYdX Indexer — тот же паттерн, что и для
-    MEXC/Gate. Особенно вероятно понадобится: dYdX Indexer активно
+    Gate. Особенно вероятно понадобится: dYdX Indexer активно
     блокирует запросы по географии условий использования (подтверждено —
     тестовый запрос с IP одного из облачных провайдеров словил именно
     такую блокировку, не просто сетевую ошибку).
@@ -706,7 +699,7 @@ def fetch_dydx_open_symbols(address: str, subaccount_number: str) -> dict:
     """
     {symbol: open_time_ms} — словарь, а не множество, как у Lighter/Gate/
     Aster: dYdX, в отличие от них, отдаёт ТОЧНОЕ время открытия позиции
-    (createdAt) прямо в ответе, поэтому формат — как у Bybit/MEXC/KuCoin
+    (createdAt) прямо в ответе, поэтому формат — как у Bybit/KuCoin
     (см. calculator._EXACT_OPEN_TIME_FIELDS, где это и используется для
     обрезки funding-истории до текущей позиции). sorted(d) по словарю
     уже даёт отсортированные ключи — единственный текущий потребитель
@@ -833,7 +826,7 @@ def fetch_dydx(address: str, subaccount_number: str, start_ms: int, end_ms: int)
                 # "rate" — чистая рыночная ставка funding (ПОДТВЕРЖДЕНО живым
                 # ответом: side=LONG, rate>0 дал payment<0 и rate<0 дал
                 # payment>0 — "положительная ставка -> лонги платят шортам",
-                # знак НЕ привязан к стороне счёта, как у MEXC/Gate/Lighter;
+                # знак НЕ привязан к стороне счёта, как у Gate/Lighter;
                 # не требует переворота знака, в отличие от Bybit feeRate)
                 # — используется funding_chart._dydx_series_from_records
                 # для графика APR по открытым позициям.
@@ -875,161 +868,6 @@ def _dydx_mark_price(market: str) -> float:
     return float(info["oraclePrice"])
 
 
-# ── Получение данных с MEXC ───────────────────────────────────────────────────
-#
-# Авторизация MEXC Futures отличается и от Bybit, и от Aster:
-#   строка_параметров = отсортированные по алфавиту "key=value", склеенные через &
-#   (пустая строка, если параметров нет)
-#   target_string      = ApiKey + Request-Time(мс) + строка_параметров
-#   Signature           = HMAC-SHA256(ApiSecret, target_string), hex
-# Подпись передаётся не в query, а в заголовках: ApiKey, Request-Time, Signature.
-#
-# Эндпоинт: GET /api/v1/private/position/funding_records (база: https://api.mexc.com)
-
-def _get_mexc_proxies() -> dict | None:
-    """
-    Прокси для запросов к MEXC — на случай, если GitHub Actions IP тоже
-    попадёт под блокировку (как ранее было с Bybit). Читает MEXC_PROXY,
-    затем общие HTTPS_PROXY/HTTP_PROXY. Форматы значения — как у Bybit-версии.
-    """
-    proxy = (
-        os.environ.get("MEXC_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("HTTP_PROXY")
-    )
-    if not proxy:
-        return None
-
-    if not proxy.startswith(("http://", "https://")):
-        parts = proxy.split(":")
-        if len(parts) == 4:
-            host, port, user, pwd = parts
-            proxy = f"http://{user}:{pwd}@{host}:{port}"
-        else:
-            proxy = f"http://{proxy}"
-
-    return {"http": proxy, "https": proxy}
-
-
-def _mexc_sign(api_key: str, api_secret: str,
-               timestamp: str, params_list: list) -> str:
-    # Бизнес-параметры сортируются по алфавиту (dictionary order) по ключу
-    sorted_params = sorted(params_list, key=lambda kv: kv[0])
-    param_string = "&".join(f"{k}={v}" for k, v in sorted_params)
-    target = f"{api_key}{timestamp}{param_string}"
-    return hmac.new(api_secret.encode("utf-8"), target.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def fetch_mexc(api_key: str, api_secret: str,
-               start_ms: int, end_ms: int) -> list:
-    """GET /api/v1/private/position/funding_records, с постраничной пагинацией."""
-    base_url    = "https://api.mexc.com"
-    page_size   = 100
-    all_records = []
-    page_num    = 1
-    proxies     = _get_mexc_proxies()
-    if proxies:
-        print(f"[MEXC DEBUG] запрос через прокси: {proxies['https'].split('@')[-1]}")
-
-    api_key    = api_key.strip()
-    api_secret = api_secret.strip()
-
-    while True:
-        timestamp = str(int(time.time() * 1000))
-
-        params_list = [
-            ("start_time", str(start_ms)),
-            ("end_time",   str(end_ms)),
-            ("page_num",   str(page_num)),
-            ("page_size",  str(page_size)),
-        ]
-
-        sig = _mexc_sign(api_key, api_secret, timestamp, params_list)
-        headers = {
-            "ApiKey":       api_key,
-            "Request-Time": timestamp,
-            "Signature":    sig,
-        }
-
-        query_string = urllib.parse.urlencode(sorted(params_list, key=lambda kv: kv[0]))
-        url = f"{base_url}/api/v1/private/position/funding_records?{query_string}"
-
-        resp = requests.get(url, headers=headers, timeout=30, proxies=proxies)
-        if not resp.ok:
-            print(f"[MEXC DEBUG] HTTP {resp.status_code}, тело ответа: {resp.text}")
-        resp.raise_for_status()
-        data = resp.json()
-
-        if not data.get("success", False):
-            raise RuntimeError(f"MEXC API error {data.get('code')}: {data.get('message') or data}")
-
-        payload = data.get("data") or {}
-        items = payload.get("resultList", [])
-        for item in items:
-            symbol = item.get("symbol", "")
-            item["asset"] = symbol.split("_")[-1] if "_" in symbol else "USDT"
-        all_records.extend(items)
-
-        total_page = payload.get("totalPage", 1)
-        if not items or page_num >= total_page:
-            break
-        page_num += 1
-
-    return all_records
-
-
-def _mexc_positions_raw(api_key: str, api_secret: str) -> list:
-    """
-    Сырой data из GET /api/v1/private/position/open_positions (уже отдаёт
-    только открытые позиции) — общий источник для fetch_mexc_open_symbols
-    ниже, liquidation_alerts._mexc_liquidation_positions и short_position_
-    tracker._fetch_mexc_open_shorts, через _cached_raw_positions выше.
-    """
-    base_url = "https://api.mexc.com"
-    api_key, api_secret = api_key.strip(), api_secret.strip()
-    timestamp = str(int(time.time() * 1000))
-
-    sig = _mexc_sign(api_key, api_secret, timestamp, [])
-    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-
-    # Прокси нужен по той же причине, что и в fetch_mexc() — этот эндпоинт
-    # (в отличие от него) раньше запросов без прокси не делал вовсе, из-за
-    # чего IP-блокировка со стороны MEXC (403) не лечилась выставлением
-    # MEXC_PROXY, как для остальных функций.
-    proxies = _get_mexc_proxies()
-    if proxies:
-        print(f"[MEXC DEBUG] open_positions через прокси: {proxies['https'].split('@')[-1]}")
-
-    resp = requests.get(
-        f"{base_url}/api/v1/private/position/open_positions",
-        headers=headers, timeout=30, proxies=proxies,
-    )
-    # Тело парсим до raise_for_status() — при 4xx MEXC обычно кладёт в JSON
-    # более конкретную причину (например код блокировки/бана ключа), чем
-    # голый текст "403 Forbidden" из requests.
-    if not resp.ok:
-        print(f"[MEXC DEBUG] open_positions HTTP {resp.status_code}, тело ответа: {resp.text}")
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
-    return data.get("data") or []
-
-
-def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
-    """
-    {symbol: create_time_ms} — MEXC, как и Bybit, хранит точное время
-    создания позиции (поле createTime), поэтому funding можно посчитать
-    именно с этого момента, а не приближённо. См. _mexc_positions_raw про
-    общий кэш.
-    """
-    items = _cached_raw_positions("mexc", lambda: _mexc_positions_raw(api_key, api_secret))
-    return {
-        p["symbol"]: int(p["createTime"])
-        for p in items if float(p.get("holdVol", 0)) > 0
-    }
-
-
 # ── Получение данных с Gate ───────────────────────────────────────────────────
 #
 # Авторизация Gate API v4 (своя, отличная от остальных):
@@ -1043,7 +881,7 @@ def fetch_mexc_open_symbols(api_key: str, api_secret: str) -> dict:
 # по умолчанию берём usdt (покрывает все USDT-M бессрочные контракты).
 
 def _get_gate_proxies() -> dict | None:
-    """Прокси для запросов к Gate — тот же паттерн, что и для Bybit/MEXC."""
+    """Прокси для запросов к Gate — тот же паттерн, что и для Bybit."""
     proxy = (
         os.environ.get("GATE_PROXY")
         or os.environ.get("HTTPS_PROXY")
@@ -1167,7 +1005,7 @@ def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt")
 
 # ── Получение данных с KuCoin ─────────────────────────────────────────────────
 #
-# В отличие от Aster/Bybit/Lighter/MEXC/Gate выше, KuCoin НЕ часть
+# В отличие от Aster/Bybit/Lighter/Gate выше, KuCoin НЕ часть
 # funding-стратегии (не входит в дневной отчёт этого файла) — используется
 # только для сводного баланса (balances.py) и для отслеживания новых
 # открытых шорт-позиций (short_position_tracker.py). Хелперы здесь, а не в
@@ -1176,7 +1014,7 @@ def fetch_gate_open_symbols(api_key: str, api_secret: str, settle: str = "usdt")
 
 def _get_kucoin_proxies() -> dict | None:
     """Прокси для запросов к KuCoin — тот же паттерн, что и у остальных бирж
-    (_get_mexc_proxies/_get_gate_proxies выше): сначала KUCOIN_PROXY, иначе
+    (_get_gate_proxies выше): сначала KUCOIN_PROXY, иначе
     общие HTTPS_PROXY/HTTP_PROXY."""
     proxy = (
         os.environ.get("KUCOIN_PROXY")
@@ -1270,7 +1108,7 @@ def fetch_kucoin_open_symbols(api_key: str, api_secret: str, api_passphrase: str
 
     ПОДТВЕРЖДЕНО по офиц. SDK ccxt (ccxt/kucoin.py, fetch_positions) и по
     офиц. документации (Get Position List): поле openingTimestamp — точное
-    время открытия позиции в мс, как и createdTime/createTime у Bybit/MEXC.
+    время открытия позиции в мс, как и createdTime/createTime у Bybit.
     См. _kucoin_positions_raw про общий кэш.
     """
     items = _cached_raw_positions(
@@ -1287,7 +1125,7 @@ def fetch_kucoin(api_key: str, api_secret: str, api_passphrase: str,
     """
     GET /api/v1/funding-history (KuCoin Futures) — история ФАКТИЧЕСКИ
     начисленного funding по аккаунту. В отличие от fetch_aster/fetch_bybit/
-    fetch_lighter/fetch_mexc/fetch_gate выше, `symbol` здесь ОБЯЗАТЕЛЬНЫЙ
+    fetch_lighter/fetch_gate выше, `symbol` здесь ОБЯЗАТЕЛЬНЫЙ
     параметр — KuCoin не отдаёт funding сразу по всему аккаунту одним
     запросом, только по одному контракту за раз. Подтверждено офиц.
     документацией (kucoin.com/docs-new/rest/futures-trading/funding-fees/
@@ -1426,7 +1264,7 @@ HTX_BASE_URL = f"https://{HTX_HOST}"
 
 def _get_htx_proxies() -> dict | None:
     """Прокси для запросов к HTX — тот же паттерн, что и у остальных бирж
-    (_get_mexc_proxies/_get_gate_proxies/_get_kucoin_proxies выше): сначала
+    (_get_gate_proxies/_get_kucoin_proxies выше): сначала
     HTX_PROXY, иначе общие HTTPS_PROXY/HTTP_PROXY."""
     proxy = (
         os.environ.get("HTX_PROXY")
@@ -1514,7 +1352,7 @@ def fetch_htx_open_symbols(api_key: str, api_secret: str) -> dict:
     """
     {contract_code: created_time_ms} — в отличие от старого API, v5 отдаёт
     ТОЧНОЕ время открытия позиции (created_time) прямо в ответе о позициях
-    — HTX попадает в ту же категорию, что Bybit/MEXC/KuCoin/dYdX (см.
+    — HTX попадает в ту же категорию, что Bybit/KuCoin/dYdX (см.
     calculator._EXACT_OPEN_TIME_FIELDS), а не в категорию "непрерывность
     начислений", как было в версии под старый API.
     """
@@ -1662,7 +1500,7 @@ BINGX_BASE_URL = "https://open-api.bingx.com"
 
 def _get_bingx_proxies() -> dict | None:
     """Прокси для запросов к BingX — тот же паттерн, что и у остальных бирж
-    (_get_mexc_proxies/_get_gate_proxies/_get_kucoin_proxies/_get_htx_proxies
+    (_get_gate_proxies/_get_kucoin_proxies/_get_htx_proxies
     выше): сначала BINGX_PROXY, иначе общие HTTPS_PROXY/HTTP_PROXY."""
     proxy = (
         os.environ.get("BINGX_PROXY")
@@ -1711,25 +1549,25 @@ def _bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str) ->
 # (entry_price._fetch_ourbit_spot_trades), не часть funding-отчётов.
 #
 # OurBit — ПОДТВЕРЖДЕНО живыми запросами (24.10.2026), что это клон/
-# white-label MEXC на ОБЩЕМ бэкенде, а не просто внешне похожий сайт:
-#   - GET /api/v3/ping -> {} — идентично MEXC;
+# использует Binance-совместимый Spot API:
+#   - GET /api/v3/ping -> {} — в стандартном формате Binance Spot API;
 #   - GET /api/v3/time -> {"serverTime": ...} — идентичный формат;
 #   - GET /api/v3/account без ключа -> {"code":400,"msg":"api key
-#     required"} — ПОБАЙТОВО совпадает с реальным ответом api.mexc.com на
+#     required"} — ПОБАЙТОВО совпадает с типовым ответом Binance Spot API на
 #     тот же запрос (сверено напрямую, не предположение) — такое текстовое
 #     совпадение сообщения об ошибке крайне маловероятно для независимой
 #     реализации, это общий бэкенд, не просто Binance-совместимый клон.
-# Отсюда — используется ТА ЖЕ схема подписи, что и у MEXC-спота
-# (entry_price._mexc_spot_sign): hex(HMAC-SHA256(secret, query_string)),
+# Отсюда — используется стандартная схема подписи Binance Spot API
+# (_ourbit_sign): hex(HMAC-SHA256(secret, query_string)),
 # query_string — НЕ отсортированная (urlencode параметров в заданном
 # порядке, как они собраны, та же логика, что и у Binance — подписывается
 # ровно та строка, что отправляется, без требования ASCII-сортировки).
 #
 # ЗАГОЛОВОК С API-КЛЮЧОМ — ПРОВЕРЕНО 25.10.2026 по официальной
 # документации https://ourbitdevelop.github.io/apidocs/spot_v3_en/:
-# заголовок называется "X-OURBIT-APIKEY", а НЕ "X-MEXC-APIKEY" (несмотря
+# заголовок называется "X-OURBIT-APIKEY", а не стандартный заголовок Binance API (несмотря
 # на общий бэкенд — имя заголовка оказалось всё же собственным,
-# OurBit-брендированным). Первая версия использовала "X-MEXC-APIKEY" по
+# OurBit-брендированным). Первая версия использовала стандартный заголовок API по
 # аналогии и реально получала 400 "api key required"/404 от прода —
 # это и вскрыло ошибку; исправлено.
 
@@ -1753,7 +1591,7 @@ def _get_ourbit_proxies() -> dict | None:
 
 def _ourbit_sign(api_secret: str, query_string: str) -> str:
     """hex(HMAC-SHA256(secret, query_string)) — идентично entry_price.
-    _mexc_spot_sign, см. докстринг секции выше про общий бэкенд с MEXC."""
+    _ourbit_sign, см. описание подписи OurBit выше."""
     return hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -1811,19 +1649,6 @@ def fetch_all(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols=None) ->
         except Exception as e:
             print(f"[Lighter] Ошибка: {e}")
             results["lighter"] = (None, str(e))
-
-    if "mexc_api_key" in secrets:
-        try:
-            records = fetch_mexc(
-                api_key    = secrets["mexc_api_key"],
-                api_secret = secrets["mexc_api_secret"],
-                start_ms   = start_ms,
-                end_ms     = end_ms,
-            )
-            results["mexc"] = (records, None)
-        except Exception as e:
-            print(f"[MEXC] Ошибка: {e}")
-            results["mexc"] = (None, str(e))
 
     if "gate_api_key" in secrets:
         try:
@@ -1892,7 +1717,6 @@ _EXCHANGE_WINDOW_DAYS = {
     "aster": 7,
     "bybit": 7,
     "lighter": 30,
-    "mexc": 90,
     "gate": 30,
     # KuCoin — подтверждено офиц. документацией (kucoin.com/docs-new/rest/
     # futures-trading/funding-fees/get-private-funding-history): "The
@@ -1987,7 +1811,7 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols
     Как fetch_all(), но для периода, который может оказаться ДЛИННЕЕ
     максимального диапазона одного запроса истории funding у конкретной
     биржи (см. _EXCHANGE_WINDOW_DAYS выше — Aster/Bybit 7 дней, Lighter/Gate
-    30, MEXC 90, KuCoin тоже 90) — используется отчётом за неделю/месяц/год/
+    30, KuCoin тоже 90) — используется отчётом за неделю/месяц/год/
     произвольный диапазон в bot_poll.py (build_calendar_markup,
     send_period_report). fetch_all() по-прежнему используется отчётом за
     ОДИН день (/report) — там период всегда меньше любого из лимитов,
@@ -2054,20 +1878,6 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols
         except Exception as e:
             print(f"[Lighter] Ошибка: {e}")
             results["lighter"] = (None, str(e))
-
-    if "mexc_api_key" in secrets:
-        try:
-            records = _fetch_in_windows(
-                lambda s, e: fetch_mexc(
-                    api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
-                    start_ms=s, end_ms=e,
-                ),
-                _EXCHANGE_WINDOW_DAYS["mexc"], start_ms, end_ms,
-            )
-            results["mexc"] = (records, None)
-        except Exception as e:
-            print(f"[MEXC] Ошибка: {e}")
-            results["mexc"] = (None, str(e))
 
     if "gate_api_key" in secrets:
         try:
@@ -2149,7 +1959,7 @@ def fetch_all_windowed(secrets: dict, start_ms: int, end_ms: int, kucoin_symbols
 # частоты начислений (та бывает чаще, не реже, так что 8ч-порог её не ловит).
 CONTINUOUS_FUNDING_GAP_HOURS = 16
 
-# Отдельный, куда более щедрый порог — только для подстраховки Bybit/MEXC от
+# Отдельный, куда более щедрый порог — только для подстраховки Bybit от
 # "залипшего" createdTime (см. докстринг _trim_open_position_records). Здесь
 # нам не нужно ловить закрытие позиции с точностью до одного пропущенного
 # начисления (в отличие от Aster/Lighter/Gate) — реальный момент открытия и
@@ -2227,7 +2037,7 @@ def _trim_open_position_records(records: list, symbol_field: str,
     Gate), где разрыв — единственный способ понять, что позиция была
     закрыта, и его нужно ловить как можно точнее.
 
-    Для Bybit/MEXC, где createdTime и так даёт точное время открытия,
+    Для Bybit, где createdTime и так даёт точное время открытия,
     вызывающий код передаёт сюда более щедрый порог (см. вызовы ниже) —
     там эта обрезка нужна только как подстраховка от "залипшего" (очень
     старого) createdTime, а не для определения момента открытия с нуля.
@@ -2258,7 +2068,7 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
       2) забирает funding fee и оставляет только записи по этим символам.
 
     Точность различается по биржам:
-      - Bybit, MEXC — ТОЧНО по времени: биржа отдаёт время открытия
+      - Bybit — ТОЧНО по времени: биржа отдаёт время открытия
         позиции (createdTime/createTime), funding считается именно с
         этого момента.
       - Aster, Lighter, Gate — ТОЧНО по непрерывности начислений: биржа
@@ -2377,47 +2187,6 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
             print(f"[Lighter/positions] Ошибка: {e}")
             results["lighter"] = (None, str(e))
 
-    if "mexc_api_key" in secrets:
-        try:
-            open_times = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-            if open_times:
-                # Тот же потолок глубины, что и у Bybit выше, и по той же причине
-                # (не доверяем createTime слепо на случай, если он "залип").
-                earliest_ms = min(open_times.values())
-                fetch_start_ms = max(min(earliest_ms, now_ms), lookback_start_ms)
-                print(
-                    "[MEXC/positions] createTime по символам: " +
-                    ", ".join(
-                        f"{sym}={datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-                        for sym, ts in open_times.items()
-                    ) + f"; запрашиваю с {datetime.fromtimestamp(fetch_start_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-                )
-                records = _fetch_in_windows(
-                    lambda s, e: fetch_mexc(
-                        api_key=secrets["mexc_api_key"], api_secret=secrets["mexc_api_secret"],
-                        start_ms=s, end_ms=e,
-                    ),
-                    _EXCHANGE_WINDOW_DAYS["mexc"], fetch_start_ms, now_ms,
-                )
-                print(f"[MEXC/positions] Получено сырых записей: {len(records)}")
-                records = [
-                    r for r in records
-                    if r.get("symbol") in open_times
-                    and int(r.get("settleTime", 0)) >= open_times[r["symbol"]]
-                ]
-                print(f"[MEXC/positions] После фильтра по символу+createTime: {len(records)}")
-                # Та же подстраховка, что и для Bybit выше — createTime теоретически
-                # может оказаться таким же "залипшим" от старого открытия позиции.
-                records = _trim_open_position_records(
-                    records, symbol_field="symbol", time_field="settleTime", time_unit="ms",
-                    gap_threshold_hours=STALE_CREATEDTIME_GAP_HOURS, debug_label="MEXC",
-                )
-                print(f"[MEXC/positions] После обрезки по непрерывности: {len(records)}")
-                results["mexc"] = (records, None)
-        except Exception as e:
-            print(f"[MEXC/positions] Ошибка: {e}")
-            results["mexc"] = (None, str(e))
-
     if "gate_api_key" in secrets:
         try:
             open_symbols = fetch_gate_open_symbols(secrets["gate_api_key"], secrets["gate_api_secret"])
@@ -2459,7 +2228,7 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
                 # отдельный запрос НА КАЖДЫЙ сейчас открытый символ (их обычно
                 # один-два), сразу с start = время открытия ИМЕННО этой позиции
                 # — без риска "залипшего" openingTimestamp от предыдущего
-                # открытия того же символа (в отличие от Bybit/MEXC выше, там
+                # открытия того же символа (в отличие от Bybit выше, там
                 # это реальная, задокументированная проблема): KuCoin отвечает
                 # только записями внутри запрошенного окна, а не всей историей
                 # символа, так что подстраховка через _trim_open_position_records
@@ -2484,7 +2253,7 @@ def fetch_all_time_open_positions(secrets: dict) -> dict:
         try:
             open_times = fetch_dydx_open_symbols(secrets["dydx_address"], secrets["dydx_subaccount_number"])
             if open_times:
-                # Раньше здесь (как и для Bybit/MEXC/KuCoin) вручную
+                # Раньше здесь (как и для Bybit/KuCoin) вручную
                 # суммировались сырые записи /v4/fundingPayments с момента
                 # открытия — но у dYdX indexer уже САМ ведёт этот накопи-
                 # тельный итог прямо на позиции (netFunding — см. докстринг
@@ -2521,7 +2290,6 @@ def build_open_positions_report(results: dict) -> str:
         "aster":   ("Aster",   "income",  "symbol", "asset"),
         "bybit":   ("Bybit",   "funding", "symbol", "currency"),
         "lighter": ("Lighter", "change",  "symbol", "asset"),
-        "mexc":    ("MEXC",    "funding", "symbol", "asset"),
         "gate":    ("Gate",    "change",  "symbol", "asset"),
         "kucoin":  ("KuCoin",  "funding", "symbol", "settleCurrency"),
         "dydx":    ("dYdX",    "payment", "symbol", "asset"),
@@ -2604,7 +2372,6 @@ def build_report(start_ms: int, end_ms: int,
                  aster_records: list | None, aster_error: str | None,
                  bybit_records: list | None, bybit_error: str | None,
                  lighter_records: list | None = None, lighter_error: str | None = None,
-                 mexc_records: list | None = None, mexc_error: str | None = None,
                  gate_records: list | None = None, gate_error: str | None = None,
                  kucoin_records: list | None = None, kucoin_error: str | None = None,
                  dydx_records: list | None = None, dydx_error: str | None = None,
@@ -2642,16 +2409,6 @@ def build_report(start_ms: int, end_ms: int,
             income_field="change", symbol_field="symbol", asset_field="asset",
         )
         combined.extend(lighter_lines)
-
-    # MEXC — только если запрашивался
-    mexc_totals: dict = {}
-    if mexc_records is not None or mexc_error is not None:
-        combined.append("")
-        mexc_lines, mexc_totals = _section_lines(
-            "MEXC", mexc_records, mexc_error,
-            income_field="funding", symbol_field="symbol", asset_field="asset",
-        )
-        combined.extend(mexc_lines)
 
     # Gate — только если запрашивался
     gate_totals: dict = {}
@@ -2694,13 +2451,13 @@ def build_report(start_ms: int, end_ms: int,
         combined.extend(htx_lines)
 
     # Итог по всем биржам
-    if (bybit_totals or aster_totals or lighter_totals or mexc_totals or gate_totals
+    if (bybit_totals or aster_totals or lighter_totals or gate_totals
             or kucoin_totals or dydx_totals or htx_totals):
         combined.append("")
         combined.append("💰 Итого по всем биржам:")
         all_assets: set = (
             set(aster_totals) | set(bybit_totals) | set(lighter_totals)
-            | set(mexc_totals) | set(gate_totals) | set(kucoin_totals) | set(dydx_totals)
+            | set(gate_totals) | set(gate_totals) | set(kucoin_totals) | set(dydx_totals)
             | set(htx_totals)
         )
         for asset in sorted(all_assets):
@@ -2708,7 +2465,6 @@ def build_report(start_ms: int, end_ms: int,
                 aster_totals.get(asset, 0.0)
                 + bybit_totals.get(asset, 0.0)
                 + lighter_totals.get(asset, 0.0)
-                + mexc_totals.get(asset, 0.0)
                 + gate_totals.get(asset, 0.0)
                 + kucoin_totals.get(asset, 0.0)
                 + dydx_totals.get(asset, 0.0)
@@ -2771,7 +2527,6 @@ def main():
         *results.get("aster",   (None, None)),
         *results.get("bybit",   (None, None)),
         *results.get("lighter", (None, None)),
-        *results.get("mexc",    (None, None)),
         *results.get("gate",    (None, None)),
         *results.get("kucoin",  (None, None)),
         *results.get("dydx",    (None, None)),
