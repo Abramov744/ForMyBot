@@ -97,7 +97,7 @@ from funding_report import (
     _cached_raw_positions,
     _aster_positions_raw,
     _lighter_positions_raw,
-    _lighter_account_raw, _lighter_user_stats_raw,
+    _lighter_user_stats_raw,
     _gate_positions_raw,
     _htx_positions_raw,
     _htx_cross_account_raw,
