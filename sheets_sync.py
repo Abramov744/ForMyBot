@@ -22,7 +22,7 @@
 Переиспользует funding_report.fetch_all_time_open_positions() — ТУ ЖЕ
 функцию, что уже считает "funding с момента открытия текущей позиции" для
 команды /positions в Telegram-боте (там же и разница в точности между
-биржами: Bybit/MEXC — по точному createdTime, Aster/Lighter/Gate — по
+биржами: Bybit — по точному createdTime, Aster/Lighter/Gate — по
 непрерывности начислений funding). Если бы этот скрипт запрашивал funding
 как-то иначе — легко было бы разойтись в цифрах с ботом (см. CLAUDE.md и
 хендофф про риск "двух мест, считающих одну и ту же метрику").
@@ -36,7 +36,7 @@ entry_price._base_asset — тем же кодом, что и автоподбо
 калькуляторе, логика не дублируется заново.
 
 Автоматизация работает ТОЛЬКО для строк, где Биржа 2 — одна из 6,
-поддерживаемых ботом (Aster/Bybit/Lighter/MEXC/Gate/KuCoin). У остальных
+поддерживаемых ботом (Aster/Bybit/Lighter/Gate/KuCoin). У остальных
 бирж, которые встречаются в старых строках таблицы (paradex, edgex, apex,
 hyper и т.п.), бот не имеет API-доступа — такие строки скрипт просто
 пропускает, не трогая ячейку (как и было при ручном вводе).
@@ -44,7 +44,7 @@ hyper и т.п.), бот не имеет API-доступа — такие ст�
 KuCoin — не совсем "как остальные": её funding-история требует ОБЯЗАТЕЛЬНО
 указать символ на уровне запроса к бирже (см. funding_report.fetch_kucoin)
 — здесь это не проблема, символ уже известен из совпадения строки таблицы с
-открытой позицией, тем же способом, что и для Bybit/MEXC (точное время
+открытой позицией, тем же способом, что и для Bybit (точное время
 открытия, см. _EXACT_TIME_EXCHANGES).
 
 Если совпадение по (биржа, базовый актив) неоднозначно — сейчас на бирже
@@ -53,7 +53,7 @@ KuCoin — не совсем "как остальные": её funding-исто�
 для ручной проверки, чем один раз молча угадать неправильно в финансовой
 таблице.
 
-Переменные окружения (плюс обычные ASTER_*/BYBIT_*/LIGHTER_*/MEXC_*/GATE_*/
+Переменные окружения (плюс обычные ASTER_*/BYBIT_*/LIGHTER_*/GATE_*/
 KUCOIN_* из funding_report.load_secrets() — они тоже нужны, скрипт дёргает
 те же fetch_*):
   GOOGLE_SHEET_ID              — id таблицы (из её URL, между /d/ и /edit)
@@ -82,8 +82,8 @@ symbol сам вызывает внутри тот же _trim_to_current_open_po
 
 Единственное, что делает этот скрипт САМ (а не просто вызывает
 calculator.py) — подбирает НАЧАЛО периода для fetch_funding_history():
-- Bybit/MEXC отдают точное время открытия позиции — используется оно
-  (fetch_bybit_open_symbols/fetch_mexc_open_symbols); без этого пришлось
+- Bybit отдают точное время открытия позиции — используется оно
+  (fetch_bybit_open_symbols); без этого пришлось
   бы гонять недельные окна вглубь всех 180 дней просто чтобы тут же
   обрезать почти всё обратно внутри fetch_funding_history.
 - Aster/Lighter/Gate точного времени не дают — берётся тот же
@@ -108,7 +108,6 @@ from funding_report import (
     fetch_gate_open_symbols,
     fetch_kucoin_open_symbols,
     fetch_lighter_open_symbols,
-    fetch_mexc_open_symbols,
     fetch_dydx_open_symbols,
     fetch_dydx_net_funding,
     fetch_htx_open_symbols,
@@ -121,7 +120,7 @@ from funding_report import (
 # на новый /v5/ API (см. докстринг funding_report.fetch_htx_open_symbols
 # про миграцию) тоже отдаёт точное время (created_time); под старым API
 # отдавала только приближённое — была в _CONTINUOUS_EXCHANGES ниже.
-_EXACT_TIME_EXCHANGES = ("bybit", "mexc", "kucoin", "dydx", "htx")
+_EXACT_TIME_EXCHANGES = ("bybit", "kucoin", "dydx", "htx")
 # Биржи без точного времени — старт периода берётся по OPEN_POSITIONS_LOOKBACK_DAYS.
 _CONTINUOUS_EXCHANGES = ("aster", "lighter", "gate")
 SUPPORTED_EXCHANGES = _EXACT_TIME_EXCHANGES + _CONTINUOUS_EXCHANGES
@@ -198,7 +197,7 @@ def _with_sheets_retry(fn, *args, **kwargs):
 
 def build_open_symbol_index(secrets: dict) -> dict:
     """
-    {exchange: {symbol: open_time_ms}} для Bybit/MEXC (точное время),
+    {exchange: {symbol: open_time_ms}} для Bybit (точное время),
     {exchange: {symbol: None}} для Aster/Lighter/Gate (точного времени нет).
     Единая форма (всегда dict symbol->значение) — чтобы дальше по коду не
     ветвиться на dict/set. Биржи без настроенных секретов просто
@@ -227,12 +226,6 @@ def build_open_symbol_index(secrets: dict) -> dict:
             index["lighter"] = {s: None for s in symbols}
         except Exception as e:
             print(f"[sheets_sync/lighter] Не удалось получить открытые позиции: {e}", flush=True)
-
-    if "mexc_api_key" in secrets:
-        try:
-            index["mexc"] = fetch_mexc_open_symbols(secrets["mexc_api_key"], secrets["mexc_api_secret"])
-        except Exception as e:
-            print(f"[sheets_sync/mexc] Не удалось получить открытые позиции: {e}", flush=True)
 
     if "gate_api_key" in secrets:
         try:
@@ -269,7 +262,7 @@ def build_open_symbol_index(secrets: dict) -> dict:
     if "htx_api_key" in secrets:
         try:
             # fetch_htx_open_symbols уже отдаёт {symbol: open_time_ms} —
-            # как и у Bybit/MEXC/dYdX (см. _EXACT_TIME_EXCHANGES выше),
+            # как и у Bybit/dYdX (см. _EXACT_TIME_EXCHANGES выше),
             # доп. обёртка не нужна.
             index["htx"] = fetch_htx_open_symbols(secrets["htx_api_key"], secrets["htx_api_secret"])
         except Exception as e:
