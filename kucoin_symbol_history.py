@@ -7,7 +7,7 @@
 бирже (fetch_kucoin_open_symbols там и так уже вызывается каждый час для
 столбца P).
 
-ЗАЧЕМ ЭТО НУЖНО: в отличие от Aster/Bybit/Lighter/MEXC/Gate,
+ЗАЧЕМ ЭТО НУЖНО: в отличие от Aster/Bybit/Lighter/Gate,
 funding_report.fetch_kucoin() (GET /api/v1/funding-history) принимает
 symbol как ОБЯЗАТЕЛЬНЫЙ параметр запроса — нет способа спросить у KuCoin
 "что вообще начислялось на аккаунте за этот период", только "что
