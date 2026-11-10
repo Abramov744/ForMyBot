@@ -816,18 +816,12 @@ def fetch_lighter_balance(account_index: str) -> float:
     тот же эндпоинт, что и funding_report.fetch_lighter_open_symbols
     использует для списка позиций.
 
-    ПОДТВЕРЖДЕНО по официальной документации полей SDK (elliottech/lighter-
-    python, docs/Account.md и docs/AccountPosition.md, дословный список
-    полей на 29.08.2026): на уровне аккаунта есть только collateral —
-    обеспечение БЕЗ учёта результата по открытым позициям, готового поля
-    "итог с учётом PnL" в API нет. При этом по документации Lighter (Total
-    Account Value = Collateral + Unrealized PnL) полный баланс — это
-    collateral ПЛЮС unrealized_pnl каждой открытой позиции (поле
-    AccountPosition.unrealized_pnl) — раньше считался только collateral,
-    поэтому PnL открытых позиций не попадал в баланс. Реальный ответ Lighter
-    напрямую не проверялся (доступа к его API из этой среды разработки не
-    было) — имена полей взяты из офиц. SDK, но однократно сверить с
-    приложением Lighter после деплоя всё равно стоит.
+    По документации Lighter Total Account Value = Collateral + Unrealized
+    PnL. Для isolated-позиций allocated_margin — отдельное обеспечение,
+    которое учитывается как collateral; поэтому складываем account-level
+    collateral, allocated_margin только позиций с margin_mode == 1 и
+    unrealized_pnl всех открытых позиций. Эти поля описаны в актуальной
+    схеме GET /api/v1/account (Account / AccountPosition).
     """
     resp = requests.get(
         f"{LIGHTER_BASE_URL}/api/v1/account",
