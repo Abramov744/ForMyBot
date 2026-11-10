@@ -33,28 +33,24 @@ GATE — та же идея, аналогичные поля того же от�
 position_margin + order_margin + available — то есть total уже САМ есть
 margin_base (сумма всех трёх компонентов капитала счёта, без unrealized
 PnL, который отдаётся отдельным полем unrealised_pnl) — никакого
-дополнительного сложения полей не требуется, в отличие от Gate:
+дополнительного сложения полей не требуется:
   margin_base = total
   unrealized  = unrealised_pnl
 
 LIGHTER — тоже одно готовое поле, как и у Gate: collateral (ПОДТВЕРЖДЕНО
 офиц. docs SDK elliottech/lighter-python, docs/Account.md, проверено
 06.10.2026) — "обеспечение" на уровне аккаунта БЕЗ учёта floating PnL
-открытых позиций (тот же смысл, что cashBalance+positionMargin у Gate и
-total у Gate). unrealized считается суммой поля unrealized_pnl по всем
+открытых позиций (тот же смысл, что и total у Gate). unrealized считается суммой поля unrealized_pnl по всем
 открытым позициям аккаунта (AccountPosition.unrealized_pnl, тот же
 источник, что уже использует balances.fetch_lighter_balance):
   margin_base = collateral
   unrealized  = sum(position.unrealized_pnl)
-ВАЖНО: в отличие от Gate, эта формула НЕ проверена против реального
-счёта пользователя с открытой позицией — поля взяты из офиц. SDK docs, но
-собственного эндпоинта тестовой проверки, как был для Gate (диагностический
-лог сырых полей), для Lighter не делалось. Первый реальный алерт по
+ВАЖНО: эта формула НЕ проверена против реального счёта пользователя с открытой позицией — поля взяты из офиц. SDK docs, но отдельной сверки с боевым аккаунтом не было. Первый реальный алерт по
 Lighter стоит явно сверить с суммами на экране самого приложения Lighter.
 
 DYDX (v4) — margin_base = equity (поле саб-аккаунта, см. _dydx_margin_
 snapshot ниже), unrealized = сумма unrealizedPnl по открытым позициям.
-В ОТЛИЧИЕ от Gate/Lighter, equity у dYdX УЖЕ включает floating PnL
+В ОТЛИЧИЕ от Lighter, equity у dYdX УЖЕ включает floating PnL
 (Indexer не отдаёт отдельного поля "капитал без PnL") — порог 70%
 здесь означает "убыток съел 70% текущего equity", а не "70% от статичного
 капитала без PnL", как у остальных трёх бирж. Цены ликвидации для dYdX
