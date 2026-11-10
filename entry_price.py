@@ -6,13 +6,13 @@
 самой биржи (это данные о текущей открытой позиции — есть только пока
 позиция открыта), а затем ищет цену открытия СПОТОВОЙ ноги (покупка той же
 монеты) в истории сделок по всем ПОДключённым биржам, у которых есть спот
-(Bybit/MEXC/Gate — Aster и Lighter спота не имеют вовсе), в окне времени
+(Bybit/Gate — Aster и Lighter спота не имеют вовсе), в окне времени
 вокруг момента открытия шорта. Если совпадение не нашлось ни на одной
 бирже — значение остаётся None, и в UI это поле нужно заполнить вручную
 (ровно то поведение, которое и было явно согласовано).
 
 Точность времени открытия шорта различается по биржам:
-  - Bybit, MEXC, KuCoin — биржа отдаёт ТОЧНОЕ время открытия позиции
+  - Bybit, KuCoin — биржа отдаёт ТОЧНОЕ время открытия позиции
     (createdTime/createTime/openingTimestamp), окно поиска спот-сделки
     узкое (см. WINDOW_MINUTES_EXACT).
   - Aster, Gate, Lighter — точного времени открытия в API позиций нет,
@@ -38,7 +38,6 @@ from funding_report import (
     _bybit_sign,
     _gate_sign,
     _get_proxies,
-    _get_mexc_proxies,
     _get_gate_proxies,
     _get_htx_proxies,
     _kucoin_signed_get,
@@ -57,7 +56,7 @@ from funding_report import (
     fetch_lighter,
 )
 
-WINDOW_MINUTES_EXACT = 20      # Bybit/MEXC — точное время открытия
+WINDOW_MINUTES_EXACT = 20      # Bybit — точное время открытия
 WINDOW_MINUTES_APPROX = 360    # Aster/Gate/Lighter — время оценено по funding
 # WETH — доп. котировка специально для Uniswap (там купленная монета часто в паре
 # с WETH, а не со стейблом); для CEX-бирж такая пара просто не найдётся и молча
@@ -69,16 +68,14 @@ QUOTE_CANDIDATES = ["USDT", "USDC", "WETH"]
 # бирже тикером) — сопоставить их автоматически неоткуда, это не выводится
 # из API ни одной биржи. Реальный случай (подтверждено пользователем,
 # 14.09.2026): шорт на Lighter под тикером "AI", встречная спот-покупка
-# того же актива — на MEXC, но там он называется "AIINU", поэтому
-# _search_spot_entry искал на MEXC пару "AIUSDT" и ничего не находил
+# того же актива — на биржи, но там он называется "AIINU", поэтому
+# _search_spot_entry искал на биржи пару "AIUSDT" и ничего не находил
 # (short_position_tracker так и не создавал строку — покупка на споте
 # "не найдена", хотя по факту была). Ключ — (биржа, база_актива на других
 # биржах), значение — реальный тикер этого актива именно на этой бирже.
 # Пополняется по мере обнаружения новых случаев — не пытаться угадывать
 # заранее.
-BASE_ASSET_ALIASES = {
-    ("mexc", "AI"): "AIINU",
-}
+BASE_ASSET_ALIASES = {}
 
 
 # ── Извлечение базового актива из формата символа конкретной биржи ───────────
@@ -87,7 +84,7 @@ _QUOTE_SUFFIXES = ("USDT", "USDC", "USD", "BUSD")
 
 
 def _base_asset(exchange: str, symbol: str) -> str:
-    if exchange in ("mexc", "gate") and "_" in symbol:
+    if exchange == "gate" and "_" in symbol:
         return symbol.split("_")[0]
     if exchange == "lighter":
         return symbol  # у Lighter symbol уже "голый" базовый актив
@@ -181,85 +178,12 @@ def _bybit_position_entry(secrets: dict, symbol: str) -> dict | None:
     return None
 
 
-_mexc_contract_size_cache: dict = {}
-
-
-def _fetch_mexc_contract_size(symbol: str) -> float:
-    """Сколько монет в ОДНОМ контракте MEXC Futures для данного символа.
-
-    У MEXC объём позиции (`holdVol`) отдаётся в количестве КОНТРАКТОВ, а не
-    напрямую в монетах — у каждого символа свой множитель contractSize
-    (для дорогих монет вроде BTC он дробный, например 0.0001 BTC за
-    контракт; для дешёвых альткоинов, наоборот, один контракт может
-    представлять сотни монет). Без этого домножения `qty` в калькуляторе
-    получался заниженным в contractSize раз (например 4 вместо реальных
-    400 монет при contractSize=100) — обнаружено по расхождению с суммой
-    позиции на самой бирже 24.08.2026.
-
-    Публичный эндпоинт (без авторизации). Кэшируется в памяти процесса —
-    контрактные спецификации почти никогда не меняются. При любой
-    неожиданности в формате ответа — не роняем автоподбор цены целиком,
-    используем множитель 1 (старое поведение) и логируем предупреждение,
-    чтобы расхождение было видно и диагностируемо через логи Railway.
-    """
-    if symbol in _mexc_contract_size_cache:
-        return _mexc_contract_size_cache[symbol]
-    contract_size = 1.0
-    try:
-        resp = requests.get(
-            "https://contract.mexc.com/api/v1/contract/detail",
-            params={"symbol": symbol}, timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        item = data.get("data")
-        if isinstance(item, list):
-            item = next((c for c in item if c.get("symbol") == symbol), None)
-        if not isinstance(item, dict) or item.get("contractSize") is None:
-            raise RuntimeError(f"неожиданный формат ответа: {data}")
-        contract_size = float(item["contractSize"])
-    except Exception as e:
-        print(f"[entry_price/mexc] Не удалось получить contractSize для {symbol}, использую 1 "
-              f"(объём позиции может быть занижен/завышен, если у контракта множитель ≠ 1): {e}")
-    _mexc_contract_size_cache[symbol] = contract_size
-    return contract_size
-
-
-def _mexc_position_entry(secrets: dict, symbol: str) -> dict | None:
-    from funding_report import _mexc_sign  # приватная HMAC-подпись contract API
-    base_url = "https://api.mexc.com"
-    api_key = secrets["mexc_api_key"].strip()
-    api_secret = secrets["mexc_api_secret"].strip()
-    timestamp = str(int(time.time() * 1000))
-    sig = _mexc_sign(api_key, api_secret, timestamp, [])
-    headers = {"ApiKey": api_key, "Request-Time": timestamp, "Signature": sig}
-    resp = requests.get(
-        f"{base_url}/api/v1/private/position/open_positions",
-        headers=headers, timeout=30, proxies=_get_mexc_proxies(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success", False):
-        raise RuntimeError(f"MEXC open_positions error {data.get('code')}: {data.get('message') or data}")
-    for p in data.get("data") or []:
-        if p.get("symbol") == symbol and float(p.get("holdVol", 0)) > 0:
-            price = p.get("openAvgPrice") or p.get("holdAvgPrice")
-            contract_size = _fetch_mexc_contract_size(symbol)
-            return {
-                "price": float(price),
-                "qty": float(p["holdVol"]) * contract_size,
-                "entry_time_ms": int(p["createTime"]) if p.get("createTime") else None,
-                "time_is_exact": True,
-            }
-    return None
-
-
 _gate_contract_size_cache: dict = {}
 
 
 def _fetch_gate_contract_multiplier(contract: str, settle: str = "usdt") -> float:
     """Сколько монет в ОДНОМ контракте Gate Futures — тот же случай, что и
-    у MEXC/HTX выше (_fetch_mexc_contract_size/_fetch_htx_contract_size):
+    у HTX выше (_fetch_htx_contract_size):
     "size" позиции отдаётся в количестве КОНТРАКТОВ, а не в монетах, свой
     множитель ("quanto_multiplier") у каждого символа — например, у
     SIREN_USDT он равен 100. Без этого домножения qty в
@@ -272,7 +196,7 @@ def _fetch_gate_contract_multiplier(contract: str, settle: str = "usdt") -> floa
     contracts/{contract}. Кэшируется в памяти процесса — контрактные
     спецификации почти никогда не меняются. При любой неожиданности в
     формате ответа — множитель 1 (старое поведение) и предупреждение в
-    лог, тот же приём, что и у MEXC/HTX."""
+    лог, тот же приём, что и у HTX."""
     if contract in _gate_contract_size_cache:
         return _gate_contract_size_cache[contract]
     multiplier = 1.0
@@ -422,14 +346,14 @@ _htx_contract_size_cache: dict = {}
 def _fetch_htx_contract_size(contract_code: str) -> float:
     """
     Сколько монет в ОДНОМ контракте HTX linear swap — тот же случай, что и
-    у MEXC (см. _fetch_mexc_contract_size выше): объём позиции ("volume")
+    у биржи (см. _fetch_htx_contract_size выше): объём позиции ("volume")
     отдаётся в количестве КОНТРАКТОВ, не в монетах, множитель свой у
     каждого символа. Публичный эндпоинт (без авторизации, ПОДТВЕРЖДЕНО
     офиц. документацией — curl-пример без ключей), GET /linear-swap-api/
     v1/swap_contract_info. Кэшируется в памяти процесса (контрактные
     спецификации почти не меняются). При любой неожиданности в формате
     ответа — множитель 1 (старое поведение) и предупреждение в лог, тот же
-    приём, что и у MEXC.
+    приём, что и у биржи.
     """
     if contract_code in _htx_contract_size_cache:
         return _htx_contract_size_cache[contract_code]
@@ -486,7 +410,6 @@ def _htx_position_entry(secrets: dict, symbol: str) -> dict | None:
 _POSITION_ENTRY_FETCHERS = {
     "aster": _aster_position_entry,
     "bybit": _bybit_position_entry,
-    "mexc": _mexc_position_entry,
     "gate": _gate_position_entry,
     "lighter": _lighter_position_entry,
     "kucoin": _kucoin_position_entry,
@@ -559,51 +482,6 @@ def _fetch_bybit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
     return [
         {"price": float(i["execPrice"]), "qty": float(i["execQty"]), "side": i.get("side")}
         for i in items if i.get("side") == wanted_side
-    ]
-
-
-def _mexc_spot_sign(api_secret: str, query_string: str) -> str:
-    return hmac.new(api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _fetch_mexc_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: int, side: str = "buy") -> list:
-    """
-    Спот-API MEXC — отдельный от контрактного, со своей (Binance-совместимой)
-    схемой подписи: HMAC-SHA256 от query-строки запроса секретным ключом,
-    подпись добавляется в неё же как параметр signature. API-ключ — в заголовке
-    X-MEXC-APIKEY (см. https://mexcdevelop.github.io/apidocs/spot_v3_en/).
-    """
-    api_key = secrets["mexc_api_key"].strip()
-    api_secret = secrets["mexc_api_secret"].strip()
-    params_list = [
-        ("symbol", symbol), ("startTime", str(start_ms)), ("endTime", str(end_ms)),
-        ("limit", "1000"), ("recvWindow", "10000"), ("timestamp", str(int(time.time() * 1000))),
-    ]
-    query_string = urllib.parse.urlencode(params_list)
-    sig = _mexc_spot_sign(api_secret, query_string)
-    headers = {"X-MEXC-APIKEY": api_key}
-    resp = requests.get(
-        f"https://api.mexc.com/api/v3/myTrades?{query_string}&signature={sig}",
-        headers=headers, timeout=30,
-    )
-    # ВАЖНО: сначала пробуем разобрать тело ответа и проверить code/msg от MEXC,
-    # и только потом (если тело не JSON) — raise_for_status(). MEXC отдаёт
-    # содержательную причину ошибки в теле даже при HTTP 400 (например, "Invalid
-    # symbol." для пары без спот-листинга или конкретную причину невалидной
-    # подписи) — старый порядок вызовов терял это сообщение, потому что
-    # raise_for_status() бросает исключение раньше, чем тело успевали прочитать,
-    # и в логах оставалось бесполезное "400 Client Error: Bad Request".
-    try:
-        data = resp.json()
-    except ValueError:
-        resp.raise_for_status()
-        raise
-    if isinstance(data, dict) and data.get("code"):
-        raise RuntimeError(f"MEXC myTrades error {data.get('code')}: {data.get('msg')}")
-    resp.raise_for_status()
-    return [
-        {"price": float(t["price"]), "qty": float(t["qty"]), "side": "Buy" if t.get("isBuyer") else "Sell"}
-        for t in data if bool(t.get("isBuyer")) == (side == "buy")
     ]
 
 
@@ -732,8 +610,8 @@ def _fetch_bingx_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms: 
     ("BTC-USDT", как у KuCoin, см. _SPOT_TRADE_FETCHERS ниже).
 
     Сторона сделки — булево поле isBuyer (не строка "BUY"/"SELL", как у
-    большинства остальных бирж) — тот же случай, что у MEXC
-    (_fetch_mexc_spot_trades, там isBuyer тоже bool).
+    большинства остальных бирж) — тот же случай, что у биржи
+    (_fetch_bybit_spot_trades, там isBuyer тоже bool).
     """
     api_key = secrets["bingx_api_key"].strip()
     api_secret = secrets["bingx_api_secret"].strip()
@@ -752,17 +630,17 @@ def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
     """
     GET /api/v3/myTrades — OurBit ПОДТВЕРЖДЕНО (живыми запросами 24.10.2026,
     см. докстринг секции OurBit в funding_report.py) работает на общем
-    бэкенде с MEXC: идентичные /api/v3/ping, /api/v3/time и ПОБАЙТОВО
+    бэкенде с биржи: идентичные /api/v3/ping, /api/v3/time и ПОБАЙТОВО
     совпадающий текст ошибки /api/v3/account без ключа. Поэтому — та же
-    схема запроса, что у _fetch_mexc_spot_trades (symbol слитно, без
-    разделителя, "BTCUSDT"; подпись entry_price._mexc_spot_sign-style, см.
+    схема запроса, что у _fetch_bybit_spot_trades (symbol слитно, без
+    разделителя, "BTCUSDT"; подпись entry_price.Binance-совместимая, см.
     funding_report._ourbit_sign; та же разборка ошибки code/msg раньше
     raise_for_status(), чтобы не терять содержательное сообщение).
 
     ПРОВЕРЕНО 25.10.2026 по официальной документации
     https://ourbitdevelop.github.io/apidocs/spot_v3_en/ — заголовок ключа
-    называется X-OURBIT-APIKEY (а не X-MEXC-APIKEY, как предполагалось по
-    аналогии с общим бэкендом MEXC — именно это и было причиной реальных
+    называется X-OURBIT-APIKEY (а не X-биржи-APIKEY, как предполагалось по
+    аналогии с общим бэкендом биржи — именно это и было причиной реальных
     404/400 от прода при первом включении биржи).
     """
     api_key = secrets["ourbit_api_key"].strip()
@@ -796,7 +674,7 @@ def _fetch_ourbit_spot_trades(secrets: dict, symbol: str, start_ms: int, end_ms:
 # ── Uniswap (любая EVM-сеть) — поиск покупки через историю переводов кошелька ─
 #
 # У Uniswap/блокчейна нет REST-эндпоинта "история моих сделок по паре", как у
-# Bybit/MEXC/Gate — вместо этого ищем сами по истории ERC-20-переводов кошелька:
+# Bybit/Gate — вместо этого ищем сами по истории ERC-20-переводов кошелька:
 # своп-покупка на Uniswap — это одна транзакция, в которой есть ОДНОВРЕМЕННО
 # исходящий перевод quote-актива (продали USDC/USDT/WETH) и входящий перевод
 # base-актива (получили купленную монету) на/с адреса самого кошелька. Что там
@@ -1014,7 +892,6 @@ def _fetch_uniswap_spot_trades_all_quotes(secrets: dict, base_asset: str, start_
 
 _SPOT_TRADE_FETCHERS = {
     "bybit": (lambda secrets, symbol, s, e, side: _fetch_bybit_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
-    "mexc":  (lambda secrets, symbol, s, e, side: _fetch_mexc_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}"),
     "gate":  (lambda secrets, symbol, s, e, side: _fetch_gate_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}_{quote}"),
     "kucoin": (lambda secrets, symbol, s, e, side: _fetch_kucoin_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}-{quote}"),
     "htx": (lambda secrets, symbol, s, e, side: _fetch_htx_spot_trades(secrets, symbol, s, e, side), lambda base, quote: f"{base}{quote}".lower()),
@@ -1032,7 +909,6 @@ _SPOT_TRADE_FETCHERS = {
 
 _SPOT_EXCHANGE_SECRET_KEY = {
     "bybit": "bybit_api_key",
-    "mexc": "mexc_api_key",
     "gate": "gate_api_key",
     "kucoin": "kucoin_api_key",
     "htx": "htx_api_key",
@@ -1051,7 +927,7 @@ def _search_spot_trade(secrets: dict, base_asset: str, center_ms: int, window_mi
     # int(...) обязателен: window_minutes приходит как float (например,
     # CLOSE_PRICE_LOOKBACK_MINUTES из sltp_alerts.py) — без него start_ms/
     # end_ms тоже float, и str(start_ms) превращается в "...610.0", что
-    # MEXC/Gate/KuCoin отвергают как невалидный timestamp (реальный баг:
+    # Gate/KuCoin отвергают как невалидный timestamp (реальный баг:
     # 11.10.2026 продажа BTW на споте при закрытии не нашлась ни на одной
     # бирже именно из-за этого — все запросы падали с ошибкой формата).
     start_ms = int(center_ms - window_minutes * 60 * 1000)
