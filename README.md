@@ -627,12 +627,11 @@ order_margin+available, не зависит от unrealised_pnl). Долларо
    🟢 PnL: +50.00 (+10.0% от маржи) — цена: 0.045 (ликвидация 0.08)
 ```
 
-Для **Lighter**: `margin_base = collateral + sum(allocated_margin isolated)`
-(`margin_mode == 1`), без floating PnL. Это важно: account-level
-`collateral` не включает отдельное обеспечение isolated-позиций.
-Долларовый PnL берётся из `unrealized_pnl` всех открытых позиций.
-Режимы подтверждены официальной документацией: `0 = cross`,
-`1 = isolated`.
+Для **Lighter**: `margin_base` берётся из `stats.collateral` официального
+WebSocket-канала `user_stats/{account_index}`. Это агрегированное поле
+для collateral/margin usage и учитывает isolated margin; не нужно вручную
+складывать `collateral` и `allocated_margin` из REST-позиций. PnL берётся
+из `unrealized_pnl` всех открытых позиций.
 
 ```
 🔴 ANSEM: -0.0100% за выплату (годовых -87.6%) — через 1ч, funding раз в 1ч
@@ -771,19 +770,18 @@ unrealized  = unrealised_pnl
 Маржа: 500 USDT → нереализованный PNL: -400 USDT
 ```
 
-**LIGHTER** — account-level collateral плюс отдельное обеспечение
-isolated-позиций:
+**LIGHTER** — маржа берётся из агрегированного поля
+`stats.collateral` приватного WebSocket-канала
+`user_stats/{account_index}`:
 
 ```
-margin_base = collateral + sum(allocated_margin where margin_mode == 1)
+margin_base = user_stats.stats.collateral
 unrealized  = sum(position.unrealized_pnl)
 ```
 
-У Lighter `margin_mode == 0` означает cross, `1` — isolated.
-Account-level `collateral` не покрывает отдельный allocated margin
-изолированных позиций; его пропуск приводил к занижению маржи. Значение
-`allocated_margin` берётся только для isolated-позиций, чтобы не задвоить
-cross collateral.
+Lighter документирует Account Stats как источник collateral, leverage и
+margin usage. Это надёжнее, чем собирать значение вручную из REST-полей
+`collateral` и `allocated_margin`, которые легко задвоить.
 
 ```
 🚨 Lighter (USDC): нереализованный убыток достиг 78% от маржи на счёте
