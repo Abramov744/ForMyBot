@@ -41,6 +41,7 @@ import re
 from datetime import datetime, timedelta
 
 import requests
+import gspread
 
 from funding_report import (
     MSK,
@@ -334,9 +335,75 @@ def answer_callback_query(token: str, callback_query_id: str, text: str | None =
         print(f"[answerCallbackQuery] не критично, пропускаю: {e}")
 
 
+# ── Метрики доходности дневного отчёта ────────────────────────────────────────
+
+def _read_margin_l4() -> float:
+    """Читает текущую маржу из L4 основной Google-таблицы."""
+    sheet_id = os.environ["GOOGLE_SHEET_ID"]
+    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    client = gspread.service_account_from_dict(creds_info)
+    spreadsheet = client.open_by_key(sheet_id)
+    tab_name = os.environ.get("GOOGLE_SHEET_TAB", "").strip()
+    worksheet = spreadsheet.worksheet(tab_name) if tab_name else spreadsheet.sheet1
+    raw_value = worksheet.acell("L4", value_render_option="UNFORMATTED_VALUE").value
+    margin = float(raw_value)
+    if margin <= 0:
+        raise ValueError("ячейка L4 должна содержать положительную маржу")
+    return margin
+
+
+def _stablecoin_income_for_report(results: dict) -> tuple[float, str | None]:
+    """Суммирует USDT и USDC по курсу 1:1; сообщает, если данные неполные."""
+    fields = {
+        "aster": ("income", "asset"),
+        "bybit": ("funding", "currency"),
+        "lighter": ("change", "asset"),
+        "gate": ("change", "asset"),
+        "kucoin": ("funding", "settleCurrency"),
+        "dydx": ("payment", "asset"),
+        "htx": ("payment", "asset"),
+    }
+    total = 0.0
+    failed = []
+    for exchange, (income_field, asset_field) in fields.items():
+        records, error = results.get(exchange, (None, None))
+        if error:
+            failed.append(exchange)
+            continue
+        for record in records or []:
+            asset = str(record.get(asset_field, "")).upper()
+            if asset in ("USDT", "USDC"):
+                total += float(record.get(income_field, 0) or 0)
+    return total, (", ".join(failed) if failed else None)
+
+
+def _append_daily_return_metrics(report: str, results: dict) -> str:
+    """Добавляет ROI за день и простой APR при доступной марже из L4."""
+    try:
+        margin = _read_margin_l4()
+    except Exception as exc:
+        print(f"Не удалось прочитать маржу из Google Sheets L4: {exc}")
+        return report + "\n\n📐 Доходность: не рассчитана — не удалось прочитать маржу из L4."
+
+    income, incomplete = _stablecoin_income_for_report(results)
+    if incomplete:
+        return report + f"\n\n⚠️ ROI/APR не рассчитаны: нет данных по биржам {incomplete}."
+    roi = income / margin * 100
+    apr = roi * 365
+    return report + (
+        "\n\n📐 Доходность за вчера (USDT + USDC = 1:1):"
+        f"\nМаржа из L4: {margin:,.2f} USDT"
+        f"\nДоход: {income:+,.4f} USDT"
+        f"\nROI: {roi:+.4f}%"
+        f"\nAPR: {apr:+.2f}% (ROI × 365)"
+    )
+
+
 # ── Формирование и отправка отчёта ────────────────────────────────────────────
 
-def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: int) -> None:
+def send_report_for_period(
+    secrets: dict, chat_id: str, start_ms: int, end_ms: int, include_return_metrics: bool = False
+) -> None:
     token = secrets["telegram_token"]
     try:
         kucoin_symbols = kucoin_symbol_history.load_known_symbols() if "kucoin_api_key" in secrets else set()
@@ -351,6 +418,8 @@ def send_report_for_period(secrets: dict, chat_id: str, start_ms: int, end_ms: i
             *results.get("dydx",    (None, None)),
             *results.get("htx",     (None, None)),
         )
+        if include_return_metrics:
+            report = _append_daily_return_metrics(report, results)
         send_telegram(token, chat_id, report)
         print("Отправлен отчёт.")
     except Exception as e:
@@ -588,7 +657,10 @@ def handle_message(secrets: dict, message: dict, allowed_chat_ids: set) -> None:
         send_telegram(token, chat_id, f"⚠️ {e}")
         return
 
-    send_report_for_period(secrets, chat_id, start_ms, end_ms)
+    include_return_metrics = date_arg.strip().lower() in ("", "вчера", "yesterday")
+    send_report_for_period(
+        secrets, chat_id, start_ms, end_ms, include_return_metrics=include_return_metrics
+    )
 
 
 def handle_callback_query(secrets: dict, cq: dict, allowed_chat_ids: set) -> None:
