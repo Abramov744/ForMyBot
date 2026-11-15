@@ -693,3 +693,47 @@ def build_period_profit_cumulative_chart(daily_totals: dict) -> str | None:
     fig.savefig(path, facecolor=CHART_BG_COLOR)
     plt.close(fig)
     return path
+
+
+def build_apr_history_chart(history: list[dict]) -> str | None:
+    """Строит историю зафиксированного ежедневного APR из Google Sheets."""
+    if not history:
+        return None
+    ordered = sorted(history, key=lambda item: item["date_msk"])
+    xs = [
+        datetime(item["date_msk"].year, item["date_msk"].month, item["date_msk"].day)
+        for item in ordered
+    ]
+    values = [float(item["apr_percent"]) for item in ordered]
+
+    fig, ax = plt.subplots(figsize=(11, 5), dpi=150)
+    fig.patch.set_facecolor(CHART_BG_COLOR)
+    ax.set_facecolor(CHART_BG_COLOR)
+    color = "#00f0a0"
+    for lw, alpha in [(6, 0.10), (4, 0.18), (2.4, 0.35)]:
+        ax.plot(xs, values, color=color, linewidth=lw, alpha=alpha, solid_capstyle="round")
+    ax.plot(
+        xs, values, color=color, linewidth=1.7, marker="o", markersize=4,
+        path_effects=[pe.Stroke(linewidth=2.4, foreground=color, alpha=0.5), pe.Normal()],
+    )
+    ax.set_title("История APR по дням", color=CHART_FG_COLOR)
+    ax.set_xlabel("Дата (МСК)", color=CHART_FG_COLOR)
+    ax.set_ylabel("APR, % годовых", color=CHART_FG_COLOR)
+    ax.axhline(0, color="#666666", linewidth=0.8, linestyle="--")
+    ax.grid(True, color=CHART_GRID_COLOR, alpha=0.5)
+    ax.tick_params(colors=CHART_FG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_color(CHART_GRID_COLOR)
+    if len(xs) <= 31:
+        interval = max(1, len(xs) // 15 or 1)
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=interval))
+    else:
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=15))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+    fig.autofmt_xdate(rotation=45)
+    fig.tight_layout()
+
+    path = f"/tmp/apr_history_{int(time.time())}.png"
+    fig.savefig(path, facecolor=CHART_BG_COLOR)
+    plt.close(fig)
+    return path

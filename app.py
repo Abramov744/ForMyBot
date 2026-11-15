@@ -66,6 +66,7 @@ from liquidation_alerts import liquidation_alert_loop
 from margin_alerts import margin_alert_loop
 from sheets_sync import sheet_sync_loop
 from short_position_tracker import short_position_check_loop
+from apr_history import daily_apr_loop
 from sltp_alerts import sltp_alert_loop
 
 app = Flask(__name__)
@@ -731,6 +732,7 @@ def main():
     # остальное (веб-калькулятор/бот/алерты по-прежнему работают).
     if os.environ.get("GOOGLE_SHEET_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
         threading.Thread(target=sheet_sync_loop, args=(secrets,), daemon=True, name="sheet-sync").start()
+        threading.Thread(target=daily_apr_loop, args=(secrets,), daemon=True, name="daily-apr-history").start()
         # Отдельный поток — не переиспользует sheet_sync_loop, у него другая
         # задача (создание НОВЫХ строк по новым шорт-позициям, а не
         # обновление funding в P у уже существующих активных строк), см.

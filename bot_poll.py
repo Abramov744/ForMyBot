@@ -54,12 +54,14 @@ from funding_report import (
     send_telegram,
 )
 import kucoin_symbol_history
+import apr_history
 from funding_alerts import build_predicted_rates_report
 from funding_chart import (
     build_positions_apr_chart,
     daily_totals_msk,
     build_period_profit_bar_chart,
     build_period_profit_cumulative_chart,
+    build_apr_history_chart,
 )
 from balances import fetch_all_balances, build_balances_report
 
@@ -337,59 +339,13 @@ def answer_callback_query(token: str, callback_query_id: str, text: str | None =
 
 # ── Метрики доходности дневного отчёта ────────────────────────────────────────
 
-def _read_margin_l4() -> float:
-    """Читает текущую маржу из L4 основной Google-таблицы."""
-    sheet_id = os.environ["GOOGLE_SHEET_ID"]
-    creds_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    client = gspread.service_account_from_dict(creds_info)
-    spreadsheet = client.open_by_key(sheet_id)
-    tab_name = os.environ.get("GOOGLE_SHEET_TAB", "").strip()
-    worksheet = spreadsheet.worksheet(tab_name) if tab_name else spreadsheet.sheet1
-    raw_value = worksheet.acell("L4", value_render_option="UNFORMATTED_VALUE").value
-    margin = float(raw_value)
-    if margin <= 0:
-        raise ValueError("ячейка L4 должна содержать положительную маржу")
-    return margin
-
-
-def _stablecoin_income_for_report(results: dict) -> tuple[float, str | None]:
-    """Суммирует USDT и USDC по курсу 1:1; сообщает, если данные неполные."""
-    fields = {
-        "aster": ("income", "asset"),
-        "bybit": ("funding", "currency"),
-        "lighter": ("change", "asset"),
-        "gate": ("change", "asset"),
-        "kucoin": ("funding", "settleCurrency"),
-        "dydx": ("payment", "asset"),
-        "htx": ("payment", "asset"),
-    }
-    total = 0.0
-    failed = []
-    for exchange, (income_field, asset_field) in fields.items():
-        records, error = results.get(exchange, (None, None))
-        if error:
-            failed.append(exchange)
-            continue
-        for record in records or []:
-            asset = str(record.get(asset_field, "")).upper()
-            if asset in ("USDT", "USDC"):
-                total += float(record.get(income_field, 0) or 0)
-    return total, (", ".join(failed) if failed else None)
-
-
 def _append_daily_return_metrics(report: str, results: dict) -> str:
-    """Добавляет ROI за день и простой APR при доступной марже из L4."""
+    """Добавляет ROI за день и простой годовой APR по текущей марже L4."""
     try:
-        margin = _read_margin_l4()
+        income, margin, roi, apr = apr_history.daily_metrics(results)
     except Exception as exc:
-        print(f"Не удалось прочитать маржу из Google Sheets L4: {exc}")
-        return report + "\n\n📐 Доходность: не рассчитана — не удалось прочитать маржу из L4."
-
-    income, incomplete = _stablecoin_income_for_report(results)
-    if incomplete:
-        return report + f"\n\n⚠️ ROI/APR не рассчитаны: нет данных по биржам {incomplete}."
-    roi = income / margin * 100
-    apr = roi * 365
+        print(f"Не удалось рассчитать доходность дневного отчёта: {exc}")
+        return report + f"\n\n📐 ROI/APR не рассчитаны: {exc}"
     return report + (
         "\n\n📐 Доходность за вчера (USDT + USDC = 1:1):"
         f"\nМаржа из L4: {margin:,.2f} USDT"
@@ -422,6 +378,24 @@ def send_report_for_period(
             report = _append_daily_return_metrics(report, results)
         send_telegram(token, chat_id, report)
         print("Отправлен отчёт.")
+        if include_return_metrics:
+            chart_path = None
+            try:
+                history = apr_history.load_apr_history()
+                chart_path = build_apr_history_chart(history)
+                if chart_path:
+                    send_photo(token, chat_id, chart_path, caption="История APR по ежедневным отчётам")
+                    print("Отправлен график истории APR.")
+                else:
+                    send_telegram(
+                        token, chat_id,
+                        "📈 История APR пока пуста. Первая запись появится после ежедневного расчёта в 00:01 МСК.",
+                    )
+            except Exception as e:
+                print(f"Ошибка при построении/отправке графика истории APR: {e}")
+            finally:
+                if chart_path and os.path.exists(chart_path):
+                    os.remove(chart_path)
     except Exception as e:
         # Не даём одной сломавшейся команде уронить обработку остальных апдейтов
         print(f"Ошибка при формировании/отправке отчёта: {e}")
