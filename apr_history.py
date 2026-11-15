@@ -71,11 +71,12 @@ def _open_worksheet():
     client = gspread.service_account_from_dict(creds_info)
     spreadsheet = client.open_by_key(sheet_id)
     try:
-        return spreadsheet.worksheet(_APR_SHEET_TAB)
+        worksheet = spreadsheet.worksheet(_APR_SHEET_TAB)
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=_APR_SHEET_TAB, rows=1000, cols=len(_HEADER))
-        worksheet.append_row(_HEADER, value_input_option="RAW")
-        return worksheet
+    if not _with_sheets_retry(worksheet.row_values, 1):
+        _with_sheets_retry(worksheet.append_row, _HEADER, value_input_option="RAW")
+    return worksheet
 
 
 def load_apr_history() -> list[dict]:
@@ -143,6 +144,7 @@ def capture_yesterday_apr(secrets: dict, report_date: date | None = None) -> boo
 
 def daily_apr_loop(secrets: dict) -> None:
     """Каждый день в 00:01 МСК рассчитывает APR за предыдущие сутки."""
+    _with_sheets_retry(_open_worksheet)  # Создать вкладку сразу при запуске сервиса.
     now = datetime.now(MSK)
     next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
     if next_run <= now:
