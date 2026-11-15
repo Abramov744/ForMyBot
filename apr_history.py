@@ -144,7 +144,13 @@ def capture_yesterday_apr(secrets: dict, report_date: date | None = None) -> boo
 
 def daily_apr_loop(secrets: dict) -> None:
     """Каждый день в 00:01 МСК рассчитывает APR за предыдущие сутки."""
-    _with_sheets_retry(_open_worksheet)  # Создать вкладку сразу при запуске сервиса.
+    while True:
+        try:
+            _with_sheets_retry(_open_worksheet)  # Создать вкладку сразу при запуске сервиса.
+            break
+        except Exception as exc:
+            print(f"[apr_history] Не удалось подготовить вкладку: {exc}; повтор через 5 минут.", flush=True)
+            time.sleep(300)
     now = datetime.now(MSK)
     next_run = now.replace(hour=0, minute=1, second=0, microsecond=0)
     if next_run <= now:
